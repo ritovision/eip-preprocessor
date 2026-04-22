@@ -12,11 +12,9 @@ get your software:
 - git
 - libgit2
 - openssl
-- just[^2]
 - [zola](https://github.com/getzola/zola/tree/next)[^1]
 
 [^1]: Requires at least commit [`ead17d0a3`] for full functionality.
-[^2]: Required for the generated local task surface.
 
 [`ead17d0a3`]: https://github.com/getzola/zola/commit/ead17d0a3a20bfb67043a076c061b35ae6b6ddea
 
@@ -41,54 +39,23 @@ cargo install --git https://github.com/ethereum/build-eips.git
 [EIPs]: https://github.com/ethereum/EIPs/
 [ERCs]: https://github.com/ethereum/ERCs/
 
-
 ## Usage
 
 1. Clone either [`ethereum/EIPs`] or [`ethereum/ERCs`], and change directory
    into it.
 1. Modify whatever proposal you'd like.
-1. Build the project. You can use:
-    - `build-eips check` to run the runtime site verification path.
-    - `build-eips build` to create an on-disk bundle of HTML, ready to be
-      deployed.
-    - `build-eips serve` to launch the runtime dev server locally.
-    - `build-eips preview` to serve the last built output without rebuilding.
+1. Run the site commands you need:
+   - `build-eips check` to run the runtime site verification path
+   - `build-eips build` to create an on-disk bundle of HTML
+   - `build-eips serve` to launch the runtime dev server locally
+   - `build-eips preview` to serve the last built output without rebuilding
 1. Run explicit editorial validation when you need proposal-targeted `eipw`
    checks.
 
-## Local Overrides
+## Workspace Bootstrap
 
-Local overrides add a local path layer and workspace config support without
-changing the default CI-oriented path unless you opt into those settings.
-
-### Explicit local overrides
-
-Use these flags to point the build at local sibling repositories and an
-out-of-tree build root:
-
-```bash
-build-eips --staging \
-  -C /work/EIPs-project/EIPs \
-  --theme-path /work/EIPs-project/theme \
-  --other-repo-path /work/EIPs-project/ERCs \
-  --build-root /work/EIPs-project/.local-build/EIPs \
-  check
-```
-
-Available overrides:
-
-- `--theme-path <path>`
-- `--other-repo-path <path>`
-- `--build-root <path>`
-- `--config <path>`
-- `--profile <name>`
-
-The local theme override also reuses that checkout's `config/eipw.toml`.
-
-### Workspace init
-
-If `build-eips` is already installed, you can bootstrap a local workspace from
-inside `EIPs/` or `ERCs/`:
+If `build-eips` is already installed, you can bootstrap a local multi-repo
+workspace from inside `EIPs/` or `ERCs/`:
 
 ```bash
 build-eips workspace init /work/EIPs-project
@@ -107,8 +74,14 @@ For platform development, you can additionally clone `preprocessor` and `eipw`:
 build-eips workspace init /work/EIPs-project --platform-dev
 ```
 
-After init, daily commands can run from inside `EIPs/` or `ERCs/` without
-repeating the local path flags:
+Validate the workspace bootstrap at any point with:
+
+```bash
+build-eips workspace doctor
+```
+
+After bootstrap, daily commands can run from inside `EIPs/` or `ERCs/` without
+repeating local path flags:
 
 ```bash
 cd /work/EIPs-project/EIPs
@@ -117,102 +90,73 @@ build-eips build
 build-eips serve
 ```
 
-`--profile parity` is available for one-off profile selection from the local
-workspace config.
+The generated starter config uses a custom `local` profile as the default
+workspace-local profile. The built-in `parity` and `dirty` profiles live in
+Rust and do not appear in `.build-eips.toml`.
 
-### Current Constraints
+## Profiles And Overrides
 
-- WG CI parity still means `--staging`
-- clean worktrees are still required
-- dirty working tree support requires the explicit dirty mode described below
+The command surface has three profile-selection paths:
 
-## Local Workspace Workflow
+- no explicit selection, which uses `default_profile` when configured
+- `build-eips --profile <name> ...`
+- built-in profile aliases such as `build-eips parity build` and
+  `build-eips dirty serve`
 
-The local workspace workflow adds the generated task surface and the
-front-door bootstrap path while keeping `.build-eips.toml` user-owned.
+Built-in profile behavior:
 
-### Refresh generated helpers
+- `parity` uses staging plus remote theme and sibling sources
+- `dirty` uses staging plus local theme and sibling sources, and enables dirty
+  mode
 
-Once `workspace init` has created `.build-eips.toml`, refresh the generated
-workspace helper files from the workspace root:
+`dirty` is still selectable without `.build-eips.toml`, but it cannot infer
+local workspace paths on its own. If you run `dirty` without workspace config,
+either bootstrap the workspace first, pass explicit local paths, or force the
+remote sources with `--remote-theme` and `--remote-sibling-repo`. That remote
+override form is still distinct from `parity`, because `dirty` keeps
+`allow_dirty = true`.
 
-```bash
-cd /work/EIPs-project
-build-eips workspace refresh
-```
+### Explicit overrides
 
-This generates or refreshes `/work/EIPs-project/justfile` without rewriting
-`.build-eips.toml`.
+Use these flags to override the selected profile directly:
 
-### Doctor checks
+- `--staging` / `--no-staging`
+- `--allow-dirty` / `--no-allow-dirty`
+- `--theme <path>` / `--remote-theme`
+- `--sibling-repo <path>` / `--remote-sibling-repo`
+- `--build-root <path>`
+- `--config <path>`
+- `--profile <name>`
 
-Validate the local setup at any point with:
-
-```bash
-build-eips workspace doctor
-```
-
-Doctor checks the workspace config, expected local repos, required tools, and
-whether the generated helper files are current.
-
-### Daily `just` commands
-
-After `workspace refresh`, you can use the generated `justfile` from inside
-`EIPs/` or `ERCs/`:
+Example:
 
 ```bash
-cd /work/EIPs-project/EIPs
-just check
-just build
-just serve
-just parity-build
+build-eips \
+  -C /work/EIPs-project/EIPs \
+  --staging \
+  --theme /work/EIPs-project/theme \
+  --sibling-repo /work/EIPs-project/ERCs \
+  --build-root /work/EIPs-project/.local-build/EIPs \
+  check
 ```
 
-`just` will find the workspace-root `justfile` by walking up from the current
-content repo. The generated recipes pass the invoking content repo back to
-`build-eips` with `-C`, so run them from inside `EIPs/` or `ERCs/` rather than
-from the workspace root.
+The local theme override also reuses that checkout's `config/eipw.toml`.
 
-### Front-door `scripts/dev-setup`
+## Dirty Mode
 
-If you cloned `EIPs/` or `ERCs/` first, use that repo's checked-in
-`./scripts/dev-setup` helper. It locates or installs `build-eips` and `just`,
-runs `workspace init`, refreshes the generated helpers, and prints the next
-useful commands.
+Dirty mode is the explicit local-only path for tracked working-tree changes in
+the active content repo.
 
-## Dirty Workflow
-
-Dirty workflow adds an explicit local-only mode for the active content repo.
-
-### Dirty profile
-
-Fresh workspaces now include a `dirty` profile in `.build-eips.toml`, so the
-documented daily dirty loop works immediately:
+Use the built-in alias:
 
 ```bash
 cd /work/EIPs-project/EIPs
-build-eips --profile dirty check
-build-eips --profile dirty build
-build-eips --profile dirty serve
+build-eips dirty check
+build-eips dirty build
+build-eips dirty serve
 ```
 
-The generated `justfile` also exposes:
-
-```bash
-just dirty-build
-just dirty-serve
-```
-
-`build-eips --profile dirty serve` now performs the expensive runtime
-preparation once at startup, then watches the real active content repo and
-mirrors tracked changes into the materialized repo that Zola is serving from.
-Zola runs in fast serve mode for in-session rebuilds, so tracked edits become a
-real live local dev loop without restarting the command.
-
-### Ad hoc override
-
-You can also enable the same dirty materialization path without relying on a
-profile:
+Or enable the same behavior ad hoc:
 
 ```bash
 build-eips --allow-dirty check
@@ -220,57 +164,24 @@ build-eips --allow-dirty build
 build-eips --allow-dirty serve
 ```
 
-### Dirty-mode limits
+`build-eips dirty serve` performs the expensive runtime preparation once at
+startup, then watches the real active content repo and mirrors tracked changes
+into the materialized repo that Zola is serving from.
+
+Dirty-mode limits:
 
 - dirty mode is opt-in and non-parity
-- the clean/default path is unchanged
 - only the active content repo is materialized dirty
-- sibling repo and theme still follow the clean workspace/profile rules
-- untracked files in the active content repo are currently ignored
-- clean `build-eips serve` remains a clean runtime serve path and does not sync
-  working-tree edits during the session
+- sibling repo and theme still follow the selected profile or explicit overrides
+- untracked files in the active content repo are ignored
+- clean `build-eips serve` remains the clean runtime serve path
 - tracked deletions are mirrored into the materialized repo, but served route
   invalidation under Zola fast serve remains best-effort
 
-## Site Commands and Editorial Commands
+## Editorial Commands
 
-The command surface separates site work from targeted editorial validation.
-
-### Site Commands
-
-These commands no longer invoke `eipw`:
-
-```bash
-build-eips check
-build-eips build
-build-eips serve
-```
-
-The generated `justfile` keeps the runtime, parity, and dirty runtime recipes:
-
-```bash
-just check
-just build
-just serve
-just parity-build
-just dirty-build
-just dirty-serve
-```
-
-### Parity Profile
-
-Use the parity profile when you want to test the active content repo against
-remote sibling and theme inputs instead of local checkouts:
-
-```bash
-build-eips --profile parity check
-build-eips --profile parity build
-build-eips --profile parity preview
-```
-
-### Editorial Commands
-
-Use the explicit editorial surface when you want targeted `eipw` validation:
+Use the explicit editorial command group when you want targeted `eipw`
+validation:
 
 ```bash
 build-eips editorial lint content/07949.md
@@ -289,34 +200,17 @@ Selector modes are mutually exclusive:
 `editorial build` runs targeted editorial validation first, then reuses the
 runtime `check` path.
 
-## Serve and Preview
+## Serve And Preview
 
 Local serving keeps two distinct modes:
 
 - `build-eips serve` for the runtime dev loop
 - `build-eips preview` for serving already-built static output
 
-### Dirty Serve
-
-`build-eips --profile dirty serve` is the live local editing loop. It performs
-the expensive runtime preparation once at startup, then watches the real active
-content repo and mirrors tracked edits into the materialized repo that Zola is
-serving from.
-
-### Static Preview
-
 `build-eips preview` serves the resolved output directory for the active
 profile without invoking Zola, preprocessing markdown, or rebuilding anything.
 If the output directory does not exist yet, it fails and tells you to run
 `build-eips build` first.
-
-The generated `justfile` also exposes:
-
-```bash
-just preview
-just parity-preview
-just dirty-preview
-```
 
 [`ethereum/EIPs`]: https://github.com/ethereum/EIPs/
 [`ethereum/ERCs`]: https://github.com/ethereum/ERCs/
