@@ -151,6 +151,25 @@ impl RepositoryUse {
     }
 }
 
+pub fn clone_missing_repo(url: &str, destination: &Path) -> Result<(), Error> {
+    if destination.exists() {
+        git2::Repository::open(destination).context(GitSnafu {
+            what: "open existing workspace repository",
+        })?;
+        info!(
+            "using existing workspace repo `{}`",
+            destination.to_string_lossy()
+        );
+        return Ok(());
+    }
+
+    info!("cloning `{url}` into `{}`", destination.to_string_lossy());
+    git2::Repository::clone(url, destination).context(GitSnafu {
+        what: "clone workspace repository",
+    })?;
+    Ok(())
+}
+
 fn is_generated_path(path: &Path) -> bool {
     path.components()
         .next()

@@ -19,6 +19,7 @@ mod zola;
 use std::{
     collections::BTreeSet,
     ffi::OsStr,
+    fmt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -36,18 +37,17 @@ use notify::{Event, RecursiveMode, Watcher};
 use snafu::{OptionExt, Report, ResultExt, Whatever};
 use url::Url;
 
-use crate::config::{Config, LoadedWorkspaceConfig, LocalOverrides};
+use crate::config::{Config, LoadedWorkspaceConfig, SelectedProfile, SourceSelection};
 
 const CONTENT_DIR: &str = "content";
 const BUILD_DIR: &str = "build";
 const REPO_DIR: &str = "repo";
 const OUTPUT_DIR: &str = "output";
-const JUSTFILE_NAME: &str = "justfile";
 const PLATFORM_PREPROCESSOR_URL: &str = "https://github.com/eips-wg/preprocessor.git";
 const PLATFORM_EIPW_URL: &str = "https://github.com/ethereum/eipw.git";
 
 #[derive(Debug, Clone)]
-pub(crate) enum ThemeSource {
+enum ThemeSource {
     Remote { repository: String, commit: String },
     Local { path: PathBuf },
 }
@@ -60,39 +60,55 @@ struct Args {
     #[clap(short = 'C')]
     root: Option<PathBuf>,
 
-    /// Use the staging repositories (for testing)
-    #[clap(long = "staging")]
-    staging: bool,
-
     /// Load workspace defaults from CONFIG instead of auto-discovering `.build-eips.toml`
     #[clap(long)]
     config: Option<PathBuf>,
 
-    /// Use the named local profile from `.build-eips.toml`
+    /// Use the named custom or built-in profile
     #[clap(long)]
     profile: Option<String>,
 
-    /// Use a local theme checkout instead of the configured remote theme
+    /// Force the staging repositories and base URLs
     #[clap(long)]
-    theme_path: Option<PathBuf>,
+    staging: bool,
 
-    /// Use a local checkout for the sibling content repository
+    /// Force the production repositories and base URLs
     #[clap(long)]
-    other_repo_path: Option<PathBuf>,
+    no_staging: bool,
+
+    /// Use a local theme checkout at PATH
+    #[clap(long)]
+    theme: Option<PathBuf>,
+
+    /// Use the configured remote theme instead of a workspace-local theme
+    #[clap(long)]
+    remote_theme: bool,
+
+    /// Use a local sibling content repository checkout at PATH
+    #[clap(long)]
+    sibling_repo: Option<PathBuf>,
+
+    /// Use the configured remote sibling content repository
+    #[clap(long)]
+    remote_sibling_repo: bool,
 
     /// Write build artifacts under BUILD_ROOT instead of the default location
     #[clap(long)]
     build_root: Option<PathBuf>,
 
-    /// Use tracked working-tree changes from the active content repo without requiring a commit
+    /// Force dirty mode on for tracked working-tree changes
     #[clap(long)]
     allow_dirty: bool,
+
+    /// Force dirty mode off
+    #[clap(long)]
+    no_allow_dirty: bool,
 
     #[clap(subcommand)]
     operation: Operation,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum Operation {
     /// Print various useful things, like available lints
     Print {
@@ -135,6 +151,45 @@ enum Operation {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+
+    /// Run a normal command with the built-in parity profile
+    Parity {
+        #[command(subcommand)]
+        command: ProfiledOperation,
+    },
+
+    /// Run a normal command with the built-in dirty profile
+    Dirty {
+        #[command(subcommand)]
+        command: ProfiledOperation,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ProfiledOperation {
+    /// Build the project and output HTML
+    Build,
+
+    /// Build the project and launch a web server to preview it
+    Serve,
+
+    /// Serve the existing built output without rebuilding it
+    Preview,
+
+    /// Remove temporary and output files
+    Clean,
+
+    /// Analyze the repository and report errors, but don't build HTML files
+    Check,
+
+    /// List files changed since the last commit common to both the local and upstream repositories
+    Changed {
+        /// List all changed files, not just proposals
+        #[arg(long, short)]
+        all: bool,
+        #[clap(long, value_enum, default_value_t)]
+        format: ChangedFormat,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -149,10 +204,7 @@ enum WorkspaceCommand {
         platform_dev: bool,
     },
 
-    /// Regenerate generated workspace helper files
-    Refresh,
-
-    /// Check whether the local workspace is ready for the local daily workflow
+    /// Check whether the local workspace bootstrap is ready for daily commands
     Doctor,
 }
 
@@ -213,11 +265,31 @@ struct ResolvedExecution {
     source_materialization: git::SourceMaterialization,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum GeneratedFileState {
-    Created,
-    Updated,
-    Current,
+#[derive(Debug, Clone)]
+enum RuntimeOperation {
+    Build,
+    Serve,
+    Preview,
+    Clean,
+    Check,
+    Changed { all: bool, format: ChangedFormat },
+    Editorial { command: EditorialCommand },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectedSource {
+    WorkspaceLocal,
+    ExplicitLocal(PathBuf),
+    Remote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutionSettings {
+    build_root: Option<PathBuf>,
+    staging: bool,
+    allow_dirty: bool,
+    theme: SelectedSource,
+    sibling: SelectedSource,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -237,6 +309,67 @@ struct DoctorReport {
 struct WorkspaceCommandContext {
     search_from: PathBuf,
     config_path: Option<PathBuf>,
+}
+
+impl Operation {
+    fn profile_alias_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Parity { .. } => Some(config::PARITY_PROFILE),
+            Self::Dirty { .. } => Some(config::DIRTY_PROFILE),
+            Self::Print { .. }
+            | Self::Build
+            | Self::Serve
+            | Self::Preview
+            | Self::Clean
+            | Self::Check
+            | Self::Changed { .. }
+            | Self::Editorial { .. }
+            | Self::Workspace { .. } => None,
+        }
+    }
+
+    fn runtime_operation(&self) -> Option<RuntimeOperation> {
+        match self {
+            Self::Print { .. } | Self::Workspace { .. } => None,
+            Self::Build => Some(RuntimeOperation::Build),
+            Self::Serve => Some(RuntimeOperation::Serve),
+            Self::Preview => Some(RuntimeOperation::Preview),
+            Self::Clean => Some(RuntimeOperation::Clean),
+            Self::Check => Some(RuntimeOperation::Check),
+            Self::Changed { all, format } => Some(RuntimeOperation::Changed {
+                all: *all,
+                format: format.clone(),
+            }),
+            Self::Editorial { command } => Some(RuntimeOperation::Editorial {
+                command: command.clone(),
+            }),
+            Self::Parity { command } | Self::Dirty { command } => Some(command.runtime_operation()),
+        }
+    }
+
+    fn is_workspace_command(&self) -> bool {
+        matches!(self, Self::Workspace { .. })
+    }
+
+    fn is_print_command(&self) -> bool {
+        matches!(self, Self::Print { .. })
+    }
+}
+
+impl ProfiledOperation {
+    fn runtime_operation(&self) -> RuntimeOperation {
+        match self {
+            Self::Build => RuntimeOperation::Build,
+            Self::Serve => RuntimeOperation::Serve,
+            Self::Preview => RuntimeOperation::Preview,
+            Self::Clean => RuntimeOperation::Clean,
+            Self::Check => RuntimeOperation::Check,
+            Self::Changed { all, format } => RuntimeOperation::Changed {
+                all: *all,
+                format: format.clone(),
+            },
+        }
+    }
 }
 
 impl ChangedFormat {
@@ -273,23 +406,15 @@ impl ChangedFormat {
     }
 }
 
-impl GeneratedFileState {
-    fn verb(self) -> &'static str {
-        match self {
-            Self::Created => "generated",
-            Self::Updated => "refreshed",
-            Self::Current => "already current",
-        }
-    }
-}
-
-impl DoctorStatus {
-    fn label(self) -> &'static str {
-        match self {
+impl fmt::Display for DoctorStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
             Self::Ok => "ok",
             Self::Warn => "warn",
             Self::Fail => "fail",
-        }
+        };
+
+        f.write_str(label)
     }
 }
 
@@ -301,7 +426,7 @@ impl DoctorReport {
             DoctorStatus::Fail => self.failures += 1,
         }
 
-        println!("[{}] {}", status.label(), message.as_ref());
+        println!("[{status}] {}", message.as_ref());
     }
 }
 
@@ -376,95 +501,174 @@ fn load_workspace_command_context(args: &Args) -> Result<WorkspaceCommandContext
     })
 }
 
-fn generated_justfile_text() -> &'static str {
-    r#"# Generated by `build-eips workspace refresh`.
-default:
-    @just --list
-
-check:
-    build-eips -C "{{ invocation_directory() }}" check
-
-build:
-    build-eips -C "{{ invocation_directory() }}" build
-
-serve:
-    build-eips -C "{{ invocation_directory() }}" serve
-
-preview:
-    build-eips -C "{{ invocation_directory() }}" preview
-
-parity-check:
-    build-eips -C "{{ invocation_directory() }}" --profile parity check
-
-parity-build:
-    build-eips -C "{{ invocation_directory() }}" --profile parity build
-
-parity-serve:
-    build-eips -C "{{ invocation_directory() }}" --profile parity serve
-
-parity-preview:
-    build-eips -C "{{ invocation_directory() }}" --profile parity preview
-
-dirty-build:
-    build-eips -C "{{ invocation_directory() }}" --profile dirty build
-
-dirty-serve:
-    build-eips -C "{{ invocation_directory() }}" --profile dirty serve
-
-dirty-preview:
-    build-eips -C "{{ invocation_directory() }}" --profile dirty preview
-
-editorial-lint:
-    build-eips -C "{{ invocation_directory() }}" editorial lint --working-tree
-
-editorial-build:
-    build-eips -C "{{ invocation_directory() }}" editorial build --working-tree
-"#
+fn has_execution_override_flags(args: &Args) -> bool {
+    args.profile.is_some()
+        || args.staging
+        || args.no_staging
+        || args.theme.is_some()
+        || args.remote_theme
+        || args.sibling_repo.is_some()
+        || args.remote_sibling_repo
+        || args.build_root.is_some()
+        || args.allow_dirty
+        || args.no_allow_dirty
 }
 
-fn sync_generated_file(path: &Path, contents: &str) -> Result<GeneratedFileState, Whatever> {
-    match std::fs::read_to_string(path) {
-        Ok(existing) if existing == contents => Ok(GeneratedFileState::Current),
-        Ok(_) => {
-            std::fs::write(path, contents)
-                .whatever_context("unable to update generated workspace helper")?;
-            Ok(GeneratedFileState::Updated)
+fn validate_non_execution_command_flags(args: &Args) -> Result<(), Whatever> {
+    if args.operation.is_workspace_command() {
+        if args.profile.is_some() {
+            snafu::whatever!("`--profile` cannot be used with `workspace` commands");
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(path, contents)
-                .whatever_context("unable to write generated workspace helper")?;
-            Ok(GeneratedFileState::Created)
+
+        if has_execution_override_flags(args) {
+            snafu::whatever!("execution override flags cannot be used with `workspace` commands");
         }
-        Err(error) => snafu::whatever!(
-            "unable to read generated workspace helper `{}`: {}",
-            path.to_string_lossy(),
-            Report::from_error(error)
-        ),
+    }
+
+    if args.operation.is_print_command() && has_execution_override_flags(args) {
+        snafu::whatever!("execution override flags cannot be used with `print`");
+    }
+
+    Ok(())
+}
+
+fn requested_profile_name(args: &Args) -> Result<Option<&str>, Whatever> {
+    match (args.operation.profile_alias_name(), args.profile.as_deref()) {
+        (Some(alias), Some(profile)) => {
+            snafu::whatever!("cannot combine profile alias `{alias}` with `--profile {profile}`")
+        }
+        (Some(alias), None) => Ok(Some(alias)),
+        (None, profile) => Ok(profile),
     }
 }
 
-fn refresh_workspace(args: &Args) -> Result<(), Whatever> {
-    let context = load_workspace_command_context(args)?;
-    let loaded_config = context
-        .config_path
+fn resolve_bool_override(
+    enabled: bool,
+    disabled: bool,
+    enabled_flag: &str,
+    disabled_flag: &str,
+) -> Result<Option<bool>, Whatever> {
+    match (enabled, disabled) {
+        (true, true) => {
+            snafu::whatever!("cannot pass both `{enabled_flag}` and `{disabled_flag}`")
+        }
+        (true, false) => Ok(Some(true)),
+        (false, true) => Ok(Some(false)),
+        (false, false) => Ok(None),
+    }
+}
+
+fn resolve_source_override(
+    local_path: Option<PathBuf>,
+    force_remote: bool,
+    local_flag: &str,
+    remote_flag: &str,
+) -> Result<Option<SelectedSource>, Whatever> {
+    match (local_path, force_remote) {
+        (Some(_), true) => snafu::whatever!("cannot pass both `{local_flag}` and `{remote_flag}`"),
+        (Some(path), false) => Ok(Some(SelectedSource::ExplicitLocal(path))),
+        (None, true) => Ok(Some(SelectedSource::Remote)),
+        (None, false) => Ok(None),
+    }
+}
+
+fn resolve_execution_settings(
+    args: &Args,
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+    selected_profile: Option<&SelectedProfile>,
+) -> Result<ExecutionSettings, Whatever> {
+    let build_root = args
+        .build_root
         .as_deref()
-        .map(LoadedWorkspaceConfig::from_path)
-        .transpose()
-        .whatever_context("unable to load workspace config")?;
-    let config = loaded_config
-        .as_ref()
-        .whatever_context("unable to find workspace config `.build-eips.toml`")?;
-    let justfile_path = config.workspace_root().join(JUSTFILE_NAME);
-    let state = sync_generated_file(&justfile_path, generated_justfile_text())?;
-    info!("{} `{}`", state.verb(), justfile_path.to_string_lossy());
-    Ok(())
+        .map(resolve_input_path)
+        .transpose()?;
+    let staging =
+        resolve_bool_override(args.staging, args.no_staging, "--staging", "--no-staging")?
+            .unwrap_or_else(|| {
+                selected_profile
+                    .map(|profile| profile.profile.staging)
+                    .unwrap_or(false)
+            });
+    let allow_dirty = resolve_bool_override(
+        args.allow_dirty,
+        args.no_allow_dirty,
+        "--allow-dirty",
+        "--no-allow-dirty",
+    )?
+    .unwrap_or_else(|| {
+        selected_profile
+            .map(|profile| profile.profile.allow_dirty)
+            .unwrap_or(false)
+    });
+    let theme_override = resolve_source_override(
+        args.theme.as_deref().map(resolve_input_path).transpose()?,
+        args.remote_theme,
+        "--theme",
+        "--remote-theme",
+    )?;
+    let sibling_override = resolve_source_override(
+        args.sibling_repo
+            .as_deref()
+            .map(resolve_input_path)
+            .transpose()?,
+        args.remote_sibling_repo,
+        "--sibling-repo",
+        "--remote-sibling-repo",
+    )?;
+
+    let default_theme = selected_profile
+        .map(|profile| profile.profile.theme)
+        .unwrap_or(SourceSelection::Remote);
+    let default_sibling = selected_profile
+        .map(|profile| profile.profile.sibling)
+        .unwrap_or(SourceSelection::Remote);
+    let missing_theme = theme_override.is_none()
+        && default_theme == SourceSelection::Local
+        && workspace_config.is_none();
+    let missing_sibling = sibling_override.is_none()
+        && default_sibling == SourceSelection::Local
+        && workspace_config.is_none();
+
+    if missing_theme || missing_sibling {
+        let profile_name = selected_profile
+            .map(|profile| profile.name.as_str())
+            .unwrap_or("selected profile");
+        let required_sources = match (missing_theme, missing_sibling) {
+            (true, true) => "theme and sibling",
+            (true, false) => "theme",
+            (false, true) => "sibling",
+            (false, false) => unreachable!(),
+        };
+
+        snafu::whatever!(
+            "profile `{profile_name}` requires workspace-local {required_sources} sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips workspace init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--theme <path>` and/or `--sibling-repo <path>` for local overrides\n3. pass `--remote-theme` and/or `--remote-sibling-repo` for remote overrides\n4. switch to `--profile parity` if remote defaults are what you actually want",
+            config::LOCAL_CONFIG_FILE
+        );
+    }
+
+    let theme = theme_override.unwrap_or(match default_theme {
+        SourceSelection::Local => SelectedSource::WorkspaceLocal,
+        SourceSelection::Remote => SelectedSource::Remote,
+    });
+    let sibling = sibling_override.unwrap_or(match default_sibling {
+        SourceSelection::Local => SelectedSource::WorkspaceLocal,
+        SourceSelection::Remote => SelectedSource::Remote,
+    });
+
+    Ok(ExecutionSettings {
+        build_root,
+        staging,
+        allow_dirty,
+        theme,
+        sibling,
+    })
 }
 
 fn command_path(command: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
 
     #[cfg(not(windows))]
-    let candidates = vec![command.to_owned()];
+    let candidates = [command.to_owned()];
 
     #[cfg(windows)]
     {
@@ -581,16 +785,12 @@ fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
     let mut report = DoctorReport::default();
 
     match context.config_path.as_ref() {
-        Some(path) if path.is_file() => report.record(
+        Some(path) => report.record(
             DoctorStatus::Ok,
             format!(
                 "found workspace config candidate `{}`",
                 path.to_string_lossy()
             ),
-        ),
-        Some(path) => report.record(
-            DoctorStatus::Fail,
-            format!("expected workspace config at `{}`", path.to_string_lossy()),
         ),
         None => report.record(
             DoctorStatus::Fail,
@@ -602,17 +802,18 @@ fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
         ),
     }
 
-    let parsed_config = match context.config_path.as_deref() {
-        Some(path) if path.is_file() => Some(LoadedWorkspaceConfig::from_path(path)).transpose(),
-        Some(_) | None => Ok(None),
-    };
+    let parsed_config = context
+        .config_path
+        .as_deref()
+        .map(LoadedWorkspaceConfig::from_path)
+        .transpose();
 
     if let Ok(Some(config)) = parsed_config.as_ref() {
         report.record(
             DoctorStatus::Ok,
             format!(
                 "workspace config parses at `{}`",
-                config.path().to_string_lossy()
+                config.config_path().to_string_lossy()
             ),
         );
 
@@ -637,39 +838,6 @@ fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
 
         for repo_name in ["EIPs", "ERCs", config::DEFAULT_THEME_DIR] {
             check_workspace_repo(&mut report, workspace_root, repo_name);
-        }
-
-        let justfile_path = workspace_root.join(JUSTFILE_NAME);
-        match std::fs::read_to_string(&justfile_path) {
-            Ok(existing) if existing == generated_justfile_text() => report.record(
-                DoctorStatus::Ok,
-                format!(
-                    "generated helper `{}` is current",
-                    justfile_path.to_string_lossy()
-                ),
-            ),
-            Ok(_) => report.record(
-                DoctorStatus::Fail,
-                format!(
-                    "generated helper `{}` is stale; run `build-eips workspace refresh`",
-                    justfile_path.to_string_lossy()
-                ),
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => report.record(
-                DoctorStatus::Fail,
-                format!(
-                    "generated helper `{}` is missing; run `build-eips workspace refresh`",
-                    justfile_path.to_string_lossy()
-                ),
-            ),
-            Err(error) => report.record(
-                DoctorStatus::Fail,
-                format!(
-                    "unable to read generated helper `{}`: {}",
-                    justfile_path.to_string_lossy(),
-                    Report::from_error(error)
-                ),
-            ),
         }
     } else if let Err(error) = parsed_config {
         report.record(
@@ -698,22 +866,17 @@ fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
     check_tool(
         &mut report,
         "build-eips",
-        "`just` recipes call `build-eips` directly, so install the release binary or put your dev build on PATH",
+        "workspace bootstrap and daily commands expect `build-eips` on PATH",
     );
     check_tool(
         &mut report,
         "git",
-        "workspace init, refresh, and daily builds expect git to be available",
+        "workspace bootstrap and daily commands expect git to be available",
     );
     check_tool(
         &mut report,
         "zola",
-        "daily build, check, and serve commands need a working zola binary",
-    );
-    check_tool(
-        &mut report,
-        "just",
-        "local daily commands use the generated workspace justfile",
+        "build, check, and serve commands need a working zola binary",
     );
     check_optional_download_tool(&mut report);
 
@@ -751,7 +914,7 @@ fn make_build_dir(build_path: &Path) -> Result<PathBuf, Whatever> {
     Ok(build_path.to_path_buf())
 }
 
-fn apply_local_other_repo(
+fn apply_local_sibling_repo(
     repository_use: &mut git::RepositoryUse,
     path: &Path,
 ) -> Result<(), Whatever> {
@@ -774,11 +937,10 @@ fn build_path(
     root_path: &Path,
     repository_use: &git::RepositoryUse,
     workspace_config: Option<&LoadedWorkspaceConfig>,
-    overrides: &LocalOverrides,
+    build_root: Option<&Path>,
 ) -> PathBuf {
-    overrides
-        .build_root
-        .clone()
+    build_root
+        .map(Path::to_path_buf)
         .or_else(|| {
             workspace_config
                 .map(|workspace_config| workspace_config.build_root_for(&repository_use.title))
@@ -793,26 +955,40 @@ fn output_path(build_path: &Path) -> PathBuf {
 fn theme_source(
     baseline: &Config,
     workspace_config: Option<&LoadedWorkspaceConfig>,
-    selected_profile: Option<&config::SelectedProfile>,
-    overrides: &LocalOverrides,
+    theme: &SelectedSource,
 ) -> ThemeSource {
-    let theme_path =
-        overrides
-            .theme_path
-            .clone()
-            .or_else(|| match (workspace_config, selected_profile) {
-                (Some(workspace_config), Some(profile)) if profile.profile.use_local_theme => {
-                    Some(workspace_config.local_theme_path())
-                }
-                _ => None,
-            });
-
-    match theme_path {
-        Some(path) => ThemeSource::Local { path },
-        None => ThemeSource::Remote {
+    match theme {
+        SelectedSource::ExplicitLocal(path) => ThemeSource::Local { path: path.clone() },
+        SelectedSource::WorkspaceLocal => ThemeSource::Local {
+            path: workspace_config
+                .expect("workspace-local theme selection requires a workspace config")
+                .local_theme_path(),
+        },
+        SelectedSource::Remote => ThemeSource::Remote {
             repository: baseline.theme.repository.to_string(),
             commit: baseline.theme.commit.clone(),
         },
+    }
+}
+
+fn sibling_repo_path(
+    repository_use: &git::RepositoryUse,
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+    sibling: &SelectedSource,
+) -> Result<Option<PathBuf>, Whatever> {
+    match sibling {
+        SelectedSource::ExplicitLocal(path) => Ok(Some(path.clone())),
+        SelectedSource::WorkspaceLocal => {
+            let workspace_config = workspace_config.whatever_context(
+                "workspace-local sibling selection requires a workspace config",
+            )?;
+            let (other_name, _) = repository_use.only_other_repo().whatever_context(
+                "local sibling overrides require exactly one sibling repository",
+            )?;
+
+            Ok(Some(workspace_config.local_repo_path(other_name)))
+        }
+        SelectedSource::Remote => Ok(None),
     }
 }
 
@@ -820,50 +996,29 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     let root_path = root(args)?;
     let workspace_config = LoadedWorkspaceConfig::load(args.config.as_deref(), &root_path)
         .whatever_context("unable to load workspace config")?;
-    let selected_profile =
-        config::selected_profile(workspace_config.as_ref(), args.profile.as_deref())
-            .whatever_context("unable to select workspace profile")?;
+    let requested_profile = requested_profile_name(args)?;
+    let selected_profile = match workspace_config.as_ref() {
+        Some(workspace_config) => workspace_config
+            .selected_profile(requested_profile)
+            .whatever_context("unable to select profile")?,
+        None => config::selected_profile(None, requested_profile)
+            .whatever_context("unable to select profile")?,
+    };
 
     if let Some(workspace_config) = workspace_config.as_ref() {
         debug!(
             "using workspace config `{}`",
-            workspace_config.path().to_string_lossy()
+            workspace_config.config_path().to_string_lossy()
         );
     }
 
     if let Some(profile) = selected_profile.as_ref() {
-        info!("using workspace profile `{}`", profile.name);
+        info!("using selected profile `{}`", profile.name);
     }
 
-    let overrides = LocalOverrides {
-        theme_path: args
-            .theme_path
-            .as_deref()
-            .map(resolve_input_path)
-            .transpose()?,
-        other_repo_path: args
-            .other_repo_path
-            .as_deref()
-            .map(resolve_input_path)
-            .transpose()?,
-        build_root: args
-            .build_root
-            .as_deref()
-            .map(resolve_input_path)
-            .transpose()?,
-    };
-
-    let use_staging = args.staging
-        || selected_profile
-            .as_ref()
-            .map(|profile| profile.profile.staging)
-            .unwrap_or(false);
-    let allow_dirty = args.allow_dirty
-        || selected_profile
-            .as_ref()
-            .map(|profile| profile.profile.allow_dirty)
-            .unwrap_or(false);
-    let baseline = if use_staging {
+    let settings =
+        resolve_execution_settings(args, workspace_config.as_ref(), selected_profile.as_ref())?;
+    let baseline = if settings.staging {
         Config::staging()
     } else {
         Config::production()
@@ -874,33 +1029,24 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
         .identify_repository(&root_path)
         .whatever_context("cannot identify repository use")?;
 
-    let other_repo_path = overrides.other_repo_path.clone().or_else(|| {
-        match (workspace_config.as_ref(), selected_profile.as_ref()) {
-            (Some(workspace_config), Some(profile)) if profile.profile.use_local_sibling => {
-                let (other_name, _) = repository_use.only_other_repo()?;
-                Some(workspace_config.local_repo_path(other_name))
-            }
-            _ => None,
-        }
-    });
+    let sibling_repo_path = sibling_repo_path(
+        &repository_use,
+        workspace_config.as_ref(),
+        &settings.sibling,
+    )?;
 
-    if let Some(path) = other_repo_path {
-        apply_local_other_repo(&mut repository_use, &path)?;
+    if let Some(path) = sibling_repo_path {
+        apply_local_sibling_repo(&mut repository_use, &path)?;
     }
 
     let build_path = build_path(
         &root_path,
         &repository_use,
         workspace_config.as_ref(),
-        &overrides,
+        settings.build_root.as_deref(),
     );
-    let theme = theme_source(
-        &baseline,
-        workspace_config.as_ref(),
-        selected_profile.as_ref(),
-        &overrides,
-    );
-    let source_materialization = if allow_dirty {
+    let theme = theme_source(&baseline, workspace_config.as_ref(), &settings.theme);
+    let source_materialization = if settings.allow_dirty {
         info!(
             "dirty mode is enabled; tracked working-tree changes from the active content repo will be materialized into the build input"
         );
@@ -1378,22 +1524,6 @@ fn editorial_runtime_execution(
     runtime
 }
 
-fn clone_missing_repo(url: &str, destination: &Path) -> Result<(), Whatever> {
-    if destination.exists() {
-        git2::Repository::open(destination)
-            .whatever_context("expected existing workspace repo path to be a git repository")?;
-        info!(
-            "using existing workspace repo `{}`",
-            destination.to_string_lossy()
-        );
-        return Ok(());
-    }
-
-    info!("cloning `{url}` into `{}`", destination.to_string_lossy());
-    git2::Repository::clone(url, destination).whatever_context("unable to clone workspace repo")?;
-    Ok(())
-}
-
 fn init_workspace(args: &Args, path: PathBuf, platform_dev: bool) -> Result<(), Whatever> {
     let root_path = root(args)?;
     let workspace_root = resolve_input_path(&path)?;
@@ -1422,18 +1552,22 @@ fn init_workspace(args: &Args, path: PathBuf, platform_dev: bool) -> Result<(), 
     let (other_name, other_url) = repository_use
         .only_other_repo()
         .whatever_context("workspace init requires exactly one sibling repository")?;
-    clone_missing_repo(other_url.as_str(), &workspace_root.join(other_name))?;
-    clone_missing_repo(
+    git::clone_missing_repo(other_url.as_str(), &workspace_root.join(other_name))
+        .whatever_context("unable to clone workspace sibling repo")?;
+    git::clone_missing_repo(
         workspace_config.theme.repository.as_str(),
         &workspace_root.join(config::DEFAULT_THEME_DIR),
-    )?;
+    )
+    .whatever_context("unable to clone workspace theme repo")?;
 
     if platform_dev {
-        clone_missing_repo(
+        git::clone_missing_repo(
             PLATFORM_PREPROCESSOR_URL,
             &workspace_root.join("preprocessor"),
-        )?;
-        clone_missing_repo(PLATFORM_EIPW_URL, &workspace_root.join("eipw"))?;
+        )
+        .whatever_context("unable to clone workspace preprocessor repo")?;
+        git::clone_missing_repo(PLATFORM_EIPW_URL, &workspace_root.join("eipw"))
+            .whatever_context("unable to clone workspace eipw repo")?;
     }
 
     std::fs::create_dir_all(workspace_root.join(config::DEFAULT_BUILD_ROOT_BASE))
@@ -1455,6 +1589,7 @@ fn init_workspace(args: &Args, path: PathBuf, platform_dev: bool) -> Result<(), 
 
 fn run() -> Result<(), Whatever> {
     let args = Args::parse();
+    validate_non_execution_command_flags(&args)?;
 
     if let Operation::Print { print } = &args.operation {
         print::print(print.clone());
@@ -1466,15 +1601,18 @@ fn run() -> Result<(), Whatever> {
             WorkspaceCommand::Init { path, platform_dev } => {
                 init_workspace(&args, path, platform_dev)?
             }
-            WorkspaceCommand::Refresh => refresh_workspace(&args)?,
             WorkspaceCommand::Doctor => doctor_workspace(&args)?,
         }
         return Ok(());
     }
 
+    let runtime_operation = args
+        .operation
+        .runtime_operation()
+        .expect("non-execution commands should have returned earlier");
     let resolved = resolve_execution(&args)?;
 
-    if matches!(&args.operation, Operation::Preview) {
+    if matches!(runtime_operation, RuntimeOperation::Preview) {
         preview::serve(&output_path(&resolved.build_path))
             .whatever_context("preview server failed")?;
         return Ok(());
@@ -1483,9 +1621,8 @@ fn run() -> Result<(), Whatever> {
     let build_path = make_build_dir(&resolved.build_path)?;
     let mut lock_file = lock(&build_path)?;
 
-    match args.operation {
-        Operation::Print { .. } | Operation::Workspace { .. } => unreachable!(),
-        Operation::Clean => {
+    match runtime_operation {
+        RuntimeOperation::Clean => {
             // TODO: There's a race condition here. Maybe we move the lockfile to the repository
             //       root?
             lock_file
@@ -1495,17 +1632,17 @@ fn run() -> Result<(), Whatever> {
                 .whatever_context("unable to remove build directory")?;
             return Ok(());
         }
-        Operation::Check => {
+        RuntimeOperation::Check => {
             Prepared::prepare(resolved)?.check()?;
         }
-        Operation::Build => {
+        RuntimeOperation::Build => {
             Prepared::prepare(resolved)?.build()?;
         }
-        Operation::Serve => {
+        RuntimeOperation::Serve => {
             Prepared::prepare(resolved)?.serve()?;
         }
-        Operation::Preview => unreachable!(),
-        Operation::Changed { all, format } => {
+        RuntimeOperation::Preview => unreachable!(),
+        RuntimeOperation::Changed { all, format } => {
             let repo_path = build_path.join(REPO_DIR);
 
             let both = git::Fresh::new(
@@ -1530,7 +1667,7 @@ fn run() -> Result<(), Whatever> {
 
             format.print(&changed_files, &repo_path);
         }
-        Operation::Editorial { command } => match command {
+        RuntimeOperation::Editorial { command } => match command {
             EditorialCommand::Lint { selectors, eipw } => {
                 run_editorial_lint(&resolved, &selectors, eipw)?;
             }
@@ -1547,6 +1684,265 @@ fn run() -> Result<(), Whatever> {
 
     info!("build finished :3");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use tempfile::TempDir;
+
+    use super::{
+        requested_profile_name, resolve_execution_settings, validate_non_execution_command_flags,
+        Args, EditorialCommand, ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation,
+        SelectedSource, WorkspaceCommand,
+    };
+    use crate::config::{self, LoadedWorkspaceConfig};
+
+    fn parse_args(arguments: &[&str]) -> Args {
+        Args::try_parse_from(arguments).unwrap()
+    }
+
+    fn load_workspace_config(contents: &str) -> LoadedWorkspaceConfig {
+        let workspace = TempDir::new().unwrap();
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(&config_path, contents).unwrap();
+        LoadedWorkspaceConfig::from_path(&config_path).unwrap()
+    }
+
+    fn selected_profile(
+        args: &Args,
+        workspace_config: Option<&LoadedWorkspaceConfig>,
+    ) -> crate::config::SelectedProfile {
+        let requested = requested_profile_name(args).unwrap();
+        config::selected_profile(workspace_config, requested)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn profile_alias_parses_as_a_command_prefix() {
+        let args = parse_args(&["build-eips", "parity", "build"]);
+
+        assert!(matches!(
+            args.operation,
+            Operation::Parity {
+                command: ProfiledOperation::Build
+            }
+        ));
+        assert_eq!(
+            requested_profile_name(&args).unwrap(),
+            Some(config::PARITY_PROFILE)
+        );
+    }
+
+    #[test]
+    fn profile_alias_and_profile_flag_conflict() {
+        let args = parse_args(&["build-eips", "--profile", "local", "parity", "build"]);
+        let error = requested_profile_name(&args).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot combine profile alias `parity` with `--profile local`"));
+    }
+
+    #[test]
+    fn workspace_commands_reject_profile_selection() {
+        let args = parse_args(&["build-eips", "--profile", "local", "workspace", "doctor"]);
+        let error = validate_non_execution_command_flags(&args).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("`--profile` cannot be used with `workspace` commands"));
+    }
+
+    #[test]
+    fn command_groups_route_separately_from_profile_aliases() {
+        let workspace = parse_args(&["build-eips", "workspace", "init", "/tmp/workspace"]);
+        let doctor = parse_args(&["build-eips", "workspace", "doctor"]);
+        let editorial_lint = parse_args(&[
+            "build-eips",
+            "--profile",
+            "parity",
+            "editorial",
+            "lint",
+            "--working-tree",
+        ]);
+        let editorial_build = parse_args(&[
+            "build-eips",
+            "--profile",
+            "parity",
+            "editorial",
+            "build",
+            "--working-tree",
+        ]);
+
+        assert!(matches!(
+            workspace.operation,
+            Operation::Workspace {
+                command: WorkspaceCommand::Init { .. }
+            }
+        ));
+        assert!(matches!(
+            doctor.operation,
+            Operation::Workspace {
+                command: WorkspaceCommand::Doctor
+            }
+        ));
+        assert!(matches!(
+            editorial_lint.operation.runtime_operation(),
+            Some(RuntimeOperation::Editorial {
+                command: EditorialCommand::Lint { .. }
+            })
+        ));
+        assert!(matches!(
+            editorial_build.operation.runtime_operation(),
+            Some(RuntimeOperation::Editorial {
+                command: EditorialCommand::Build { .. }
+            })
+        ));
+        assert!(validate_non_execution_command_flags(&editorial_lint).is_ok());
+        assert_eq!(
+            requested_profile_name(&editorial_lint).unwrap(),
+            Some(config::PARITY_PROFILE)
+        );
+    }
+
+    #[test]
+    fn reserved_command_group_name_is_not_a_profile() {
+        let args = parse_args(&["build-eips", "--profile", "editorial", "build"]);
+        let requested = requested_profile_name(&args).unwrap();
+        let error = config::selected_profile(None, requested).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("reserved for a command group and cannot be selected"));
+    }
+
+    #[test]
+    fn boolean_override_conflicts_are_hard_errors() {
+        let args = parse_args(&["build-eips", "--staging", "--no-staging", "build"]);
+        let error = resolve_execution_settings(&args, None, None).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot pass both `--staging` and `--no-staging`"));
+    }
+
+    #[test]
+    fn source_override_conflicts_are_hard_errors() {
+        let args = parse_args(&[
+            "build-eips",
+            "--theme",
+            "/tmp/theme",
+            "--remote-theme",
+            "build",
+        ]);
+        let error = resolve_execution_settings(&args, None, None).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot pass both `--theme` and `--remote-theme`"));
+    }
+
+    #[test]
+    fn dirty_profile_without_workspace_config_requires_explicit_resolution() {
+        let args = parse_args(&["build-eips", "dirty", "build"]);
+        let selected_profile = selected_profile(&args, None);
+        let error = resolve_execution_settings(&args, None, Some(&selected_profile)).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("profile `dirty` requires workspace-local theme and sibling sources")
+        );
+        assert!(message.contains("build-eips workspace init <workspace-root>"));
+        assert!(message.contains("--theme <path>` and/or `--sibling-repo <path>"));
+        assert!(message.contains("--remote-theme` and/or `--remote-sibling-repo"));
+        assert!(message.contains("switch to `--profile parity`"));
+    }
+
+    #[test]
+    fn dirty_with_remote_overrides_is_not_parity() {
+        let dirty_args = parse_args(&[
+            "build-eips",
+            "--remote-theme",
+            "--remote-sibling-repo",
+            "dirty",
+            "build",
+        ]);
+        let dirty_profile = selected_profile(&dirty_args, None);
+        let dirty_settings =
+            resolve_execution_settings(&dirty_args, None, Some(&dirty_profile)).unwrap();
+
+        let parity_args = parse_args(&["build-eips", "parity", "build"]);
+        let parity_profile = selected_profile(&parity_args, None);
+        let parity_settings =
+            resolve_execution_settings(&parity_args, None, Some(&parity_profile)).unwrap();
+
+        assert_eq!(
+            dirty_settings,
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: true,
+                theme: SelectedSource::Remote,
+                sibling: SelectedSource::Remote,
+            }
+        );
+        assert_eq!(
+            parity_settings,
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: false,
+                theme: SelectedSource::Remote,
+                sibling: SelectedSource::Remote,
+            }
+        );
+    }
+
+    #[test]
+    fn default_profile_selection_and_overrides_share_the_same_path() {
+        let workspace_config = load_workspace_config(
+            r#"
+default_profile = "local"
+
+[profiles.local]
+staging = true
+theme = "local"
+sibling = "local"
+"#,
+        );
+        let args = parse_args(&["build-eips", "--no-staging", "--remote-theme", "build"]);
+        let selected_profile = config::selected_profile(
+            Some(&workspace_config),
+            requested_profile_name(&args).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let settings =
+            resolve_execution_settings(&args, Some(&workspace_config), Some(&selected_profile))
+                .unwrap();
+
+        assert_eq!(selected_profile.name, "local");
+        assert_eq!(
+            settings,
+            ExecutionSettings {
+                build_root: None,
+                staging: false,
+                allow_dirty: false,
+                theme: SelectedSource::Remote,
+                sibling: SelectedSource::WorkspaceLocal,
+            }
+        );
+    }
+
+    #[test]
+    fn built_in_profile_can_be_selected_through_profile_flag_without_workspace_config() {
+        let args = parse_args(&["build-eips", "--profile", "dirty", "build"]);
+        let selected_profile = selected_profile(&args, None);
+
+        assert_eq!(selected_profile.name, config::DIRTY_PROFILE);
+    }
 }
 
 fn main() -> Result<(), Report<Whatever>> {
