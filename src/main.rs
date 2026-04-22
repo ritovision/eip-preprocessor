@@ -204,7 +204,7 @@ enum WorkspaceCommand {
         platform_dev: bool,
     },
 
-    /// Check whether the local workspace bootstrap is ready for daily commands
+    /// Check whether the local workspace bootstrap is ready for direct build-eips commands
     Doctor,
 }
 
@@ -866,12 +866,12 @@ fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
     check_tool(
         &mut report,
         "build-eips",
-        "workspace bootstrap and daily commands expect `build-eips` on PATH",
+        "workspace bootstrap and build-eips commands expect `build-eips` on PATH",
     );
     check_tool(
         &mut report,
         "git",
-        "workspace bootstrap and daily commands expect git to be available",
+        "workspace bootstrap and build-eips commands expect git to be available",
     );
     check_tool(
         &mut report,

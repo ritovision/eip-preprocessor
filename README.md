@@ -80,8 +80,8 @@ Validate the workspace bootstrap at any point with:
 build-eips workspace doctor
 ```
 
-After bootstrap, daily commands can run from inside `EIPs/` or `ERCs/` without
-repeating local path flags:
+After bootstrap, direct `build-eips` commands can run from inside `EIPs/` or
+`ERCs/` without repeating local path flags:
 
 ```bash
 cd /work/EIPs-project/EIPs
