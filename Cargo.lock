@@ -258,6 +258,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha3",
  "snafu",
  "tokio",

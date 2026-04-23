@@ -101,6 +101,9 @@ struct FrontMatter {
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     extra: HashMap<String, Value>,
+
+    #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
+    other: HashMap<String, Value>,
 }
 
 fn default_true() -> bool {
@@ -133,6 +136,7 @@ impl Default for FrontMatter {
             template: Default::default(),
             taxonomies: Default::default(),
             extra: Default::default(),
+            other: Default::default(),
         }
     }
 }
@@ -182,6 +186,64 @@ fn write_file(path: &Path, front_matter: FrontMatter, body: &str) -> std::io::Re
     writeln!(output, "{}", toml::to_string(&front_matter).unwrap())?;
     writeln!(output, "+++")?;
     writeln!(output, "{}", body)?;
+    Ok(())
+}
+
+fn is_structured_page(path: &Path) -> bool {
+    matches!(path.file_name().and_then(OsStr::to_str), Some("_index.md"))
+}
+
+fn split_front_matter<'a>(
+    contents: &'a str,
+) -> Result<(Option<&'static str>, &'a str, &'a str), Whatever> {
+    let (delimiter, body_start) = if contents.starts_with("---\r\n") {
+        ("---", 5)
+    } else if contents.starts_with("---\n") {
+        ("---", 4)
+    } else if contents.starts_with("+++\r\n") {
+        ("+++", 5)
+    } else if contents.starts_with("+++\n") {
+        ("+++", 4)
+    } else {
+        return Ok((None, "", contents));
+    };
+
+    let mut offset = body_start;
+    for line in contents[body_start..].split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == delimiter {
+            let front_matter = &contents[body_start..offset];
+            let body = &contents[offset + line.len()..];
+            return Ok((Some(delimiter), front_matter, body));
+        }
+        offset += line.len();
+    }
+
+    whatever!("missing closing front matter delimiter `{delimiter}`")
+}
+
+fn process_page(root: &Path, path: &Path) -> Result<(), Whatever> {
+    let path_lossy = path.to_string_lossy();
+    let contents = read_to_string(path)
+        .with_whatever_context(|_| format!("could not read file `{}`", path_lossy))?;
+    let (delimiter, front_matter, body) = split_front_matter(&contents)
+        .with_whatever_context(|_| format!("couldn't split front matter for `{}`", path_lossy))?;
+
+    let front_matter = match delimiter {
+        Some("---") => serde_yaml::from_str(front_matter).with_whatever_context(|e| {
+            format!("couldn't parse YAML front matter in `{}`: {e}", path_lossy)
+        })?,
+        Some("+++") => toml::from_str(front_matter).with_whatever_context(|e| {
+            format!("couldn't parse TOML front matter in `{}`: {e}", path_lossy)
+        })?,
+        Some(other) => whatever!("unsupported front matter delimiter `{other}`"),
+        None => FrontMatter::default(),
+    };
+
+    let body = transform_markdown(root, path, body)
+        .with_whatever_context(|_| format!("unable to transform markdown for `{path_lossy}`"))?;
+
+    write_file(path, front_matter, &body).whatever_context("couldn't write file")?;
+
     Ok(())
 }
 
@@ -271,7 +333,11 @@ pub fn preprocess(root_path: &Path) -> Result<(), Whatever> {
             process_eip(root_path, &entry_path.join("index.md"))?;
             process_assets(root_path, &entry_path)?;
         } else if entry_path.extension().and_then(OsStr::to_str) == Some("md") {
-            process_eip(root_path, &entry_path)?;
+            if is_structured_page(&entry_path) {
+                process_page(root_path, &entry_path)?;
+            } else {
+                process_eip(root_path, &entry_path)?;
+            }
         }
     }
 
@@ -672,4 +738,75 @@ fn process_eip(root: &Path, path: &Path) -> Result<(), Whatever> {
     write_file(Path::new(&path), front_matter, &body).whatever_context("couldn't write file")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{split_front_matter, FrontMatter};
+
+    #[test]
+    fn parses_nested_yaml_front_matter_for_homepage_badges() {
+        let input = r#"---
+title: Home
+extra:
+  homepage_badges:
+    - href: https://discord.gg/Nz6rtfJ8Cu
+      image: https://dcbadge.limes.pink/api/server/Nz6rtfJ8Cu?style=flat
+      alt: Badge for EIP Editor Discord channel
+---
+
+# EIPs
+"#;
+
+        let (delimiter, front_matter, body) = split_front_matter(input).unwrap();
+        assert_eq!(delimiter, Some("---"));
+        assert_eq!(body, "\n# EIPs\n");
+
+        let parsed: FrontMatter = serde_yaml::from_str(front_matter).unwrap();
+        let badges = parsed
+            .extra
+            .get("homepage_badges")
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        assert_eq!(badges.len(), 1);
+
+        let badge = badges[0].as_table().unwrap();
+        assert_eq!(
+            badge.get("href").and_then(toml::Value::as_str),
+            Some("https://discord.gg/Nz6rtfJ8Cu")
+        );
+    }
+
+    #[test]
+    fn preserves_unknown_top_level_front_matter_fields() {
+        let input = r#"---
+title: Home
+sort_by: date
+paginate_by: 20
+extra:
+  homepage_badges:
+    - href: https://discord.gg/Nz6rtfJ8Cu
+      image: https://dcbadge.limes.pink/api/server/Nz6rtfJ8Cu?style=flat
+      alt: Badge for EIP Editor Discord channel
+---
+
+# EIPs
+"#;
+
+        let (_, front_matter, _) = split_front_matter(input).unwrap();
+        let parsed: FrontMatter = serde_yaml::from_str(front_matter).unwrap();
+
+        assert_eq!(
+            parsed.other.get("sort_by").and_then(toml::Value::as_str),
+            Some("date")
+        );
+        assert_eq!(
+            parsed.other.get("paginate_by").and_then(toml::Value::as_integer),
+            Some(20)
+        );
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        assert!(serialized.contains("sort_by = \"date\""));
+        assert!(serialized.contains("paginate_by = 20"));
+    }
 }
