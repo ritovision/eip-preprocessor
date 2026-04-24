@@ -63,7 +63,7 @@ build-eips workspace init /work/EIPs-project
 
 By default this:
 
-- clones the missing sibling content repo
+- clones any missing declared sibling content repos
 - clones `theme`
 - creates `.local-build/`
 - writes `.build-eips.toml`
@@ -93,6 +93,12 @@ build-eips serve
 The generated starter config uses a custom `local` profile as the default
 workspace-local profile. The built-in `parity` and `dirty` profiles live in
 Rust and do not appear in `.build-eips.toml`.
+
+Tracked active-repo metadata lives separately in `.build-eips.repo.toml` when a
+repo provides one. That manifest owns the repo identity, environment URLs, and
+declared sibling topology; `.build-eips.toml` remains workspace-local execution
+config. During the migration window, current `EIPs` and `ERCs` checkouts without
+that manifest still use the legacy identity fallback.
 
 ## Profiles And Overrides
 
@@ -127,6 +133,11 @@ Use these flags to override the selected profile directly:
 - `--build-root <path>`
 - `--config <path>`
 - `--profile <name>`
+
+`--sibling-repo <path>` applies only when the active repo has exactly one
+declared sibling. For repos with multiple siblings, use `workspace init` for
+local sibling provisioning or `--remote-sibling-repo` to force all siblings
+remote.
 
 Example:
 
