@@ -5,15 +5,14 @@
  */
 
 use std::{
-    collections::BTreeSet,
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     path::{absolute, Path, PathBuf},
 };
 
 use crate::{
     cache::Cache,
-    config::{Location, Locations},
+    config::{LegacyLocations, RepositoryEndpoint},
     progress::{Git, ProgressIteratorExt},
 };
 use git2::{
@@ -83,12 +82,12 @@ pub enum SourceMaterialization {
 #[derive(Debug, Clone)]
 pub struct RepositoryUse {
     pub title: String,
-    pub location: Location,
-    pub other_repos: HashMap<String, Url>,
+    pub location: RepositoryEndpoint,
+    pub other_repos: BTreeMap<String, Url>,
 }
 
-impl Locations {
-    pub fn identify_repository(&self, path: &Path) -> Result<RepositoryUse, Error> {
+impl LegacyLocations {
+    pub fn identify_repository_title(&self, path: &Path) -> Result<String, Error> {
         let repo =
             git2::Repository::open_ext(path, RepositoryOpenFlags::NO_SEARCH, &[] as &[&OsStr])
                 .context(GitSnafu {
@@ -116,9 +115,13 @@ impl Locations {
         );
         ensure!(containing_locations.len() == 1, NoIdentifySnafu);
 
-        let (title, location) = containing_locations[0];
+        let (title, _) = containing_locations[0];
 
-        // TODO: this is a bit weird, and is a leftover from the previous architecture.
+        Ok(title.clone())
+    }
+
+    pub fn repository_use_for_title(&self, title: &str) -> Option<RepositoryUse> {
+        let location = self.0.get(title)?;
         let other_repos = self
             .0
             .iter()
@@ -131,23 +134,11 @@ impl Locations {
             })
             .collect();
 
-        Ok(RepositoryUse {
-            title: title.clone(),
-            location: location.clone(),
+        Some(RepositoryUse {
+            title: title.to_owned(),
+            location: location.endpoint(),
             other_repos,
         })
-    }
-}
-
-impl RepositoryUse {
-    pub fn only_other_repo(&self) -> Option<(&str, &Url)> {
-        let mut repos = self.other_repos.iter();
-        let next = repos.next()?;
-        if repos.next().is_some() {
-            None
-        } else {
-            Some((next.0.as_str(), next.1))
-        }
     }
 }
 
@@ -797,17 +788,31 @@ impl SourceWithUpstream {
 
     pub fn merge(&self) -> Result<(), Error> {
         let repo_use = &self.src_repo_use;
-        let master_tree = self.local_head_tree()?;
         let mut local_head = self.local_head;
-        for (other_kind, other_repo) in repo_use.other_repos.iter().progress_ext("Merge Repos") {
+        for (index, (other_kind, other_repo)) in repo_use
+            .other_repos
+            .iter()
+            .progress_ext("Merge Repos")
+            .enumerate()
+        {
+            let local_commit = self
+                .working_repo
+                .find_commit(local_head)
+                .context(GitSnafu {
+                    what: "find local head commit",
+                })?;
+            let local_tree = local_commit.tree().context(GitSnafu {
+                what: "getting local head tree",
+            })?;
             info!("fetching {other_kind} repository");
             // Local sibling overrides should follow the checked-out repo HEAD instead of assuming `master`.
+            let other_ref = format!("refs/build-eips/other-head-{index}");
             let other_refspec = if other_repo.scheme() == "file" {
-                "HEAD:refs/build-eips/other-head"
+                format!("+HEAD:{other_ref}")
             } else {
-                "master:refs/build-eips/other-head"
+                format!("+master:{other_ref}")
             };
-            let master_other = fetch(&self.working_repo, other_repo.as_str(), other_refspec)?;
+            let master_other = fetch(&self.working_repo, other_repo.as_str(), &other_refspec)?;
             let other_tree = master_other.tree().context(GitSnafu {
                 what: "getting other tree",
             })?;
@@ -850,7 +855,7 @@ impl SourceWithUpstream {
                     }
                 }
 
-                if let Err(e) = check_conflict(&master_tree, Path::new(&path), b) {
+                if let Err(e) = check_conflict(&local_tree, Path::new(&path), b) {
                     walk_error = Some(e);
                     return TreeWalkResult::Abort;
                 }
@@ -869,7 +874,7 @@ impl SourceWithUpstream {
             })?;
 
             let merged_tree_oid = tree_builder
-                .create_updated(&self.working_repo, &master_tree)
+                .create_updated(&self.working_repo, &local_tree)
                 .context(GitSnafu { what: "build tree" })?;
             let merged_tree = self.working_repo.find_tree(merged_tree_oid).unwrap();
 
@@ -881,12 +886,6 @@ impl SourceWithUpstream {
                 },
             )?;
             let msg = format!("Merge {other_repo}");
-            let master = self
-                .working_repo
-                .find_commit(local_head)
-                .context(GitSnafu {
-                    what: "find local head commit",
-                })?;
             local_head = self
                 .working_repo
                 .commit(
@@ -895,7 +894,7 @@ impl SourceWithUpstream {
                     &sig,
                     &msg,
                     &merged_tree,
-                    &[&master, &master_other],
+                    &[&local_commit, &master_other],
                 )
                 .context(GitSnafu { what: "committing" })?;
 

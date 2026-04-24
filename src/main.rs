@@ -37,7 +37,9 @@ use notify::{Event, RecursiveMode, Watcher};
 use snafu::{OptionExt, Report, ResultExt, Whatever};
 use url::Url;
 
-use crate::config::{Config, LoadedWorkspaceConfig, SelectedProfile, SourceSelection};
+use crate::config::{
+    Config, LoadedRepoManifest, LoadedWorkspaceConfig, SelectedProfile, SourceSelection,
+};
 
 const CONTENT_DIR: &str = "content";
 const BUILD_DIR: &str = "build";
@@ -311,6 +313,98 @@ struct WorkspaceCommandContext {
     config_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+enum ActiveRepoIdentity {
+    Manifest(Box<LoadedRepoManifest>),
+    Legacy { repo_id: String },
+}
+
+impl ActiveRepoIdentity {
+    fn load(root_path: &Path) -> Result<Self, Whatever> {
+        if let Some(manifest) =
+            LoadedRepoManifest::load(root_path).whatever_context("unable to load repo manifest")?
+        {
+            return Ok(Self::Manifest(Box::new(manifest)));
+        }
+
+        match Config::production()
+            .locations
+            .identify_repository_title(root_path)
+        {
+            Ok(repo_id) => Ok(Self::Legacy { repo_id }),
+            Err(git::Error::NoIdentify { .. }) => {
+                snafu::whatever!(
+                    "active repository `{}` does not carry `{}` and does not match the legacy EIPs/ERCs identity fallback",
+                    root_path.to_string_lossy(),
+                    config::REPO_MANIFEST_FILE
+                )
+            }
+            Err(error) => Err(error).whatever_context("cannot identify legacy repository use"),
+        }
+    }
+
+    fn repo_id(&self) -> &str {
+        match self {
+            Self::Manifest(manifest) => &manifest.manifest().repo_id,
+            Self::Legacy { repo_id } => repo_id,
+        }
+    }
+
+    fn source_description(&self) -> &'static str {
+        match self {
+            Self::Manifest(_) => "repo manifest",
+            Self::Legacy { .. } => "legacy EIPs/ERCs fallback",
+        }
+    }
+
+    fn manifest(&self) -> Option<&LoadedRepoManifest> {
+        match self {
+            Self::Manifest(manifest) => Some(manifest.as_ref()),
+            Self::Legacy { .. } => None,
+        }
+    }
+
+    fn sibling_ids(&self) -> Vec<String> {
+        match self {
+            Self::Manifest(manifest) => manifest.manifest().siblings.keys().cloned().collect(),
+            Self::Legacy { repo_id } => Config::production()
+                .locations
+                .repository_use_for_title(repo_id)
+                .expect("legacy repository id should have metadata")
+                .other_repos
+                .keys()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn repository_use(&self, staging: bool) -> Result<git::RepositoryUse, Whatever> {
+        match self {
+            Self::Manifest(manifest) => {
+                let manifest = manifest.manifest();
+                Ok(git::RepositoryUse {
+                    title: manifest.repo_id.clone(),
+                    location: manifest.active_endpoint(staging),
+                    other_repos: manifest.sibling_repositories(staging),
+                })
+            }
+            Self::Legacy { repo_id } => {
+                let baseline = if staging {
+                    Config::staging()
+                } else {
+                    Config::production()
+                };
+                baseline
+                    .locations
+                    .repository_use_for_title(repo_id)
+                    .with_whatever_context(|| {
+                        format!("legacy repository metadata for `{repo_id}` is unavailable")
+                    })
+            }
+        }
+    }
+}
+
 impl Operation {
     fn profile_alias_name(&self) -> Option<&'static str> {
         match self {
@@ -572,8 +666,33 @@ fn resolve_source_override(
     }
 }
 
+fn format_sibling_ids(sibling_ids: &[String]) -> String {
+    sibling_ids.join(", ")
+}
+
+fn validate_sibling_override(
+    sibling_ids: &[String],
+    sibling_override: Option<&SelectedSource>,
+) -> Result<(), Whatever> {
+    if !matches!(sibling_override, Some(SelectedSource::ExplicitLocal(_))) {
+        return Ok(());
+    }
+
+    match sibling_ids.len() {
+        0 => snafu::whatever!(
+            "`--sibling-repo <path>` cannot be used because active repo declares no sibling content repos"
+        ),
+        1 => Ok(()),
+        _ => snafu::whatever!(
+            "`--sibling-repo <path>` is ambiguous because active repo declares multiple sibling content repos: {}. Run `build-eips workspace init <workspace-root>` for local sibling provisioning, or pass `--remote-sibling-repo` to force all siblings remote",
+            format_sibling_ids(sibling_ids)
+        ),
+    }
+}
+
 fn resolve_execution_settings(
     args: &Args,
+    sibling_ids: &[String],
     workspace_config: Option<&LoadedWorkspaceConfig>,
     selected_profile: Option<&SelectedProfile>,
 ) -> Result<ExecutionSettings, Whatever> {
@@ -615,6 +734,7 @@ fn resolve_execution_settings(
         "--sibling-repo",
         "--remote-sibling-repo",
     )?;
+    validate_sibling_override(sibling_ids, sibling_override.as_ref())?;
 
     let default_theme = selected_profile
         .map(|profile| profile.profile.theme)
@@ -627,6 +747,7 @@ fn resolve_execution_settings(
         && workspace_config.is_none();
     let missing_sibling = sibling_override.is_none()
         && default_sibling == SourceSelection::Local
+        && !sibling_ids.is_empty()
         && workspace_config.is_none();
 
     if missing_theme || missing_sibling {
@@ -703,35 +824,72 @@ fn command_path(command: &str) -> Option<PathBuf> {
     }
 }
 
-fn check_workspace_repo(report: &mut DoctorReport, workspace_root: &Path, name: &str) {
+fn check_workspace_repo(
+    report: &mut DoctorReport,
+    workspace_root: &Path,
+    name: &str,
+) -> Option<PathBuf> {
     let path = workspace_root.join(name);
-    if !path.exists() {
-        report.record(
+    match git2::Repository::open(&path) {
+        Ok(_) => {
+            report.record(
+                DoctorStatus::Ok,
+                format!(
+                    "found workspace repo `{}` at `{}`",
+                    name,
+                    path.to_string_lossy()
+                ),
+            );
+            Some(path)
+        }
+        Err(_) if !path.exists() => {
+            report.record(
+                DoctorStatus::Fail,
+                format!(
+                    "expected workspace repo `{}` at `{}`",
+                    name,
+                    path.to_string_lossy()
+                ),
+            );
+            None
+        }
+        Err(_) => {
+            report.record(
+                DoctorStatus::Fail,
+                format!(
+                    "expected `{}` to be a git repository at `{}`",
+                    name,
+                    path.to_string_lossy()
+                ),
+            );
+            None
+        }
+    }
+}
+
+fn check_sibling_manifest_id(
+    report: &mut DoctorReport,
+    sibling_path: &Path,
+    expected_repo_id: &str,
+) {
+    match LoadedRepoManifest::load(sibling_path) {
+        Ok(Some(manifest)) if manifest.manifest().repo_id == expected_repo_id => report.record(
+            DoctorStatus::Ok,
+            format!("sibling `{expected_repo_id}` manifest repo_id matches workspace key"),
+        ),
+        Ok(Some(manifest)) => report.record(
             DoctorStatus::Fail,
             format!(
-                "expected workspace repo `{}` at `{}`",
-                name,
-                path.to_string_lossy()
-            ),
-        );
-        return;
-    }
-
-    match git2::Repository::open(&path) {
-        Ok(_) => report.record(
-            DoctorStatus::Ok,
-            format!(
-                "found workspace repo `{}` at `{}`",
-                name,
-                path.to_string_lossy()
+                "sibling `{expected_repo_id}` manifest declares repo_id `{}`",
+                manifest.manifest().repo_id
             ),
         ),
-        Err(_) => report.record(
+        Ok(None) => (),
+        Err(error) => report.record(
             DoctorStatus::Fail,
             format!(
-                "expected `{}` to be a git repository at `{}`",
-                name,
-                path.to_string_lossy()
+                "sibling `{expected_repo_id}` repo manifest could not be loaded: {}",
+                Report::from_error(error)
             ),
         ),
     }
@@ -780,9 +938,50 @@ fn check_optional_download_tool(report: &mut DoctorReport) {
     }
 }
 
-fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
+fn collect_doctor_report(args: &Args, check_tools: bool) -> Result<DoctorReport, Whatever> {
     let context = load_workspace_command_context(args)?;
     let mut report = DoctorReport::default();
+    let (root_path, active_repo) = match root(args) {
+        Ok(root_path) => match ActiveRepoIdentity::load(&root_path) {
+            Ok(active_repo) => {
+                report.record(
+                    DoctorStatus::Ok,
+                    format!(
+                        "identified active repo `{}` from {}",
+                        active_repo.repo_id(),
+                        active_repo.source_description()
+                    ),
+                );
+                if let Some(manifest) = active_repo.manifest() {
+                    report.record(
+                        DoctorStatus::Ok,
+                        format!(
+                            "repo manifest parses at `{}`",
+                            manifest.manifest_path().to_string_lossy()
+                        ),
+                    );
+                }
+                (Some(root_path), Some(active_repo))
+            }
+            Err(error) => {
+                report.record(
+                    DoctorStatus::Fail,
+                    format!("active repo identity could not be resolved: {error}"),
+                );
+                (Some(root_path), None)
+            }
+        },
+        Err(error) => {
+            report.record(
+                DoctorStatus::Fail,
+                format!(
+                    "active repo root could not be resolved: {}",
+                    Report::from_error(error)
+                ),
+            );
+            (None, None)
+        }
+    };
 
     match context.config_path.as_ref() {
         Some(path) => report.record(
@@ -836,9 +1035,45 @@ fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
             );
         }
 
-        for repo_name in ["EIPs", "ERCs", config::DEFAULT_THEME_DIR] {
-            check_workspace_repo(&mut report, workspace_root, repo_name);
+        if let (Some(root_path), Some(active_repo)) = (root_path.as_ref(), active_repo.as_ref()) {
+            let expected_root = workspace_root.join(active_repo.repo_id());
+            if root_path == &expected_root {
+                report.record(
+                    DoctorStatus::Ok,
+                    format!(
+                        "active repo `{}` is checked out at `{}`",
+                        active_repo.repo_id(),
+                        expected_root.to_string_lossy()
+                    ),
+                );
+            } else {
+                report.record(
+                    DoctorStatus::Fail,
+                    format!(
+                        "active repo `{}` should be checked out at `{}`, found `{}`",
+                        active_repo.repo_id(),
+                        expected_root.to_string_lossy(),
+                        root_path.to_string_lossy()
+                    ),
+                );
+            }
+
+            check_workspace_repo(&mut report, workspace_root, active_repo.repo_id());
+            for sibling_id in active_repo.sibling_ids() {
+                if let Some(sibling_path) =
+                    check_workspace_repo(&mut report, workspace_root, &sibling_id)
+                {
+                    check_sibling_manifest_id(&mut report, &sibling_path, &sibling_id);
+                }
+            }
+        } else {
+            report.record(
+                DoctorStatus::Warn,
+                "workspace repo layout checks were skipped because active repo identity was unavailable",
+            );
         }
+
+        check_workspace_repo(&mut report, workspace_root, config::DEFAULT_THEME_DIR);
     } else if let Err(error) = parsed_config {
         report.record(
             DoctorStatus::Fail,
@@ -863,36 +1098,44 @@ fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
         );
     }
 
-    check_tool(
-        &mut report,
-        "build-eips",
-        "workspace bootstrap and build-eips commands expect `build-eips` on PATH",
-    );
-    check_tool(
-        &mut report,
-        "git",
-        "workspace bootstrap and build-eips commands expect git to be available",
-    );
-    check_tool(
-        &mut report,
-        "zola",
-        "build, check, and serve commands need a working zola binary",
-    );
-    check_optional_download_tool(&mut report);
+    if check_tools {
+        check_tool(
+            &mut report,
+            "build-eips",
+            "workspace bootstrap and build-eips commands expect `build-eips` on PATH",
+        );
+        check_tool(
+            &mut report,
+            "git",
+            "workspace bootstrap and build-eips commands expect git to be available",
+        );
+        check_tool(
+            &mut report,
+            "zola",
+            "build, check, and serve commands need a working zola binary",
+        );
+        check_optional_download_tool(&mut report);
 
-    match command_path("tar") {
-        Some(path) => report.record(
-            DoctorStatus::Ok,
-            format!(
-                "found front-door archive tool `tar` at `{}`",
-                path.to_string_lossy()
+        match command_path("tar") {
+            Some(path) => report.record(
+                DoctorStatus::Ok,
+                format!(
+                    "found front-door archive tool `tar` at `{}`",
+                    path.to_string_lossy()
+                ),
             ),
-        ),
-        None => report.record(
-            DoctorStatus::Warn,
-            "missing `tar`; `scripts/dev-setup` will not be able to unpack the release binary",
-        ),
+            None => report.record(
+                DoctorStatus::Warn,
+                "missing `tar`; `scripts/dev-setup` will not be able to unpack the release binary",
+            ),
+        }
     }
+
+    Ok(report)
+}
+
+fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
+    let report = collect_doctor_report(args, true)?;
 
     if report.failures > 0 {
         snafu::whatever!(
@@ -914,23 +1157,74 @@ fn make_build_dir(build_path: &Path) -> Result<PathBuf, Whatever> {
     Ok(build_path.to_path_buf())
 }
 
-fn apply_local_sibling_repo(
-    repository_use: &mut git::RepositoryUse,
-    path: &Path,
-) -> Result<(), Whatever> {
-    repository_use
-        .only_other_repo()
-        .whatever_context("local sibling overrides require exactly one sibling repository")?;
-
-    let url = Url::from_directory_path(path)
+fn local_repo_url(path: &Path) -> Result<Url, Whatever> {
+    Url::from_directory_path(path)
         .ok()
-        .whatever_context("unable to convert local sibling repository path into a file URL")?;
+        .whatever_context("unable to convert local sibling repository path into a file URL")
+}
 
-    for repository in repository_use.other_repos.values_mut() {
-        *repository = url.clone();
+fn local_repo_available(path: &Path) -> bool {
+    git2::Repository::open(path).is_ok()
+}
+
+fn apply_sibling_sources(
+    repository_use: &mut git::RepositoryUse,
+    sibling_ids: &[String],
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+    sibling: &SelectedSource,
+) -> Result<(), Whatever> {
+    match sibling {
+        SelectedSource::Remote => Ok(()),
+        SelectedSource::ExplicitLocal(path) => {
+            let repo_id = sibling_ids
+                .first()
+                .expect("explicit sibling override should have exactly one sibling");
+            if !local_repo_available(path) {
+                snafu::whatever!(
+                    "local sibling `{repo_id}` is missing or is not a git repository at `{}`",
+                    path.to_string_lossy()
+                );
+            }
+
+            repository_use
+                .other_repos
+                .insert(repo_id.clone(), local_repo_url(path)?);
+            Ok(())
+        }
+        SelectedSource::WorkspaceLocal => {
+            if sibling_ids.is_empty() {
+                return Ok(());
+            }
+
+            let workspace_config = workspace_config.whatever_context(
+                "workspace-local sibling selection requires a workspace config",
+            )?;
+            let mut missing = Vec::new();
+            let mut local_repositories = Vec::new();
+
+            for repo_id in sibling_ids {
+                let path = workspace_config.local_repo_path(repo_id);
+                if local_repo_available(&path) {
+                    local_repositories.push((repo_id.clone(), local_repo_url(&path)?));
+                } else {
+                    missing.push(repo_id.clone());
+                }
+            }
+
+            if !missing.is_empty() {
+                snafu::whatever!(
+                    "workspace-local sibling selection requires all declared sibling repos; missing or invalid sibling repo(s): {}",
+                    format_sibling_ids(&missing)
+                );
+            }
+
+            for (repo_id, url) in local_repositories {
+                repository_use.other_repos.insert(repo_id, url);
+            }
+
+            Ok(())
+        }
     }
-
-    Ok(())
 }
 
 fn build_path(
@@ -971,29 +1265,10 @@ fn theme_source(
     }
 }
 
-fn sibling_repo_path(
-    repository_use: &git::RepositoryUse,
-    workspace_config: Option<&LoadedWorkspaceConfig>,
-    sibling: &SelectedSource,
-) -> Result<Option<PathBuf>, Whatever> {
-    match sibling {
-        SelectedSource::ExplicitLocal(path) => Ok(Some(path.clone())),
-        SelectedSource::WorkspaceLocal => {
-            let workspace_config = workspace_config.whatever_context(
-                "workspace-local sibling selection requires a workspace config",
-            )?;
-            let (other_name, _) = repository_use.only_other_repo().whatever_context(
-                "local sibling overrides require exactly one sibling repository",
-            )?;
-
-            Ok(Some(workspace_config.local_repo_path(other_name)))
-        }
-        SelectedSource::Remote => Ok(None),
-    }
-}
-
 fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     let root_path = root(args)?;
+    let active_repo = ActiveRepoIdentity::load(&root_path)?;
+    let sibling_ids = active_repo.sibling_ids();
     let workspace_config = LoadedWorkspaceConfig::load(args.config.as_deref(), &root_path)
         .whatever_context("unable to load workspace config")?;
     let requested_profile = requested_profile_name(args)?;
@@ -1016,28 +1291,25 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
         info!("using selected profile `{}`", profile.name);
     }
 
-    let settings =
-        resolve_execution_settings(args, workspace_config.as_ref(), selected_profile.as_ref())?;
+    let settings = resolve_execution_settings(
+        args,
+        &sibling_ids,
+        workspace_config.as_ref(),
+        selected_profile.as_ref(),
+    )?;
     let baseline = if settings.staging {
         Config::staging()
     } else {
         Config::production()
     };
 
-    let mut repository_use = baseline
-        .locations
-        .identify_repository(&root_path)
-        .whatever_context("cannot identify repository use")?;
-
-    let sibling_repo_path = sibling_repo_path(
-        &repository_use,
+    let mut repository_use = active_repo.repository_use(settings.staging)?;
+    apply_sibling_sources(
+        &mut repository_use,
+        &sibling_ids,
         workspace_config.as_ref(),
         &settings.sibling,
     )?;
-
-    if let Some(path) = sibling_repo_path {
-        apply_local_sibling_repo(&mut repository_use, &path)?;
-    }
 
     let build_path = build_path(
         &root_path,
@@ -1525,7 +1797,18 @@ fn editorial_runtime_execution(
 }
 
 fn init_workspace(args: &Args, path: PathBuf, platform_dev: bool) -> Result<(), Whatever> {
+    let theme_repository = Config::staging().theme.repository;
+    init_workspace_with_theme_repository(args, path, platform_dev, &theme_repository)
+}
+
+fn init_workspace_with_theme_repository(
+    args: &Args,
+    path: PathBuf,
+    platform_dev: bool,
+    theme_repository: &Url,
+) -> Result<(), Whatever> {
     let root_path = root(args)?;
+    let active_repo = ActiveRepoIdentity::load(&root_path)?;
     let workspace_root = resolve_input_path(&path)?;
     std::fs::create_dir_all(&workspace_root)
         .whatever_context("unable to create workspace root directory")?;
@@ -1534,11 +1817,7 @@ fn init_workspace(args: &Args, path: PathBuf, platform_dev: bool) -> Result<(), 
         .whatever_context("unable to canonicalize workspace root directory")?;
 
     // Workspace init is a local-dev bootstrap path, so it intentionally uses staging URLs.
-    let workspace_config = Config::staging();
-    let repository_use = workspace_config
-        .locations
-        .identify_repository(&root_path)
-        .whatever_context("cannot identify repository use")?;
+    let repository_use = active_repo.repository_use(true)?;
 
     let expected_root = workspace_root.join(&repository_use.title);
     if root_path != expected_root {
@@ -1549,13 +1828,15 @@ fn init_workspace(args: &Args, path: PathBuf, platform_dev: bool) -> Result<(), 
         );
     }
 
-    let (other_name, other_url) = repository_use
-        .only_other_repo()
-        .whatever_context("workspace init requires exactly one sibling repository")?;
-    git::clone_missing_repo(other_url.as_str(), &workspace_root.join(other_name))
-        .whatever_context("unable to clone workspace sibling repo")?;
+    for (sibling_id, sibling_url) in repository_use.other_repos {
+        git::clone_missing_repo(sibling_url.as_str(), &workspace_root.join(&sibling_id))
+            .with_whatever_context(|_| {
+                format!("unable to clone workspace sibling repo `{sibling_id}`")
+            })?;
+    }
+
     git::clone_missing_repo(
-        workspace_config.theme.repository.as_str(),
+        theme_repository.as_str(),
         &workspace_root.join(config::DEFAULT_THEME_DIR),
     )
     .whatever_context("unable to clone workspace theme repo")?;
@@ -1688,13 +1969,19 @@ fn run() -> Result<(), Whatever> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use clap::Parser;
+    use git2::{IndexAddOption, Repository, Signature};
     use tempfile::TempDir;
+    use url::Url;
 
     use super::{
-        requested_profile_name, resolve_execution_settings, validate_non_execution_command_flags,
-        Args, EditorialCommand, ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation,
-        SelectedSource, WorkspaceCommand,
+        collect_doctor_report, editorial_targets, init_workspace_with_theme_repository,
+        requested_profile_name, resolve_execution, resolve_execution_settings,
+        validate_non_execution_command_flags, Args, EditorialCommand, EditorialSelectorArgs,
+        ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation, SelectedSource,
+        WorkspaceCommand, REPO_DIR,
     };
     use crate::config::{self, LoadedWorkspaceConfig};
 
@@ -1717,6 +2004,122 @@ mod tests {
         config::selected_profile(workspace_config, requested)
             .unwrap()
             .unwrap()
+    }
+
+    fn file_url(path: &Path) -> Url {
+        Url::from_directory_path(path).unwrap()
+    }
+
+    fn write_file(root: &Path, relative: impl AsRef<Path>, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn commit_all(repo: &Repository, message: &str) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
+    fn init_repo(path: &Path, files: &[(&str, &str)]) -> Repository {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = Repository::init(path).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        for (relative, contents) in files {
+            write_file(path, relative, contents);
+        }
+        commit_all(&repo, "initial");
+        repo
+    }
+
+    fn append_and_commit(repo: &Repository, root: &Path, files: &[(&str, &str)], message: &str) {
+        for (relative, contents) in files {
+            write_file(root, relative, contents);
+        }
+        commit_all(repo, message);
+    }
+
+    fn repo_manifest_text(repo_id: &str, repository: &Url, siblings: &[(&str, Url)]) -> String {
+        let mut manifest = format!(
+            r#"
+repo_id = "{repo_id}"
+
+[production]
+repository = "{repository}"
+base_url = "https://example.test/{repo_id}/"
+
+[staging]
+repository = "{repository}"
+base_url = "https://staging.example.test/{repo_id}/"
+"#
+        );
+
+        for (sibling_id, sibling_repository) in siblings {
+            manifest.push_str(&format!(
+                r#"
+[siblings.{sibling_id}.production]
+repository = "{sibling_repository}"
+base_url = "https://example.test/{sibling_id}/"
+
+[siblings.{sibling_id}.staging]
+repository = "{sibling_repository}"
+base_url = "https://staging.example.test/{sibling_id}/"
+"#
+            ));
+        }
+
+        manifest
+    }
+
+    fn write_repo_manifest_file(
+        path: &Path,
+        repo_id: &str,
+        upstream: &Url,
+        siblings: &[(&str, Url)],
+    ) {
+        write_file(
+            path,
+            config::REPO_MANIFEST_FILE,
+            &repo_manifest_text(repo_id, upstream, siblings),
+        );
+    }
+
+    fn write_manifest_repo(
+        path: &Path,
+        repo_id: &str,
+        upstream: &Url,
+        siblings: &[(&str, Url)],
+    ) -> Repository {
+        let repo = init_repo(path, &[("content/0001.md", "# Proposal\n")]);
+        write_repo_manifest_file(path, repo_id, upstream, siblings);
+        commit_all(&repo, "add repo manifest");
+        repo
     }
 
     #[test]
@@ -1821,7 +2224,7 @@ mod tests {
     #[test]
     fn boolean_override_conflicts_are_hard_errors() {
         let args = parse_args(&["build-eips", "--staging", "--no-staging", "build"]);
-        let error = resolve_execution_settings(&args, None, None).unwrap_err();
+        let error = resolve_execution_settings(&args, &[], None, None).unwrap_err();
 
         assert!(error
             .to_string()
@@ -1837,7 +2240,7 @@ mod tests {
             "--remote-theme",
             "build",
         ]);
-        let error = resolve_execution_settings(&args, None, None).unwrap_err();
+        let error = resolve_execution_settings(&args, &[], None, None).unwrap_err();
 
         assert!(error
             .to_string()
@@ -1848,7 +2251,9 @@ mod tests {
     fn dirty_profile_without_workspace_config_requires_explicit_resolution() {
         let args = parse_args(&["build-eips", "dirty", "build"]);
         let selected_profile = selected_profile(&args, None);
-        let error = resolve_execution_settings(&args, None, Some(&selected_profile)).unwrap_err();
+        let sibling_ids = vec!["ERCs".to_owned()];
+        let error = resolve_execution_settings(&args, &sibling_ids, None, Some(&selected_profile))
+            .unwrap_err();
         let message = error.to_string();
 
         assert!(
@@ -1870,13 +2275,16 @@ mod tests {
             "build",
         ]);
         let dirty_profile = selected_profile(&dirty_args, None);
+        let sibling_ids = vec!["ERCs".to_owned()];
         let dirty_settings =
-            resolve_execution_settings(&dirty_args, None, Some(&dirty_profile)).unwrap();
+            resolve_execution_settings(&dirty_args, &sibling_ids, None, Some(&dirty_profile))
+                .unwrap();
 
         let parity_args = parse_args(&["build-eips", "parity", "build"]);
         let parity_profile = selected_profile(&parity_args, None);
         let parity_settings =
-            resolve_execution_settings(&parity_args, None, Some(&parity_profile)).unwrap();
+            resolve_execution_settings(&parity_args, &sibling_ids, None, Some(&parity_profile))
+                .unwrap();
 
         assert_eq!(
             dirty_settings,
@@ -1901,6 +2309,292 @@ mod tests {
     }
 
     #[test]
+    fn zero_sibling_remote_override_is_noop_but_local_override_errors() {
+        let remote_args = parse_args(&["build-eips", "--remote-sibling-repo", "parity", "build"]);
+        let remote_profile = selected_profile(&remote_args, None);
+        let remote_settings =
+            resolve_execution_settings(&remote_args, &[], None, Some(&remote_profile)).unwrap();
+
+        assert_eq!(remote_settings.sibling, SelectedSource::Remote);
+
+        let local_args = parse_args(&["build-eips", "--sibling-repo", "/tmp/ERCs", "build"]);
+        let error = resolve_execution_settings(&local_args, &[], None, None).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("active repo declares no sibling content repos"));
+    }
+
+    #[test]
+    fn single_sibling_local_override_remains_supported() {
+        let args = parse_args(&["build-eips", "--sibling-repo", "/tmp/ERCs", "build"]);
+        let sibling_ids = vec!["ERCs".to_owned()];
+        let settings = resolve_execution_settings(&args, &sibling_ids, None, None).unwrap();
+
+        assert_eq!(
+            settings.sibling,
+            SelectedSource::ExplicitLocal(PathBuf::from("/tmp/ERCs"))
+        );
+    }
+
+    #[test]
+    fn multi_sibling_local_override_is_ambiguous() {
+        let args = parse_args(&["build-eips", "--sibling-repo", "/tmp/proposals", "build"]);
+        let sibling_ids = vec!["EIPs".to_owned(), "ERCs".to_owned()];
+        let error = resolve_execution_settings(&args, &sibling_ids, None, None).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("`--sibling-repo <path>` is ambiguous"));
+        assert!(message.contains("EIPs, ERCs"));
+        assert!(message.contains("--remote-sibling-repo"));
+    }
+
+    #[test]
+    fn zero_sibling_dirty_profile_without_workspace_config_only_requires_theme_resolution() {
+        let args = parse_args(&["build-eips", "dirty", "build"]);
+        let selected_profile = selected_profile(&args, None);
+        let error =
+            resolve_execution_settings(&args, &[], None, Some(&selected_profile)).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("profile `dirty` requires workspace-local theme sources"));
+        assert!(!message.contains("theme and sibling"));
+    }
+
+    #[test]
+    fn manifest_identity_drives_runtime_resolution() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let build_root = workspace.path().join("build-root");
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "--build-root",
+            build_root.to_str().unwrap(),
+            "parity",
+            "build",
+        ]);
+
+        let resolved = resolve_execution(&args).unwrap();
+
+        assert_eq!(resolved.repository_use.title, "Core");
+        assert_eq!(resolved.repository_use.location.repository, active_url);
+        assert!(resolved.repository_use.other_repos.is_empty());
+        assert_eq!(resolved.build_path, build_root);
+    }
+
+    #[test]
+    fn unknown_repo_without_manifest_or_legacy_identity_errors() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Unknown");
+        init_repo(&active_path, &[("content/0001.md", "# Proposal\n")]);
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "parity",
+            "build",
+        ]);
+
+        let error = resolve_execution(&args).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains(config::REPO_MANIFEST_FILE));
+        assert!(message.contains("legacy EIPs/ERCs identity fallback"));
+    }
+
+    #[test]
+    fn sibling_override_validation_uses_manifest_cardinality() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let sibling_path = workspace.path().join("Sibling");
+        init_repo(&sibling_path, &[("content/0002.md", "# Sibling\n")]);
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "--sibling-repo",
+            sibling_path.to_str().unwrap(),
+            "parity",
+            "build",
+        ]);
+
+        let error = resolve_execution(&args).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("active repo declares no sibling content repos"));
+    }
+
+    #[test]
+    fn workspace_local_sibling_mode_is_all_or_nothing() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let eips_path = workspace.path().join("EIPs");
+        init_repo(&eips_path, &[("content/0002.md", "# EIP\n")]);
+        let siblings = vec![
+            ("EIPs", file_url(&eips_path)),
+            ("ERCs", file_url(&workspace.path().join("remotes/ERCs"))),
+        ];
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &siblings);
+        std::fs::write(
+            workspace.path().join(config::LOCAL_CONFIG_FILE),
+            config::default_workspace_config_text(),
+        )
+        .unwrap();
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "build"]);
+
+        let error = resolve_execution(&args).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("requires all declared sibling repos"));
+        assert!(message.contains("ERCs"));
+    }
+
+    fn assert_workspace_init_and_doctor_for_siblings(sibling_ids: &[&str]) {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let theme_path = remotes_root.join("theme");
+        init_repo(&theme_path, &[("theme.txt", "theme\n")]);
+        let theme_url = file_url(&theme_path);
+
+        let sibling_repositories = sibling_ids
+            .iter()
+            .map(|sibling_id| {
+                let sibling_id = *sibling_id;
+                let sibling_path = remotes_root.join(sibling_id);
+                let sibling_url = file_url(&sibling_path);
+                write_manifest_repo(&sibling_path, sibling_id, &sibling_url, &[]);
+                (sibling_id.to_owned(), sibling_url)
+            })
+            .collect::<Vec<_>>();
+        let sibling_manifest_entries = sibling_repositories
+            .iter()
+            .map(|(repo_id, url)| (repo_id.as_str(), url.clone()))
+            .collect::<Vec<_>>();
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &sibling_manifest_entries);
+        let init_args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "init",
+            workspace_root.to_str().unwrap(),
+        ]);
+
+        init_workspace_with_theme_repository(&init_args, workspace_root.clone(), false, &theme_url)
+            .unwrap();
+
+        assert!(workspace_root.join(config::LOCAL_CONFIG_FILE).is_file());
+        assert!(Repository::open(workspace_root.join(config::DEFAULT_THEME_DIR)).is_ok());
+        for sibling_id in sibling_ids {
+            assert!(Repository::open(workspace_root.join(sibling_id)).is_ok());
+        }
+
+        let doctor_args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "doctor",
+        ]);
+        let report = collect_doctor_report(&doctor_args, false).unwrap();
+
+        assert_eq!(report.failures, 0);
+    }
+
+    #[test]
+    fn workspace_init_and_doctor_cover_zero_one_and_many_siblings() {
+        assert_workspace_init_and_doctor_for_siblings(&[]);
+        assert_workspace_init_and_doctor_for_siblings(&["ERCs"]);
+        assert_workspace_init_and_doctor_for_siblings(&["EIPs", "ERCs"]);
+    }
+
+    #[test]
+    fn manifest_driven_multi_repo_build_and_editorial_flows_resolve_siblings() {
+        let temp = TempDir::new().unwrap();
+        let upstream_path = temp.path().join("upstream/Core");
+        init_repo(
+            &upstream_path,
+            &[("content/0001.md", "# Original proposal\n")],
+        );
+        let upstream_url = file_url(&upstream_path);
+
+        let active_path = temp.path().join("workspace/Core");
+        std::fs::create_dir_all(active_path.parent().unwrap()).unwrap();
+        git2::build::RepoBuilder::new()
+            .clone(upstream_url.as_str(), &active_path)
+            .unwrap();
+        let active_repo = Repository::open(&active_path).unwrap();
+
+        let eips_path = temp.path().join("remotes/EIPs");
+        init_repo(&eips_path, &[("content/0002.md", "# EIP sibling\n")]);
+        let ercs_path = temp.path().join("remotes/ERCs");
+        init_repo(&ercs_path, &[("content/0003.md", "# ERC sibling\n")]);
+        let siblings = vec![
+            ("EIPs", file_url(&eips_path)),
+            ("ERCs", file_url(&ercs_path)),
+        ];
+        write_repo_manifest_file(&active_path, "Core", &upstream_url, &siblings);
+        append_and_commit(
+            &active_repo,
+            &active_path,
+            &[("content/0001.md", "# Updated proposal\n")],
+            "local proposal update",
+        );
+        let build_root = temp.path().join("build-root");
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "--build-root",
+            build_root.to_str().unwrap(),
+            "parity",
+            "build",
+        ]);
+        let resolved = resolve_execution(&args).unwrap();
+
+        assert_eq!(resolved.repository_use.other_repos.len(), 2);
+
+        let repo_path = resolved.build_path.join(REPO_DIR);
+        crate::git::Fresh::new(
+            &resolved.root_path,
+            &repo_path,
+            resolved.repository_use.clone(),
+            resolved.source_materialization,
+        )
+        .unwrap()
+        .clone_src()
+        .unwrap()
+        .fetch_upstream()
+        .unwrap()
+        .merge()
+        .unwrap();
+
+        assert!(repo_path.join("content/0002.md").is_file());
+        assert!(repo_path.join("content/0003.md").is_file());
+
+        let selectors = EditorialSelectorArgs {
+            paths: Vec::<PathBuf>::new(),
+            batch: None,
+            working_tree: false,
+            against_upstream: true,
+        };
+        let targets = editorial_targets(&selectors, &resolved).unwrap();
+
+        assert_eq!(targets, vec![PathBuf::from("content/0001.md")]);
+    }
+
+    #[test]
     fn default_profile_selection_and_overrides_share_the_same_path() {
         let workspace_config = load_workspace_config(
             r#"
@@ -1919,9 +2613,13 @@ sibling = "local"
         )
         .unwrap()
         .unwrap();
-        let settings =
-            resolve_execution_settings(&args, Some(&workspace_config), Some(&selected_profile))
-                .unwrap();
+        let settings = resolve_execution_settings(
+            &args,
+            &["ERCs".to_owned()],
+            Some(&workspace_config),
+            Some(&selected_profile),
+        )
+        .unwrap();
 
         assert_eq!(selected_profile.name, "local");
         assert_eq!(
