@@ -1007,95 +1007,86 @@ fn collect_doctor_report(args: &Args, check_tools: bool) -> Result<DoctorReport,
         .map(LoadedWorkspaceConfig::from_path)
         .transpose();
 
-    if let Ok(Some(config)) = parsed_config.as_ref() {
-        report.record(
-            DoctorStatus::Ok,
-            format!(
-                "workspace config parses at `{}`",
-                config.config_path().to_string_lossy()
-            ),
-        );
-
-        let workspace_root = config.workspace_root();
-        if workspace_root.is_dir() {
+    match parsed_config {
+        Ok(Some(config)) => {
             report.record(
                 DoctorStatus::Ok,
                 format!(
-                    "workspace root exists at `{}`",
-                    workspace_root.to_string_lossy()
+                    "workspace config parses at `{}`",
+                    config.config_path().to_string_lossy()
                 ),
             );
-        } else {
-            report.record(
-                DoctorStatus::Fail,
-                format!(
-                    "workspace root is missing at `{}`",
-                    workspace_root.to_string_lossy()
-                ),
-            );
-        }
 
-        if let (Some(root_path), Some(active_repo)) = (root_path.as_ref(), active_repo.as_ref()) {
-            let expected_root = workspace_root.join(active_repo.repo_id());
-            if root_path == &expected_root {
+            let workspace_root = config.workspace_root();
+            if workspace_root.is_dir() {
                 report.record(
                     DoctorStatus::Ok,
                     format!(
-                        "active repo `{}` is checked out at `{}`",
-                        active_repo.repo_id(),
-                        expected_root.to_string_lossy()
+                        "workspace root exists at `{}`",
+                        workspace_root.to_string_lossy()
                     ),
                 );
             } else {
                 report.record(
                     DoctorStatus::Fail,
                     format!(
-                        "active repo `{}` should be checked out at `{}`, found `{}`",
-                        active_repo.repo_id(),
-                        expected_root.to_string_lossy(),
-                        root_path.to_string_lossy()
+                        "workspace root is missing at `{}`",
+                        workspace_root.to_string_lossy()
                     ),
                 );
             }
 
-            check_workspace_repo(&mut report, workspace_root, active_repo.repo_id());
-            for sibling_id in active_repo.sibling_ids() {
-                if let Some(sibling_path) =
-                    check_workspace_repo(&mut report, workspace_root, &sibling_id)
-                {
-                    check_sibling_manifest_id(&mut report, &sibling_path, &sibling_id);
+            if let (Some(root_path), Some(active_repo)) = (root_path.as_ref(), active_repo.as_ref())
+            {
+                let expected_root = workspace_root.join(active_repo.repo_id());
+                if root_path == &expected_root {
+                    report.record(
+                        DoctorStatus::Ok,
+                        format!(
+                            "active repo `{}` is checked out at `{}`",
+                            active_repo.repo_id(),
+                            expected_root.to_string_lossy()
+                        ),
+                    );
+                } else {
+                    report.record(
+                        DoctorStatus::Fail,
+                        format!(
+                            "active repo `{}` should be checked out at `{}`, found `{}`",
+                            active_repo.repo_id(),
+                            expected_root.to_string_lossy(),
+                            root_path.to_string_lossy()
+                        ),
+                    );
                 }
+
+                check_workspace_repo(&mut report, workspace_root, active_repo.repo_id());
+                for sibling_id in active_repo.sibling_ids() {
+                    if let Some(sibling_path) =
+                        check_workspace_repo(&mut report, workspace_root, &sibling_id)
+                    {
+                        check_sibling_manifest_id(&mut report, &sibling_path, &sibling_id);
+                    }
+                }
+            } else {
+                report.record(
+                    DoctorStatus::Warn,
+                    "workspace repo layout checks were skipped because active repo identity was unavailable",
+                );
             }
-        } else {
+
+            check_workspace_repo(&mut report, workspace_root, config::DEFAULT_THEME_DIR);
+        }
+        Err(error) => {
             report.record(
-                DoctorStatus::Warn,
-                "workspace repo layout checks were skipped because active repo identity was unavailable",
+                DoctorStatus::Fail,
+                format!(
+                    "workspace config could not be parsed: {}",
+                    Report::from_error(error)
+                ),
             );
         }
-
-        check_workspace_repo(&mut report, workspace_root, config::DEFAULT_THEME_DIR);
-    } else if let Err(error) = parsed_config {
-        report.record(
-            DoctorStatus::Fail,
-            format!(
-                "workspace config could not be parsed: {}",
-                Report::from_error(error)
-            ),
-        );
-        report.record(
-            DoctorStatus::Warn,
-            "workspace layout checks were skipped because the workspace config could not be parsed",
-        );
-    } else if context.config_path.is_some() {
-        report.record(
-            DoctorStatus::Fail,
-            "workspace config could not be parsed, so workspace layout checks were skipped",
-        );
-    } else {
-        report.record(
-            DoctorStatus::Warn,
-            "workspace layout checks were skipped because no workspace config was found",
-        );
+        Ok(None) => (),
     }
 
     if check_tools {
@@ -1176,9 +1167,18 @@ fn apply_sibling_sources(
     match sibling {
         SelectedSource::Remote => Ok(()),
         SelectedSource::ExplicitLocal(path) => {
-            let repo_id = sibling_ids
-                .first()
-                .expect("explicit sibling override should have exactly one sibling");
+            let [repo_id] = sibling_ids else {
+                match sibling_ids {
+                    [] => snafu::whatever!(
+                        "`--sibling-repo <path>` cannot be used because active repo declares no sibling content repos"
+                    ),
+                    _ => snafu::whatever!(
+                        "`--sibling-repo <path>` is ambiguous because active repo declares multiple sibling content repos: {}. Run `build-eips workspace init <workspace-root>` for local sibling provisioning, or pass `--remote-sibling-repo` to force all siblings remote",
+                        format_sibling_ids(sibling_ids)
+                    ),
+                }
+            };
+
             if !local_repo_available(path) {
                 snafu::whatever!(
                     "local sibling `{repo_id}` is missing or is not a git repository at `{}`",
@@ -1973,6 +1973,7 @@ mod tests {
 
     use clap::Parser;
     use git2::{IndexAddOption, Repository, Signature};
+    use snafu::Report;
     use tempfile::TempDir;
     use url::Url;
 
@@ -2407,6 +2408,26 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
+    fn malformed_repo_manifest_does_not_fall_back_to_legacy_identity() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Malformed");
+        init_repo(&active_path, &[("content/0001.md", "# Proposal\n")]);
+        write_file(&active_path, config::REPO_MANIFEST_FILE, "repo_id = [");
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "parity",
+            "build",
+        ]);
+
+        let message = Report::from_error(resolve_execution(&args).unwrap_err()).to_string();
+
+        assert!(message.contains("unable to load repo manifest"));
+        assert!(!message.contains("legacy EIPs/ERCs identity fallback"));
+    }
+
+    #[test]
     fn sibling_override_validation_uses_manifest_cardinality() {
         let workspace = TempDir::new().unwrap();
         let active_path = workspace.path().join("Core");
@@ -2517,6 +2538,47 @@ base_url = "https://staging.example.test/{sibling_id}/"
         assert_workspace_init_and_doctor_for_siblings(&[]);
         assert_workspace_init_and_doctor_for_siblings(&["ERCs"]);
         assert_workspace_init_and_doctor_for_siblings(&["EIPs", "ERCs"]);
+    }
+
+    #[test]
+    fn workspace_doctor_missing_config_reports_one_failure_without_skip_warning() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "doctor",
+        ]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_parse_failed_config_reports_one_failure_without_skip_warning() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        std::fs::write(workspace.path().join(config::LOCAL_CONFIG_FILE), "[").unwrap();
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "doctor",
+        ]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
     }
 
     #[test]

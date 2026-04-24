@@ -876,6 +876,16 @@ base_url = "https://staging.example.test/{repo_id}/"
     }
 
     #[test]
+    fn malformed_repo_manifest_reports_parse_error() {
+        let workspace = TestWorkspace::new();
+        let manifest_path = workspace.write_file(REPO_MANIFEST_FILE, "repo_id = [");
+
+        let error = LoadedRepoManifest::from_path(&manifest_path).unwrap_err();
+
+        assert!(matches!(error, RepoManifestError::RepoParse { .. }));
+    }
+
+    #[test]
     fn parses_repo_manifest_with_directional_siblings() {
         let workspace = TestWorkspace::new();
         let manifest_path = workspace.write_file(

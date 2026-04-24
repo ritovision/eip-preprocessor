@@ -903,6 +903,22 @@ impl SourceWithUpstream {
                 .context(GitSnafu {
                     what: "checkout merged",
                 })?;
+
+            drop(merged_tree);
+            drop(other_tree);
+            drop(master_other);
+            drop(local_tree);
+            drop(local_commit);
+            match self.working_repo.find_reference(&other_ref) {
+                Ok(mut reference) => {
+                    if let Err(error) = reference.delete() {
+                        debug!("unable to delete temporary sibling ref `{other_ref}`: {error}");
+                    }
+                }
+                Err(error) => {
+                    debug!("temporary sibling ref `{other_ref}` was not deleted: {error}");
+                }
+            }
         }
 
         Ok(())
