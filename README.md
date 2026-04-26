@@ -228,5 +228,10 @@ profile without invoking Zola, preprocessing markdown, or rebuilding anything.
 If the output directory does not exist yet, it fails and tells you to run
 `build-eips build` first.
 
+The workspace config `[server]` table controls the local bind address for both
+`serve` and `preview`; the default is `127.0.0.1:1111`. Per-command `--host`
+and `--port` flags override that config for one run. These settings do not
+change build base URLs.
+
 [`ethereum/EIPs`]: https://github.com/ethereum/EIPs/
 [`ethereum/ERCs`]: https://github.com/ethereum/ERCs/

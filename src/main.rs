@@ -38,7 +38,8 @@ use snafu::{OptionExt, Report, ResultExt, Whatever};
 use url::Url;
 
 use crate::config::{
-    Config, LoadedRepoManifest, LoadedWorkspaceConfig, SelectedProfile, SourceSelection,
+    Config, LoadedRepoManifest, LoadedWorkspaceConfig, SelectedProfile, ServerBinding,
+    SourceSelection,
 };
 
 const CONTENT_DIR: &str = "content";
@@ -99,6 +100,17 @@ struct Args {
     operation: Operation,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+struct ServerCliArgs {
+    /// Host/interface for the local server to bind
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Port for the local server to bind
+    #[arg(long)]
+    port: Option<u16>,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 enum Operation {
     /// Print various useful things, like available lints
@@ -111,10 +123,16 @@ enum Operation {
     Build,
 
     /// Build the project and launch a web server to preview it
-    Serve,
+    Serve {
+        #[command(flatten)]
+        server: ServerCliArgs,
+    },
 
     /// Serve the existing built output without rebuilding it
-    Preview,
+    Preview {
+        #[command(flatten)]
+        server: ServerCliArgs,
+    },
 
     /// Remove temporary and output files
     Clean,
@@ -162,10 +180,16 @@ enum ProfiledOperation {
     Build,
 
     /// Build the project and launch a web server to preview it
-    Serve,
+    Serve {
+        #[command(flatten)]
+        server: ServerCliArgs,
+    },
 
     /// Serve the existing built output without rebuilding it
-    Preview,
+    Preview {
+        #[command(flatten)]
+        server: ServerCliArgs,
+    },
 
     /// Remove temporary and output files
     Clean,
@@ -258,6 +282,7 @@ struct ResolvedExecution {
     repository_use: git::RepositoryUse,
     theme: ThemeSource,
     source_materialization: git::SourceMaterialization,
+    server_binding: ServerBinding,
 }
 
 #[derive(Debug, Clone)]
@@ -405,14 +430,28 @@ impl ActiveRepoIdentity {
 }
 
 impl Operation {
+    fn server_cli_args(&self) -> ServerCliArgs {
+        match self {
+            Self::Serve { server } | Self::Preview { server } => server.clone(),
+            Self::Parity { command } | Self::Dirty { command } => command.server_cli_args(),
+            Self::Print { .. }
+            | Self::Build
+            | Self::Clean
+            | Self::Check
+            | Self::Changed { .. }
+            | Self::Editorial { .. }
+            | Self::Workspace { .. } => ServerCliArgs::default(),
+        }
+    }
+
     fn profile_alias_name(&self) -> Option<&'static str> {
         match self {
             Self::Parity { .. } => Some(config::PARITY_PROFILE),
             Self::Dirty { .. } => Some(config::DIRTY_PROFILE),
             Self::Print { .. }
             | Self::Build
-            | Self::Serve
-            | Self::Preview
+            | Self::Serve { .. }
+            | Self::Preview { .. }
             | Self::Clean
             | Self::Check
             | Self::Changed { .. }
@@ -425,8 +464,8 @@ impl Operation {
         match self {
             Self::Print { .. } | Self::Workspace { .. } => None,
             Self::Build => Some(RuntimeOperation::Build),
-            Self::Serve => Some(RuntimeOperation::Serve),
-            Self::Preview => Some(RuntimeOperation::Preview),
+            Self::Serve { .. } => Some(RuntimeOperation::Serve),
+            Self::Preview { .. } => Some(RuntimeOperation::Preview),
             Self::Clean => Some(RuntimeOperation::Clean),
             Self::Check => Some(RuntimeOperation::Check),
             Self::Changed { all, format } => Some(RuntimeOperation::Changed {
@@ -450,11 +489,20 @@ impl Operation {
 }
 
 impl ProfiledOperation {
+    fn server_cli_args(&self) -> ServerCliArgs {
+        match self {
+            Self::Serve { server } | Self::Preview { server } => server.clone(),
+            Self::Build | Self::Clean | Self::Check | Self::Changed { .. } => {
+                ServerCliArgs::default()
+            }
+        }
+    }
+
     fn runtime_operation(&self) -> RuntimeOperation {
         match self {
             Self::Build => RuntimeOperation::Build,
-            Self::Serve => RuntimeOperation::Serve,
-            Self::Preview => RuntimeOperation::Preview,
+            Self::Serve { .. } => RuntimeOperation::Serve,
+            Self::Preview { .. } => RuntimeOperation::Preview,
             Self::Clean => RuntimeOperation::Clean,
             Self::Check => RuntimeOperation::Check,
             Self::Changed { all, format } => RuntimeOperation::Changed {
@@ -1189,6 +1237,25 @@ fn theme_source(
     }
 }
 
+fn resolve_server_binding(
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+    server_cli: &ServerCliArgs,
+) -> ServerBinding {
+    let mut binding = workspace_config
+        .map(|workspace_config| ServerBinding::from(workspace_config.server_settings()))
+        .unwrap_or_default();
+
+    if let Some(host) = &server_cli.host {
+        binding.host = host.clone();
+    }
+
+    if let Some(port) = server_cli.port {
+        binding.port = port;
+    }
+
+    binding
+}
+
 fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     let root_path = root(args)?;
     let active_repo = ActiveRepoIdentity::load(&root_path)?;
@@ -1257,6 +1324,10 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
         repository_use,
         theme,
         source_materialization,
+        server_binding: resolve_server_binding(
+            workspace_config.as_ref(),
+            &args.operation.server_cli_args(),
+        ),
     })
 }
 
@@ -1603,6 +1674,7 @@ struct Prepared {
     theme: ThemeSource,
     source_root: PathBuf,
     source_materialization: git::SourceMaterialization,
+    server_binding: ServerBinding,
 }
 
 impl Prepared {
@@ -1615,6 +1687,7 @@ impl Prepared {
             repository_use,
             theme,
             source_materialization,
+            server_binding,
         } = resolved;
 
         let repo_path = build_path.join(REPO_DIR);
@@ -1648,6 +1721,7 @@ impl Prepared {
             output_path,
             source_root: root_path,
             source_materialization,
+            server_binding,
         })
     }
 
@@ -1673,8 +1747,14 @@ impl Prepared {
             None
         };
 
-        let result = zola::serve(&self.theme, &self.cache, &self.repo_path, &self.output_path)
-            .whatever_context("zola serve failed");
+        let result = zola::serve(
+            &self.theme,
+            &self.cache,
+            &self.repo_path,
+            &self.output_path,
+            &self.server_binding,
+        )
+        .whatever_context("zola serve failed");
 
         if let Some(dirty_watcher) = dirty_watcher {
             dirty_watcher.stop();
@@ -1847,7 +1927,7 @@ fn run() -> Result<(), Whatever> {
     let resolved = resolve_execution(&args)?;
 
     if matches!(runtime_operation, RuntimeOperation::Preview) {
-        preview::serve(&output_path(&resolved.build_path))
+        preview::serve(&output_path(&resolved.build_path), &resolved.server_binding)
             .whatever_context("preview server failed")?;
         return Ok(());
     }
@@ -1933,11 +2013,12 @@ mod tests {
     use super::{
         collect_doctor_report, editorial_targets, init_workspace_with_repositories,
         requested_profile_name, resolve_execution, resolve_execution_settings,
-        validate_non_execution_command_flags, Args, EditorialCommand, EditorialSelectorArgs,
-        ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation, SelectedSource,
-        ThemeSource, WorkspaceCommand, WorkspaceInitRepositories, REPO_DIR,
+        resolve_server_binding, validate_non_execution_command_flags, Args, EditorialCommand,
+        EditorialSelectorArgs, ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation,
+        SelectedSource, ServerCliArgs, ThemeSource, WorkspaceCommand, WorkspaceInitRepositories,
+        REPO_DIR,
     };
-    use crate::config::{self, LoadedWorkspaceConfig};
+    use crate::config::{self, LoadedWorkspaceConfig, ServerBinding};
 
     fn parse_args(arguments: &[&str]) -> Args {
         Args::try_parse_from(arguments).unwrap()
@@ -2161,6 +2242,142 @@ base_url = "https://staging.example.test/{sibling_id}/"
         assert_eq!(
             requested_profile_name(&editorial_lint).unwrap(),
             Some(config::PARITY_PROFILE)
+        );
+    }
+
+    #[test]
+    fn server_flags_parse_on_serve_and_preview_forms() {
+        let cases: &[(&[&str], bool)] = &[
+            (
+                &["build-eips", "serve", "--host", "0.0.0.0", "--port", "8080"],
+                true,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "preview",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "serve",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "preview",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "dirty",
+                    "serve",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "dirty",
+                    "preview",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ],
+                false,
+            ),
+        ];
+
+        for (arguments, expect_serve) in cases {
+            let args = parse_args(arguments);
+            let runtime_operation = args.operation.runtime_operation().unwrap();
+            match runtime_operation {
+                RuntimeOperation::Serve if *expect_serve => {}
+                RuntimeOperation::Preview if !*expect_serve => {}
+                other => panic!("unexpected runtime operation: {other:?}"),
+            }
+            let server = args.operation.server_cli_args();
+
+            assert_eq!(server.host.as_deref(), Some("0.0.0.0"));
+            assert_eq!(server.port, Some(8080));
+        }
+    }
+
+    #[test]
+    fn server_binding_resolution_uses_cli_config_then_defaults() {
+        assert_eq!(
+            resolve_server_binding(None, &ServerCliArgs::default()),
+            ServerBinding {
+                host: "127.0.0.1".to_owned(),
+                port: 1111,
+            }
+        );
+
+        let workspace_config = load_workspace_config(
+            r#"
+[server]
+host = "0.0.0.0"
+port = 8080
+"#,
+        );
+
+        assert_eq!(
+            resolve_server_binding(Some(&workspace_config), &ServerCliArgs::default()),
+            ServerBinding {
+                host: "0.0.0.0".to_owned(),
+                port: 8080,
+            }
+        );
+        assert_eq!(
+            resolve_server_binding(
+                Some(&workspace_config),
+                &ServerCliArgs {
+                    host: Some("127.0.0.1".to_owned()),
+                    port: Some(4000),
+                },
+            ),
+            ServerBinding {
+                host: "127.0.0.1".to_owned(),
+                port: 4000,
+            }
+        );
+        assert_eq!(
+            resolve_server_binding(
+                Some(&workspace_config),
+                &ServerCliArgs {
+                    host: None,
+                    port: Some(4000),
+                },
+            ),
+            ServerBinding {
+                host: "0.0.0.0".to_owned(),
+                port: 4000,
+            }
         );
     }
 

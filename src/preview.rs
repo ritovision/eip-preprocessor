@@ -13,10 +13,11 @@ use log::info;
 use snafu::{ResultExt, Whatever};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
-const PREVIEW_ADDR: &str = "127.0.0.1:1111";
+use crate::config::ServerBinding;
+
 const INDEX_HTML: &str = "index.html";
 
-pub fn serve(output_path: &Path) -> Result<(), Whatever> {
+pub fn serve(output_path: &Path, server_binding: &ServerBinding) -> Result<(), Whatever> {
     if !output_path.is_dir() {
         snafu::whatever!(
             "preview output directory `{}` is missing; run `build-eips build` for this profile first",
@@ -24,15 +25,15 @@ pub fn serve(output_path: &Path) -> Result<(), Whatever> {
         );
     }
 
-    let server = match Server::http(PREVIEW_ADDR) {
+    let server = match Server::http((server_binding.host.as_str(), server_binding.port)) {
         Ok(server) => server,
         Err(error) => {
-            snafu::whatever!("unable to bind preview server on {PREVIEW_ADDR}: {error}")
+            snafu::whatever!("unable to bind preview server on {server_binding}: {error}")
         }
     };
 
     info!(
-        "serving static preview from `{}` at http://{PREVIEW_ADDR}/",
+        "serving static preview from `{}` at http://{server_binding}/",
         output_path.to_string_lossy()
     );
 

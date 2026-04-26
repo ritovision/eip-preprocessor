@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
 };
 
@@ -20,6 +21,8 @@ pub const DEFAULT_THEME_DIR: &str = "theme";
 pub const LOCAL_PROFILE: &str = "local";
 pub const PARITY_PROFILE: &str = "parity";
 pub const DIRTY_PROFILE: &str = "dirty";
+pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
+pub const DEFAULT_SERVER_PORT: u16 = 1111;
 const RESERVED_WORKSPACE_NAMES: &[&str] = &[DEFAULT_THEME_DIR, "preprocessor", "eipw"];
 
 #[derive(Debug, Snafu)]
@@ -513,6 +516,10 @@ pub struct WorkspaceConfig {
     /// Directory under the workspace root where local build artifacts are written.
     pub build_root_base: PathBuf,
 
+    /// Local server defaults for `build-eips serve` and `build-eips preview`.
+    #[serde(default)]
+    pub server: ServerSettings,
+
     /// Custom profile definitions keyed by profile name.
     pub profiles: BTreeMap<String, LocalProfile>,
 }
@@ -522,6 +529,7 @@ impl Default for WorkspaceConfig {
         Self {
             default_profile: None,
             build_root_base: DEFAULT_BUILD_ROOT_BASE.into(),
+            server: ServerSettings::default(),
             profiles: BTreeMap::new(),
         }
     }
@@ -535,6 +543,7 @@ impl WorkspaceConfig {
         Self {
             default_profile: Some(LOCAL_PROFILE.into()),
             build_root_base: DEFAULT_BUILD_ROOT_BASE.into(),
+            server: ServerSettings::default(),
             profiles,
         }
     }
@@ -551,6 +560,59 @@ impl WorkspaceConfig {
         }
 
         Ok(())
+    }
+}
+
+/// Workspace-local bind address defaults for local server commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerSettings {
+    /// Host or interface address used by `serve` and `preview`.
+    pub host: String,
+
+    /// TCP port used by `serve` and `preview`.
+    pub port: u16,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            host: DEFAULT_SERVER_HOST.to_owned(),
+            port: DEFAULT_SERVER_PORT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerBinding {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for ServerBinding {
+    fn default() -> Self {
+        ServerSettings::default().into()
+    }
+}
+
+impl From<ServerSettings> for ServerBinding {
+    fn from(settings: ServerSettings) -> Self {
+        Self {
+            host: settings.host,
+            port: settings.port,
+        }
+    }
+}
+
+impl From<&ServerSettings> for ServerBinding {
+    fn from(settings: &ServerSettings) -> Self {
+        settings.clone().into()
+    }
+}
+
+impl fmt::Display for ServerBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.host, self.port)
     }
 }
 
@@ -657,6 +719,10 @@ impl LoadedWorkspaceConfig {
     pub fn build_root_for(&self, repo_name: &str) -> PathBuf {
         self.resolve_path(&self.config.build_root_base)
             .join(repo_name)
+    }
+
+    pub fn server_settings(&self) -> &ServerSettings {
+        &self.config.server
     }
 
     pub fn local_theme_path(&self) -> PathBuf {
@@ -792,8 +858,9 @@ mod tests {
 
     use super::{
         default_workspace_config_text, discover_path, selected_profile, LoadedRepoManifest,
-        LoadedWorkspaceConfig, LocalProfile, RepoManifestError, SourceSelection, WorkspaceError,
-        DIRTY_PROFILE, LOCAL_CONFIG_FILE, LOCAL_PROFILE, PARITY_PROFILE, REPO_MANIFEST_FILE,
+        LoadedWorkspaceConfig, LocalProfile, RepoManifestError, ServerBinding, ServerSettings,
+        SourceSelection, WorkspaceError, DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT, DIRTY_PROFILE,
+        LOCAL_CONFIG_FILE, LOCAL_PROFILE, PARITY_PROFILE, REPO_MANIFEST_FILE,
     };
 
     struct TestWorkspace {
@@ -1056,6 +1123,7 @@ base_url = "https://staging.example.test/ERCs/"
             .selected_profile(Some(DIRTY_PROFILE))
             .unwrap()
             .is_some());
+        assert_eq!(config.server_settings(), &ServerSettings::default());
     }
 
     #[test]
@@ -1068,7 +1136,55 @@ base_url = "https://staging.example.test/ERCs/"
         assert!(!original.contains("[profiles.parity]"));
         assert!(!original.contains("[profiles.dirty]"));
         assert!(original.contains("default_profile = \"local\""));
+        assert!(original.contains("[server]"));
+        assert!(original.contains("host = \"127.0.0.1\""));
+        assert!(original.contains("port = 1111"));
         assert!(original.contains("[profiles.local]"));
+    }
+
+    #[test]
+    fn parses_workspace_config_server_settings() {
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[server]
+host = "0.0.0.0"
+port = 8080
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(
+            config.server_settings(),
+            &ServerSettings {
+                host: "0.0.0.0".to_owned(),
+                port: 8080,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_server_settings_use_default_binding() {
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+default_profile = "custom"
+
+[profiles.custom]
+theme = "remote"
+sibling = "remote"
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+        let binding = ServerBinding::from(config.server_settings());
+
+        assert_eq!(binding.host, DEFAULT_SERVER_HOST);
+        assert_eq!(binding.port, DEFAULT_SERVER_PORT);
+        assert_eq!(binding.to_string(), "127.0.0.1:1111");
     }
 
     #[test]

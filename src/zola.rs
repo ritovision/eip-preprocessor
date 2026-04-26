@@ -15,7 +15,7 @@ use semver::Version;
 use snafu::{ensure, Backtrace, IntoError, Report, ResultExt, Snafu};
 use url::Url;
 
-use crate::{cache::Cache, git, ThemeSource};
+use crate::{cache::Cache, config::ServerBinding, git, ThemeSource};
 
 const MINIMUM_VERSION: Version = Version::new(0, 22, 1);
 
@@ -96,6 +96,39 @@ pub fn find_zola() -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsString, path::Path};
+
+    use crate::config::ServerBinding;
+
+    use super::serve_args;
+
+    #[test]
+    fn serve_args_include_configured_interface_and_port() {
+        let server_binding = ServerBinding {
+            host: "0.0.0.0".to_owned(),
+            port: 8080,
+        };
+
+        assert_eq!(
+            serve_args(&server_binding, Path::new("/tmp/build-output")),
+            vec![
+                OsString::from("serve"),
+                OsString::from("--drafts"),
+                OsString::from("--fast"),
+                OsString::from("--force"),
+                OsString::from("--interface"),
+                OsString::from("0.0.0.0"),
+                OsString::from("--port"),
+                OsString::from("8080"),
+                OsString::from("-o"),
+                OsString::from("/tmp/build-output"),
+            ]
+        );
+    }
+}
+
 pub fn check(theme: &ThemeSource, cache: &Cache, project_path: &Path) -> Result<(), Error> {
     let args = ["check", "--drafts", "--skip-external-links"];
     spawn_log(theme, cache, project_path, args)?;
@@ -126,15 +159,33 @@ pub fn serve(
     cache: &Cache,
     project_path: &Path,
     output_path: &Path,
+    server_binding: &ServerBinding,
 ) -> Result<(), Error> {
     // TODO: Properly kill the child process when we receive ctrl-c.
     remove_output(output_path);
-    let args = ["serve", "--drafts", "--fast", "--force", "-o"]
-        .map(OsString::from)
-        .into_iter()
-        .chain(std::iter::once(output_path.into()));
+    let args = serve_args(server_binding, output_path);
     spawn_log(theme, cache, project_path, args)?;
     Ok(())
+}
+
+pub(crate) fn serve_args(server_binding: &ServerBinding, output_path: &Path) -> Vec<OsString> {
+    [
+        "serve",
+        "--drafts",
+        "--fast",
+        "--force",
+        "--interface",
+        server_binding.host.as_str(),
+        "--port",
+    ]
+    .map(OsString::from)
+    .into_iter()
+    .chain([
+        OsString::from(server_binding.port.to_string()),
+        OsString::from("-o"),
+        output_path.as_os_str().to_os_string(),
+    ])
+    .collect()
 }
 
 fn remove_output(output_path: &Path) {
