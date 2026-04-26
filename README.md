@@ -99,9 +99,8 @@ build-eips build
 build-eips serve
 ```
 
-The generated starter config includes transitional profile fields for older
-explicit `--profile` invocations. Plain site commands use the local-first
-defaults described below instead of reading `default_profile`.
+The generated starter config contains local workspace preferences such as
+`build_root_base`, `[server]`, and `[site]`. Command behavior is built in.
 
 Tracked active-repo metadata lives separately in `.build-eips.repo.toml` when a
 repo provides one. That manifest owns the repo identity, environment URLs, and
@@ -137,22 +136,20 @@ build-eips --production build
 build-eips parity build
 ```
 
-## Profiles And Overrides
+## Source Mode Overrides
 
-The transitional `--profile <name>` flag is still accepted for explicit profile
-invocations, and `build-eips parity build|serve|check` remains the built-in
-remote clean staging/parity alias. Plain commands do not read
-`default_profile`.
+`build-eips parity build|serve|check` is the built-in remote clean
+staging/parity path.
 
 ### Explicit overrides
 
-Use these flags to override the selected profile directly:
+Use these flags to override the built-in source and output-location choices
+directly:
 
 - `--staging` / `--production`
 - `--remote-theme`
 - `--remote-sibling-repo`
 - `--build-root <path>`
-- `--profile <name>`
 
 Workspace-local sources come from the standard workspace layout. The local theme
 is `workspace/theme`, and local sibling repos are `workspace/<sibling_repo_id>`
@@ -215,8 +212,8 @@ Local serving keeps two distinct modes:
 - `build-eips serve` for the runtime dev loop
 - `build-eips preview` for serving already-built static output
 
-`build-eips preview` serves the resolved output directory for the active
-profile without invoking Zola, preprocessing markdown, or rebuilding anything.
+`build-eips preview` serves the resolved output directory for the active repo
+without invoking Zola, preprocessing markdown, or rebuilding anything.
 If the output directory does not exist yet, it fails and tells you to run
 `build-eips build` first.
 
@@ -229,9 +226,9 @@ The workspace config `[site].base_url` value is a local rendered-site URL
 default. Starter configs set it to `http://127.0.0.1:1111`; if you change
 `[server].port`, update `[site].base_url` too when generated links should match
 the local server. Explicit environment and parity commands ignore
-`[site].base_url`, including `--staging`, `--production`, `parity`, and
-`--profile parity`. Per-command `--base-url` on `build` or `serve` is a one-run
-override and wins even with staging or parity.
+`[site].base_url`, including `--staging`, `--production`, and `parity`.
+Per-command `--base-url` on `build` or `serve` is a one-run override and wins
+even with staging or parity.
 `preview` serves existing output, so build with `--base-url` first when previewed
 HTML should contain a different local link target.
 

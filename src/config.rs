@@ -18,9 +18,6 @@ pub const LOCAL_CONFIG_FILE: &str = ".build-eips.toml";
 pub const REPO_MANIFEST_FILE: &str = ".build-eips.repo.toml";
 pub const DEFAULT_BUILD_ROOT_BASE: &str = ".local-build";
 pub const DEFAULT_THEME_DIR: &str = "theme";
-pub const LOCAL_PROFILE: &str = "local";
-pub const PARITY_PROFILE: &str = "parity";
-pub const DIRTY_PROFILE: &str = "dirty";
 pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_SERVER_PORT: u16 = 1111;
 pub const DEFAULT_SITE_BASE_URL: &str = "http://127.0.0.1:1111";
@@ -77,37 +74,13 @@ pub enum WorkspaceError {
         backtrace: Backtrace,
     },
 
-    #[snafu(display("cannot use `--profile {profile}` without a workspace config"))]
-    ProfileWithoutConfig {
-        profile: String,
-        backtrace: Backtrace,
-    },
-
     #[snafu(display(
-        "workspace config `{}` does not define profile `{profile}`",
+        "workspace config `{}` uses removed profile field(s): {fields}\nCommand behavior is now built in; remove stale profile fields manually or delete `.build-eips.toml` and rerun `build-eips workspace init <workspace-root>`.\nSupported local preference fields are `build_root_base`, `[server]`, and `[site]` until build-root config is removed in a later phase.",
         config_path.to_string_lossy()
     ))]
-    MissingProfile {
+    StaleProfileSchema {
         config_path: PathBuf,
-        profile: String,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display(
-        "workspace config `{}` defines reserved profile name `{profile}`",
-        config_path.to_string_lossy()
-    ))]
-    ReservedProfileName {
-        config_path: PathBuf,
-        profile: String,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display(
-        "profile name `{profile}` is reserved for a command group and cannot be selected"
-    ))]
-    ReservedProfileSelection {
-        profile: String,
+        fields: String,
         backtrace: Backtrace,
     },
 }
@@ -494,26 +467,10 @@ impl LegacyLocation {
     }
 }
 
-/// Selects whether a profile-backed source uses the workspace-local checkout or the remote
-/// default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceSelection {
-    /// Use the remote/default source for this input.
-    #[default]
-    Remote,
-
-    /// Use the workspace-local source for this input.
-    Local,
-}
-
 /// Workspace-local configuration loaded from `.build-eips.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspaceConfig {
-    /// Profile name to use when no profile alias or `--profile` is passed.
-    pub default_profile: Option<String>,
-
     /// Directory under the workspace root where local build artifacts are written.
     pub build_root_base: PathBuf,
 
@@ -524,49 +481,25 @@ pub struct WorkspaceConfig {
     /// Local rendered-site URL defaults for build and serve commands.
     #[serde(default)]
     pub site: SiteSettings,
-
-    /// Custom profile definitions keyed by profile name.
-    pub profiles: BTreeMap<String, LocalProfile>,
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
-            default_profile: None,
             build_root_base: DEFAULT_BUILD_ROOT_BASE.into(),
             server: ServerSettings::default(),
             site: SiteSettings::default(),
-            profiles: BTreeMap::new(),
         }
     }
 }
 
 impl WorkspaceConfig {
     fn starter() -> Self {
-        let mut profiles = BTreeMap::new();
-        profiles.insert(LOCAL_PROFILE.into(), LocalProfile::local_default());
-
         Self {
-            default_profile: Some(LOCAL_PROFILE.into()),
             build_root_base: DEFAULT_BUILD_ROOT_BASE.into(),
             server: ServerSettings::default(),
             site: SiteSettings::starter(),
-            profiles,
         }
-    }
-
-    fn validate(&self, config_path: &Path) -> Result<(), WorkspaceError> {
-        for profile in self.profiles.keys() {
-            if is_reserved_profile_name(profile) {
-                return ReservedProfileNameSnafu {
-                    config_path: config_path.to_path_buf(),
-                    profile: profile.clone(),
-                }
-                .fail();
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -673,52 +606,6 @@ fn format_base_url(base_url: &Url) -> String {
     }
 }
 
-/// Profile defaults that participate in profile selection, `default_profile`, and CLI overrides.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct LocalProfile {
-    /// Use the staging repositories and staging base URLs instead of production.
-    pub staging: bool,
-
-    /// Source preference for the theme input.
-    pub theme: SourceSelection,
-
-    /// Source preference for the sibling content repository input.
-    pub sibling: SourceSelection,
-
-    /// Enable dirty mode so tracked working-tree changes are materialized into the build input.
-    pub allow_dirty: bool,
-}
-
-impl LocalProfile {
-    fn local_default() -> Self {
-        Self {
-            staging: true,
-            theme: SourceSelection::Local,
-            sibling: SourceSelection::Local,
-            allow_dirty: false,
-        }
-    }
-
-    pub fn parity() -> Self {
-        Self {
-            staging: true,
-            theme: SourceSelection::Remote,
-            sibling: SourceSelection::Remote,
-            allow_dirty: false,
-        }
-    }
-
-    pub fn dirty() -> Self {
-        Self {
-            staging: true,
-            theme: SourceSelection::Local,
-            sibling: SourceSelection::Local,
-            allow_dirty: true,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct LoadedWorkspaceConfig {
     config_path: PathBuf,
@@ -734,10 +621,15 @@ impl LoadedWorkspaceConfig {
         let contents = std::fs::read_to_string(&config_path).with_context(|_| FsSnafu {
             path: config_path.clone(),
         })?;
-        let config = toml::from_str::<WorkspaceConfig>(&contents).with_context(|_| ParseSnafu {
+        let value = toml::from_str::<toml::Value>(&contents).with_context(|_| ParseSnafu {
             config_path: config_path.clone(),
         })?;
-        config.validate(&config_path)?;
+        reject_stale_profile_schema(&config_path, &value)?;
+        let config = value
+            .try_into::<WorkspaceConfig>()
+            .with_context(|_| ParseSnafu {
+                config_path: config_path.clone(),
+            })?;
 
         let workspace_root = config_path
             .parent()
@@ -756,13 +648,6 @@ impl LoadedWorkspaceConfig {
             Some(path) => Self::from_path(&path).map(Some),
             None => Ok(None),
         }
-    }
-
-    pub fn selected_profile(
-        &self,
-        requested: Option<&str>,
-    ) -> Result<Option<SelectedProfile>, WorkspaceError> {
-        selected_profile(Some(self), requested)
     }
 
     pub fn config_path(&self) -> &Path {
@@ -799,88 +684,28 @@ impl LoadedWorkspaceConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectedProfile {
-    pub name: String,
-    pub profile: LocalProfile,
-}
-
-impl SelectedProfile {
-    pub fn built_in(name: &str) -> Option<Self> {
-        let profile = match name {
-            PARITY_PROFILE => LocalProfile::parity(),
-            DIRTY_PROFILE => LocalProfile::dirty(),
-            _ => return None,
-        };
-
-        Some(Self {
-            name: name.to_owned(),
-            profile,
-        })
-    }
-}
-
-pub fn is_reserved_command_group_name(name: &str) -> bool {
-    matches!(name, "editorial" | "workspace")
-}
-
-fn is_reserved_profile_name(name: &str) -> bool {
-    matches!(
-        name,
-        PARITY_PROFILE | DIRTY_PROFILE | "editorial" | "workspace"
-    )
-}
-
-fn select_profile(
-    config: Option<&LoadedWorkspaceConfig>,
-    name: &str,
-) -> Result<SelectedProfile, WorkspaceError> {
-    if is_reserved_command_group_name(name) {
-        return ReservedProfileSelectionSnafu {
-            profile: name.to_owned(),
+fn reject_stale_profile_schema(
+    config_path: &Path,
+    value: &toml::Value,
+) -> Result<(), WorkspaceError> {
+    let mut fields = Vec::new();
+    if let Some(table) = value.as_table() {
+        if table.contains_key("default_profile") {
+            fields.push("default_profile");
         }
-        .fail();
-    }
-
-    if let Some(profile) = SelectedProfile::built_in(name) {
-        return Ok(profile);
-    }
-
-    let Some(config) = config else {
-        return ProfileWithoutConfigSnafu {
-            profile: name.to_owned(),
+        if table.contains_key("profiles") {
+            fields.push("profiles");
         }
-        .fail();
-    };
+    }
 
-    let profile =
-        config
-            .config
-            .profiles
-            .get(name)
-            .cloned()
-            .with_context(|| MissingProfileSnafu {
-                config_path: config.config_path.clone(),
-                profile: name.to_owned(),
-            })?;
-
-    Ok(SelectedProfile {
-        name: name.to_owned(),
-        profile,
-    })
-}
-
-pub fn selected_profile(
-    config: Option<&LoadedWorkspaceConfig>,
-    requested: Option<&str>,
-) -> Result<Option<SelectedProfile>, WorkspaceError> {
-    let name = requested.or_else(|| {
-        config.and_then(|loaded_config| loaded_config.config.default_profile.as_deref())
-    });
-
-    match name {
-        Some(name) => select_profile(config, name).map(Some),
-        None => Ok(None),
+    if fields.is_empty() {
+        Ok(())
+    } else {
+        StaleProfileSchemaSnafu {
+            config_path: config_path.to_path_buf(),
+            fields: fields.join(", "),
+        }
+        .fail()
     }
 }
 
@@ -918,11 +743,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        default_workspace_config_text, discover_path, selected_profile, LoadedRepoManifest,
-        LoadedWorkspaceConfig, LocalProfile, RepoManifestError, ServerBinding, ServerSettings,
-        SourceSelection, WorkspaceError, DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT,
-        DEFAULT_SITE_BASE_URL, DIRTY_PROFILE, LOCAL_CONFIG_FILE, LOCAL_PROFILE, PARITY_PROFILE,
-        REPO_MANIFEST_FILE,
+        default_workspace_config_text, discover_path, LoadedRepoManifest, LoadedWorkspaceConfig,
+        RepoManifestError, ServerBinding, ServerSettings, WorkspaceError, DEFAULT_SERVER_HOST,
+        DEFAULT_SERVER_PORT, DEFAULT_SITE_BASE_URL, LOCAL_CONFIG_FILE, REPO_MANIFEST_FILE,
     };
 
     struct TestWorkspace {
@@ -1162,29 +985,11 @@ base_url = "https://staging.example.test/ERCs/"
         let config_path = workspace.write_file(LOCAL_CONFIG_FILE, &default_workspace_config_text());
 
         let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
-        let local = config
-            .selected_profile(Some(LOCAL_PROFILE))
-            .unwrap()
-            .unwrap()
-            .profile;
 
         assert_eq!(
-            local,
-            LocalProfile {
-                staging: true,
-                theme: SourceSelection::Local,
-                sibling: SourceSelection::Local,
-                allow_dirty: false,
-            }
+            config.build_root_for("EIPs"),
+            workspace.path(".local-build/EIPs")
         );
-        assert!(config
-            .selected_profile(Some(PARITY_PROFILE))
-            .unwrap()
-            .is_some());
-        assert!(config
-            .selected_profile(Some(DIRTY_PROFILE))
-            .unwrap()
-            .is_some());
         assert_eq!(config.server_settings(), &ServerSettings::default());
         assert_eq!(
             config.site_settings().base_url.as_ref().unwrap().as_str(),
@@ -1199,15 +1004,14 @@ base_url = "https://staging.example.test/ERCs/"
         let reparsed = toml::to_string_pretty(&parsed).unwrap();
 
         assert_eq!(reparsed, original);
-        assert!(!original.contains("[profiles.parity]"));
-        assert!(!original.contains("[profiles.dirty]"));
-        assert!(original.contains("default_profile = \"local\""));
+        assert!(original.contains("build_root_base = \".local-build\""));
         assert!(original.contains("[server]"));
         assert!(original.contains("host = \"127.0.0.1\""));
         assert!(original.contains("port = 1111"));
         assert!(original.contains("[site]"));
         assert!(original.contains(&format!("base_url = \"{DEFAULT_SITE_BASE_URL}\"")));
-        assert!(original.contains("[profiles.local]"));
+        assert!(!original.contains("default_profile"));
+        assert!(!original.contains("[profiles"));
     }
 
     #[test]
@@ -1239,11 +1043,7 @@ port = 8080
         let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
-default_profile = "custom"
-
-[profiles.custom]
-theme = "remote"
-sibling = "remote"
+build_root_base = ".local-build"
 "#,
         );
 
@@ -1297,11 +1097,7 @@ base_url = "not a url"
         let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
-default_profile = "custom"
-
-[profiles.custom]
-theme = "remote"
-sibling = "remote"
+build_root_base = ".local-build"
 "#,
         );
 
@@ -1311,114 +1107,84 @@ sibling = "remote"
     }
 
     #[test]
-    fn built_in_profiles_work_without_workspace_config() {
-        let parity = selected_profile(None, Some(PARITY_PROFILE))
-            .unwrap()
-            .unwrap();
-        let dirty = selected_profile(None, Some(DIRTY_PROFILE))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(parity.profile, LocalProfile::parity());
-        assert_eq!(dirty.profile, LocalProfile::dirty());
-    }
-
-    #[test]
-    fn custom_profile_without_workspace_config_fails() {
-        let error = selected_profile(None, Some(LOCAL_PROFILE)).unwrap_err();
-
-        assert!(matches!(error, WorkspaceError::ProfileWithoutConfig { .. }));
-    }
-
-    #[test]
-    fn reserved_command_group_name_cannot_be_selected_as_profile() {
-        let error = selected_profile(None, Some("editorial")).unwrap_err();
-
-        assert!(matches!(
-            error,
-            WorkspaceError::ReservedProfileSelection { .. }
-        ));
-    }
-
-    #[test]
-    fn config_defined_profile_names_cannot_collide_with_reserved_names() {
+    fn stale_default_profile_errors_with_migration_guidance() {
         let workspace = TestWorkspace::new();
         let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
-[profiles.parity]
-staging = true
+default_profile = "local"
 "#,
         );
 
         let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+        let message = error.to_string();
 
-        assert!(matches!(error, WorkspaceError::ReservedProfileName { .. }));
+        assert!(matches!(error, WorkspaceError::StaleProfileSchema { .. }));
+        assert!(message.contains("default_profile"));
+        assert!(message.contains("Command behavior is now built in"));
+        assert!(message.contains(
+            "delete `.build-eips.toml` and rerun `build-eips workspace init <workspace-root>`"
+        ));
+        assert!(message.contains("build_root_base"));
+        assert!(message.contains("[server]"));
+        assert!(message.contains("[site]"));
     }
 
     #[test]
-    fn old_inverse_schema_fails_to_parse() {
+    fn stale_profiles_table_errors_with_migration_guidance() {
         let workspace = TestWorkspace::new();
         let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
 [profiles.local]
 staging = true
-use_local_theme = true
-use_local_sibling = true
 "#,
         );
 
         let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+        let message = error.to_string();
 
-        assert!(matches!(error, WorkspaceError::Parse { .. }));
+        assert!(matches!(error, WorkspaceError::StaleProfileSchema { .. }));
+        assert!(message.contains("profiles"));
+        assert!(message.contains("Command behavior is now built in"));
     }
 
     #[test]
-    fn default_profile_resolves_to_built_in_profile() {
+    fn stale_default_profile_and_profiles_table_errors_name_both_fields() {
         let workspace = TestWorkspace::new();
         let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
 default_profile = "parity"
+
+[profiles.local]
+staging = true
 "#,
         );
 
-        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
-        let selected = config.selected_profile(None).unwrap().unwrap();
+        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+        let message = error.to_string();
 
-        assert_eq!(selected.name, PARITY_PROFILE);
-        assert_eq!(selected.profile, LocalProfile::parity());
+        assert!(matches!(error, WorkspaceError::StaleProfileSchema { .. }));
+        assert!(message.contains("default_profile"));
+        assert!(message.contains("profiles"));
     }
 
     #[test]
-    fn default_profile_resolves_to_custom_profile() {
+    fn unrelated_unknown_workspace_config_field_uses_normal_parse_error() {
         let workspace = TestWorkspace::new();
         let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
-default_profile = "custom"
-
-[profiles.custom]
-staging = true
-theme = "local"
-sibling = "remote"
+unknown = true
 "#,
         );
 
-        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
-        let selected = config.selected_profile(None).unwrap().unwrap();
+        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+        let message = error.to_string();
 
-        assert_eq!(selected.name, "custom");
-        assert_eq!(
-            selected.profile,
-            LocalProfile {
-                staging: true,
-                theme: SourceSelection::Local,
-                sibling: SourceSelection::Remote,
-                allow_dirty: false,
-            }
-        );
+        assert!(matches!(error, WorkspaceError::Parse { .. }));
+        assert!(!message.contains("Command behavior is now built in"));
     }
 
     #[test]

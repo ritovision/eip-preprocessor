@@ -37,10 +37,7 @@ use notify::{Event, RecursiveMode, Watcher};
 use snafu::{OptionExt, Report, ResultExt, Whatever};
 use url::Url;
 
-use crate::config::{
-    Config, LoadedRepoManifest, LoadedWorkspaceConfig, SelectedProfile, ServerBinding,
-    SourceSelection,
-};
+use crate::config::{Config, LoadedRepoManifest, LoadedWorkspaceConfig, ServerBinding};
 
 const CONTENT_DIR: &str = "content";
 const BUILD_DIR: &str = "build";
@@ -63,10 +60,6 @@ struct Args {
     /// Use ROOT as the base directory (instead of finding it automatically)
     #[clap(short = 'C')]
     root: Option<PathBuf>,
-
-    /// Use the named custom or built-in profile
-    #[clap(long)]
-    profile: Option<String>,
 
     /// Force the staging repositories and base URLs
     #[clap(long)]
@@ -182,7 +175,7 @@ enum Operation {
         command: WorkspaceCommand,
     },
 
-    /// Run a normal command with the built-in parity profile
+    /// Run a normal command with the built-in parity mode
     Parity {
         #[command(subcommand)]
         command: ProfiledOperation,
@@ -493,21 +486,6 @@ impl Operation {
         )
     }
 
-    fn profile_alias_name(&self) -> Option<&'static str> {
-        match self {
-            Self::Parity { .. } => Some(config::PARITY_PROFILE),
-            Self::Print { .. }
-            | Self::Build { .. }
-            | Self::Serve { .. }
-            | Self::Preview { .. }
-            | Self::Clean
-            | Self::Check { .. }
-            | Self::Changed { .. }
-            | Self::Editorial { .. }
-            | Self::Workspace { .. } => None,
-        }
-    }
-
     fn runtime_operation(&self) -> Option<RuntimeOperation> {
         match self {
             Self::Print { .. } | Self::Workspace { .. } => None,
@@ -687,8 +665,7 @@ fn load_workspace_command_context(args: &Args) -> Result<WorkspaceCommandContext
 }
 
 fn has_execution_override_flags(args: &Args) -> bool {
-    args.profile.is_some()
-        || args.staging
+    args.staging
         || args.production
         || args.remote_theme
         || args.remote_sibling_repo
@@ -696,14 +673,8 @@ fn has_execution_override_flags(args: &Args) -> bool {
 }
 
 fn validate_non_execution_command_flags(args: &Args) -> Result<(), Whatever> {
-    if args.operation.is_workspace_command() {
-        if args.profile.is_some() {
-            snafu::whatever!("`--profile` cannot be used with `workspace` commands");
-        }
-
-        if has_execution_override_flags(args) {
-            snafu::whatever!("execution override flags cannot be used with `workspace` commands");
-        }
+    if args.operation.is_workspace_command() && has_execution_override_flags(args) {
+        snafu::whatever!("execution override flags cannot be used with `workspace` commands");
     }
 
     if args.operation.is_print_command() && has_execution_override_flags(args) {
@@ -711,16 +682,6 @@ fn validate_non_execution_command_flags(args: &Args) -> Result<(), Whatever> {
     }
 
     Ok(())
-}
-
-fn requested_profile_name(args: &Args) -> Result<Option<&str>, Whatever> {
-    match (args.operation.profile_alias_name(), args.profile.as_deref()) {
-        (Some(alias), Some(profile)) => {
-            snafu::whatever!("cannot combine profile alias `{alias}` with `--profile {profile}`")
-        }
-        (Some(alias), None) => Ok(Some(alias)),
-        (None, profile) => Ok(profile),
-    }
 }
 
 fn resolve_bool_override(
@@ -751,65 +712,59 @@ fn resolve_environment_override(args: &Args) -> Result<Option<bool>, Whatever> {
     resolve_bool_override(args.staging, args.production, "--staging", "--production")
 }
 
+fn explicit_environment_or_parity(args: &Args) -> Result<Option<bool>, Whatever> {
+    if let Some(staging) = resolve_environment_override(args)? {
+        return Ok(Some(staging));
+    }
+
+    if matches!(args.operation, Operation::Parity { .. }) {
+        return Ok(Some(true));
+    }
+
+    Ok(None)
+}
+
 fn resolve_execution_settings(
     args: &Args,
     sibling_ids: &[String],
     workspace_config: Option<&LoadedWorkspaceConfig>,
-    selected_profile: Option<&SelectedProfile>,
 ) -> Result<ExecutionSettings, Whatever> {
     let build_root = args
         .build_root
         .as_deref()
         .map(resolve_input_path)
         .transpose()?;
-    let environment_override = resolve_environment_override(args)?;
+    let explicit_environment = explicit_environment_or_parity(args)?;
     let theme_override = remote_source_override(args.remote_theme);
     let sibling_override = remote_source_override(args.remote_sibling_repo);
-    let requested_profile = requested_profile_name(args)?;
     let clean = args.operation.clean_cli_args().clean;
 
     let (staging, allow_dirty, default_theme, default_sibling) = if let Some(staging) =
-        environment_override
+        explicit_environment
     {
         (
             staging,
             false,
-            SourceSelection::Remote,
-            SourceSelection::Remote,
-        )
-    } else if matches!(args.operation, Operation::Parity { .. })
-        || requested_profile == Some(config::PARITY_PROFILE)
-    {
-        (
-            true,
-            false,
-            SourceSelection::Remote,
-            SourceSelection::Remote,
-        )
-    } else if let Some(profile) = selected_profile {
-        (
-            profile.profile.staging,
-            profile.profile.allow_dirty && !clean,
-            profile.profile.theme,
-            profile.profile.sibling,
+            SelectedSource::Remote,
+            SelectedSource::Remote,
         )
     } else if args.operation.is_plain_site_command() || args.operation.is_editorial_build_command()
     {
-        (true, !clean, SourceSelection::Local, SourceSelection::Local)
-    } else {
         (
-            false,
-            false,
-            SourceSelection::Remote,
-            SourceSelection::Remote,
+            true,
+            !clean,
+            SelectedSource::WorkspaceLocal,
+            SelectedSource::WorkspaceLocal,
         )
+    } else {
+        (false, false, SelectedSource::Remote, SelectedSource::Remote)
     };
 
     let missing_theme = theme_override.is_none()
-        && default_theme == SourceSelection::Local
+        && default_theme == SelectedSource::WorkspaceLocal
         && workspace_config.is_none();
     let missing_sibling = sibling_override.is_none()
-        && default_sibling == SourceSelection::Local
+        && default_sibling == SelectedSource::WorkspaceLocal
         && !sibling_ids.is_empty()
         && workspace_config.is_none();
 
@@ -827,14 +782,8 @@ fn resolve_execution_settings(
         );
     }
 
-    let theme = theme_override.unwrap_or(match default_theme {
-        SourceSelection::Local => SelectedSource::WorkspaceLocal,
-        SourceSelection::Remote => SelectedSource::Remote,
-    });
-    let sibling = sibling_override.unwrap_or(match default_sibling {
-        SourceSelection::Local => SelectedSource::WorkspaceLocal,
-        SourceSelection::Remote => SelectedSource::Remote,
-    });
+    let theme = theme_override.unwrap_or(default_theme);
+    let sibling = sibling_override.unwrap_or(default_sibling);
 
     Ok(ExecutionSettings {
         build_root,
@@ -1318,27 +1267,19 @@ fn resolve_server_binding(
     binding
 }
 
-fn is_explicit_env_or_parity(args: &Args, requested_profile: Option<&str>) -> bool {
-    args.staging
-        || args.production
-        || matches!(args.operation, Operation::Parity { .. })
-        || requested_profile == Some(config::PARITY_PROFILE)
-}
-
 fn resolve_base_url_override(
     args: &Args,
-    requested_profile: Option<&str>,
     workspace_config: Option<&LoadedWorkspaceConfig>,
-) -> Option<Url> {
+) -> Result<Option<Url>, Whatever> {
     if let Some(base_url) = args.operation.base_url_cli_args().base_url {
-        return Some(base_url);
+        return Ok(Some(base_url));
     }
 
-    if is_explicit_env_or_parity(args, requested_profile) {
-        return None;
+    if explicit_environment_or_parity(args)?.is_some() {
+        return Ok(None);
     }
 
-    workspace_config.and_then(|config| config.site_settings().base_url.clone())
+    Ok(workspace_config.and_then(|config| config.site_settings().base_url.clone()))
 }
 
 fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
@@ -1347,17 +1288,6 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     let sibling_ids = active_repo.sibling_ids();
     let workspace_config = LoadedWorkspaceConfig::discover(&root_path)
         .whatever_context("unable to load workspace config")?;
-    let requested_profile = requested_profile_name(args)?;
-    let selected_profile = match requested_profile {
-        Some(_) => match workspace_config.as_ref() {
-            Some(workspace_config) => workspace_config
-                .selected_profile(requested_profile)
-                .whatever_context("unable to select profile")?,
-            None => config::selected_profile(None, requested_profile)
-                .whatever_context("unable to select profile")?,
-        },
-        None => None,
-    };
 
     if let Some(workspace_config) = workspace_config.as_ref() {
         debug!(
@@ -1366,16 +1296,7 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
         );
     }
 
-    if let Some(profile) = selected_profile.as_ref() {
-        info!("using selected profile `{}`", profile.name);
-    }
-
-    let settings = resolve_execution_settings(
-        args,
-        &sibling_ids,
-        workspace_config.as_ref(),
-        selected_profile.as_ref(),
-    )?;
+    let settings = resolve_execution_settings(args, &sibling_ids, workspace_config.as_ref())?;
     let baseline = if settings.staging {
         Config::staging()
     } else {
@@ -1405,8 +1326,7 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     } else {
         git::SourceMaterialization::Clean
     };
-    let base_url_override =
-        resolve_base_url_override(args, requested_profile, workspace_config.as_ref());
+    let base_url_override = resolve_base_url_override(args, workspace_config.as_ref())?;
 
     Ok(ResolvedExecution {
         root_path,
@@ -2111,7 +2031,7 @@ mod tests {
 
     use super::{
         collect_doctor_report, editorial_runtime_execution, editorial_targets,
-        init_workspace_with_repositories, is_explicit_env_or_parity, requested_profile_name,
+        explicit_environment_or_parity, init_workspace_with_repositories,
         resolve_base_url_override, resolve_execution, resolve_execution_settings,
         resolve_server_binding, validate_non_execution_command_flags, Args, EditorialCommand,
         EditorialSelectorArgs, ExecutionSettings, Operation, ProfiledOperation, ResolvedExecution,
@@ -2131,39 +2051,18 @@ mod tests {
         LoadedWorkspaceConfig::from_path(&config_path).unwrap()
     }
 
-    fn selected_profile(
-        args: &Args,
-        workspace_config: Option<&LoadedWorkspaceConfig>,
-    ) -> crate::config::SelectedProfile {
-        let requested = requested_profile_name(args).unwrap();
-        config::selected_profile(workspace_config, requested)
-            .unwrap()
-            .unwrap()
-    }
-
     fn settings_for(
         arguments: &[&str],
         sibling_ids: &[&str],
         workspace_config: Option<&LoadedWorkspaceConfig>,
     ) -> ExecutionSettings {
         let args = parse_args(arguments);
-        let requested = requested_profile_name(&args).unwrap();
-        let selected_profile = match requested {
-            Some(_) => config::selected_profile(workspace_config, requested).unwrap(),
-            None => None,
-        };
         let sibling_ids = sibling_ids
             .iter()
             .map(|sibling_id| (*sibling_id).to_owned())
             .collect::<Vec<_>>();
 
-        resolve_execution_settings(
-            &args,
-            &sibling_ids,
-            workspace_config,
-            selected_profile.as_ref(),
-        )
-        .unwrap()
+        resolve_execution_settings(&args, &sibling_ids, workspace_config).unwrap()
     }
 
     fn assert_settings(
@@ -2295,7 +2194,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
-    fn profile_alias_parses_as_a_command_prefix() {
+    fn parity_command_parses_as_command_prefix() {
         let args = parse_args(&["build-eips", "parity", "build"]);
 
         assert!(matches!(
@@ -2304,52 +2203,24 @@ base_url = "https://staging.example.test/{sibling_id}/"
                 command: ProfiledOperation::Build { .. }
             }
         ));
-        assert_eq!(
-            requested_profile_name(&args).unwrap(),
-            Some(config::PARITY_PROFILE)
-        );
     }
 
     #[test]
-    fn profile_alias_and_profile_flag_conflict() {
-        let args = parse_args(&["build-eips", "--profile", "local", "parity", "build"]);
-        let error = requested_profile_name(&args).unwrap_err();
+    fn profile_flag_is_rejected() {
+        let error =
+            Args::try_parse_from(["build-eips", "--profile", "local", "build"]).unwrap_err();
 
         assert!(error
             .to_string()
-            .contains("cannot combine profile alias `parity` with `--profile local`"));
+            .contains("unexpected argument '--profile'"));
     }
 
     #[test]
-    fn workspace_commands_reject_profile_selection() {
-        let args = parse_args(&["build-eips", "--profile", "local", "workspace", "doctor"]);
-        let error = validate_non_execution_command_flags(&args).unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("`--profile` cannot be used with `workspace` commands"));
-    }
-
-    #[test]
-    fn command_groups_route_separately_from_profile_aliases() {
+    fn command_groups_route_separately_from_parity() {
         let workspace = parse_args(&["build-eips", "workspace", "init", "/tmp/workspace"]);
         let doctor = parse_args(&["build-eips", "workspace", "doctor"]);
-        let editorial_lint = parse_args(&[
-            "build-eips",
-            "--profile",
-            "parity",
-            "editorial",
-            "lint",
-            "--working-tree",
-        ]);
-        let editorial_build = parse_args(&[
-            "build-eips",
-            "--profile",
-            "parity",
-            "editorial",
-            "build",
-            "--working-tree",
-        ]);
+        let editorial_lint = parse_args(&["build-eips", "editorial", "lint", "--working-tree"]);
+        let editorial_build = parse_args(&["build-eips", "editorial", "build", "--working-tree"]);
 
         assert!(matches!(
             workspace.operation,
@@ -2376,10 +2247,6 @@ base_url = "https://staging.example.test/{sibling_id}/"
             })
         ));
         assert!(validate_non_execution_command_flags(&editorial_lint).is_ok());
-        assert_eq!(
-            requested_profile_name(&editorial_lint).unwrap(),
-            Some(config::PARITY_PROFILE)
-        );
     }
 
     #[test]
@@ -2513,17 +2380,6 @@ port = 8080
                 ],
                 RuntimeOperation::Serve,
             ),
-            (
-                &[
-                    "build-eips",
-                    "--profile",
-                    "dirty",
-                    "build",
-                    "--base-url",
-                    "http://localhost:4000",
-                ],
-                RuntimeOperation::Build,
-            ),
         ];
 
         for (arguments, expected_runtime_operation) in cases {
@@ -2642,44 +2498,20 @@ port = 8080
     }
 
     #[test]
-    fn explicit_env_or_parity_provenance_is_classified_separately_from_dirty_defaults() {
-        let workspace_config = load_workspace_config(
-            r#"
-default_profile = "parity"
-
-[profiles.local]
-staging = true
-theme = "remote"
-sibling = "remote"
-"#,
-        );
-        let selected_parity_default = config::selected_profile(Some(&workspace_config), None)
-            .unwrap()
-            .unwrap();
-        let cases: &[(&[&str], bool)] = &[
-            (&["build-eips", "--staging", "build"], true),
-            (&["build-eips", "--production", "build"], true),
-            (&["build-eips", "parity", "build"], true),
-            (&["build-eips", "--profile", "parity", "build"], true),
-            (&["build-eips", "build"], false),
-            (&["build-eips", "--profile", "dirty", "build"], false),
-            (&["build-eips", "--profile", "local", "build"], false),
+    fn explicit_env_or_parity_provenance_is_classified_separately_from_local_defaults() {
+        let cases: &[(&[&str], Option<bool>)] = &[
+            (&["build-eips", "--staging", "build"], Some(true)),
+            (&["build-eips", "--production", "build"], Some(false)),
+            (&["build-eips", "parity", "build"], Some(true)),
+            (&["build-eips", "build"], None),
+            (&["build-eips", "serve"], None),
+            (&["build-eips", "check"], None),
         ];
 
         for (arguments, expected) in cases {
             let args = parse_args(arguments);
-            assert_eq!(
-                is_explicit_env_or_parity(&args, requested_profile_name(&args).unwrap()),
-                *expected
-            );
+            assert_eq!(explicit_environment_or_parity(&args).unwrap(), *expected);
         }
-
-        let plain_args = parse_args(&["build-eips", "build"]);
-        assert!(!is_explicit_env_or_parity(
-            &plain_args,
-            requested_profile_name(&plain_args).unwrap(),
-        ));
-        assert_eq!(selected_parity_default.name, config::PARITY_PROFILE);
     }
 
     #[test]
@@ -2690,48 +2522,26 @@ sibling = "remote"
 base_url = "http://localhost:4000"
 "#,
         );
-        let parity_default_config = load_workspace_config(
-            r#"
-default_profile = "parity"
-
-[site]
-base_url = "http://localhost:4000"
-"#,
-        );
-
         let none = parse_args(&["build-eips", "build"]);
-        assert!(
-            resolve_base_url_override(&none, requested_profile_name(&none).unwrap(), None,)
-                .is_none()
-        );
+        assert!(resolve_base_url_override(&none, None).unwrap().is_none());
 
-        for arguments in [
-            &["build-eips", "build"][..],
-            &["build-eips", "serve"][..],
-            &["build-eips", "--profile", "dirty", "build"][..],
-        ] {
+        for arguments in [&["build-eips", "build"][..], &["build-eips", "serve"][..]] {
             let args = parse_args(arguments);
             assert_eq!(
-                resolve_base_url_override(
-                    &args,
-                    requested_profile_name(&args).unwrap(),
-                    Some(&workspace_config),
-                )
-                .unwrap()
-                .as_str(),
+                resolve_base_url_override(&args, Some(&workspace_config))
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
                 "http://localhost:4000/"
             );
         }
 
         let cli = parse_args(&["build-eips", "build", "--base-url", "http://localhost:5000"]);
         assert_eq!(
-            resolve_base_url_override(
-                &cli,
-                requested_profile_name(&cli).unwrap(),
-                Some(&workspace_config),
-            )
-            .unwrap()
-            .as_str(),
+            resolve_base_url_override(&cli, Some(&workspace_config))
+                .unwrap()
+                .unwrap()
+                .as_str(),
             "http://localhost:5000/"
         );
 
@@ -2740,28 +2550,12 @@ base_url = "http://localhost:4000"
             &["build-eips", "--production", "build"][..],
             &["build-eips", "parity", "build"][..],
             &["build-eips", "parity", "serve"][..],
-            &["build-eips", "--profile", "parity", "build"][..],
         ] {
             let args = parse_args(arguments);
-            assert!(resolve_base_url_override(
-                &args,
-                requested_profile_name(&args).unwrap(),
-                Some(&workspace_config),
-            )
-            .is_none());
+            assert!(resolve_base_url_override(&args, Some(&workspace_config))
+                .unwrap()
+                .is_none());
         }
-
-        let default_parity = parse_args(&["build-eips", "build"]);
-        assert_eq!(
-            resolve_base_url_override(
-                &default_parity,
-                requested_profile_name(&default_parity).unwrap(),
-                Some(&parity_default_config),
-            )
-            .unwrap()
-            .as_str(),
-            "http://localhost:4000/"
-        );
 
         for arguments in [
             &[
@@ -2795,13 +2589,10 @@ base_url = "http://localhost:4000"
         ] {
             let args = parse_args(arguments);
             assert_eq!(
-                resolve_base_url_override(
-                    &args,
-                    requested_profile_name(&args).unwrap(),
-                    Some(&workspace_config),
-                )
-                .unwrap()
-                .as_str(),
+                resolve_base_url_override(&args, Some(&workspace_config))
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
                 "http://localhost:5000/"
             );
         }
@@ -2816,17 +2607,13 @@ base_url = "http://localhost:4000"
 "#,
         );
         let args = parse_args(&["build-eips", "build"]);
-        let settings =
-            resolve_execution_settings(&args, &[], Some(&workspace_config), None).unwrap();
+        let settings = resolve_execution_settings(&args, &[], Some(&workspace_config)).unwrap();
 
         assert_eq!(
-            resolve_base_url_override(
-                &args,
-                requested_profile_name(&args).unwrap(),
-                Some(&workspace_config),
-            )
-            .unwrap()
-            .as_str(),
+            resolve_base_url_override(&args, Some(&workspace_config))
+                .unwrap()
+                .unwrap()
+                .as_str(),
             "http://localhost:4000/"
         );
         assert_eq!(
@@ -3163,28 +2950,6 @@ base_url = "http://localhost:4000"
     }
 
     #[test]
-    fn default_profile_does_not_affect_plain_commands_in_phase_one() {
-        let workspace_config = load_workspace_config(
-            r#"
-default_profile = "parity"
-"#,
-        );
-
-        assert_settings(
-            &["build-eips", "build"],
-            &["ERCs"],
-            Some(&workspace_config),
-            ExecutionSettings {
-                build_root: None,
-                staging: true,
-                allow_dirty: true,
-                theme: SelectedSource::WorkspaceLocal,
-                sibling: SelectedSource::WorkspaceLocal,
-            },
-        );
-    }
-
-    #[test]
     fn downstream_ci_environment_forms_do_not_need_workspace_config() {
         for (arguments, expected_staging) in [
             (&["build-eips", "--staging", "build"][..], true),
@@ -3266,20 +3031,9 @@ default_profile = "parity"
     }
 
     #[test]
-    fn reserved_command_group_name_is_not_a_profile() {
-        let args = parse_args(&["build-eips", "--profile", "editorial", "build"]);
-        let requested = requested_profile_name(&args).unwrap();
-        let error = config::selected_profile(None, requested).unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("reserved for a command group and cannot be selected"));
-    }
-
-    #[test]
     fn boolean_override_conflicts_are_hard_errors() {
         let args = parse_args(&["build-eips", "--staging", "--production", "build"]);
-        let error = resolve_execution_settings(&args, &[], None, None).unwrap_err();
+        let error = resolve_execution_settings(&args, &[], None).unwrap_err();
 
         assert!(error
             .to_string()
@@ -3290,7 +3044,7 @@ default_profile = "parity"
     fn local_first_without_workspace_config_requires_explicit_resolution() {
         let args = parse_args(&["build-eips", "build"]);
         let sibling_ids = vec!["ERCs".to_owned()];
-        let error = resolve_execution_settings(&args, &sibling_ids, None, None).unwrap_err();
+        let error = resolve_execution_settings(&args, &sibling_ids, None).unwrap_err();
         let message = error.to_string();
 
         assert!(
@@ -3316,14 +3070,10 @@ default_profile = "parity"
             "build",
         ]);
         let sibling_ids = vec!["ERCs".to_owned()];
-        let local_settings =
-            resolve_execution_settings(&local_args, &sibling_ids, None, None).unwrap();
+        let local_settings = resolve_execution_settings(&local_args, &sibling_ids, None).unwrap();
 
         let parity_args = parse_args(&["build-eips", "parity", "build"]);
-        let parity_profile = selected_profile(&parity_args, None);
-        let parity_settings =
-            resolve_execution_settings(&parity_args, &sibling_ids, None, Some(&parity_profile))
-                .unwrap();
+        let parity_settings = resolve_execution_settings(&parity_args, &sibling_ids, None).unwrap();
 
         assert_eq!(
             local_settings,
@@ -3350,9 +3100,7 @@ default_profile = "parity"
     #[test]
     fn zero_sibling_remote_override_is_noop() {
         let remote_args = parse_args(&["build-eips", "--remote-sibling-repo", "parity", "build"]);
-        let remote_profile = selected_profile(&remote_args, None);
-        let remote_settings =
-            resolve_execution_settings(&remote_args, &[], None, Some(&remote_profile)).unwrap();
+        let remote_settings = resolve_execution_settings(&remote_args, &[], None).unwrap();
 
         assert_eq!(remote_settings.sibling, SelectedSource::Remote);
     }
@@ -3360,7 +3108,7 @@ default_profile = "parity"
     #[test]
     fn zero_sibling_local_first_without_workspace_config_only_requires_theme_resolution() {
         let args = parse_args(&["build-eips", "build"]);
-        let error = resolve_execution_settings(&args, &[], None, None).unwrap_err();
+        let error = resolve_execution_settings(&args, &[], None).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("selected command requires workspace-local theme sources"));
@@ -3406,13 +3154,7 @@ default_profile = "parity"
             &workspace_root,
             config::LOCAL_CONFIG_FILE,
             r#"
-default_profile = "custom"
 build_root_base = "custom-build"
-
-[profiles.custom]
-theme = "remote"
-sibling = "remote"
-allow_dirty = true
 "#,
         );
         let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "build"]);
@@ -3761,6 +3503,36 @@ allow_dirty = true
     }
 
     #[test]
+    fn workspace_doctor_stale_profile_schema_reports_failing_config_check() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        std::fs::write(
+            workspace.path().join(config::LOCAL_CONFIG_FILE),
+            r#"
+default_profile = "local"
+
+[profiles.local]
+staging = true
+"#,
+        )
+        .unwrap();
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "doctor",
+        ]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
     fn manifest_driven_multi_repo_build_and_editorial_flows_resolve_siblings() {
         let temp = TempDir::new().unwrap();
         let upstream_path = temp.path().join("upstream/Core");
@@ -3833,60 +3605,6 @@ allow_dirty = true
         let targets = editorial_targets(&selectors, &resolved).unwrap();
 
         assert_eq!(targets, vec![PathBuf::from("content/0001.md")]);
-    }
-
-    #[test]
-    fn explicit_profile_selection_and_overrides_share_the_same_path() {
-        let workspace_config = load_workspace_config(
-            r#"
-default_profile = "local"
-
-[profiles.local]
-staging = true
-theme = "local"
-sibling = "local"
-"#,
-        );
-        let args = parse_args(&[
-            "build-eips",
-            "--profile",
-            "local",
-            "--remote-theme",
-            "build",
-        ]);
-        let selected_profile = config::selected_profile(
-            Some(&workspace_config),
-            requested_profile_name(&args).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-        let settings = resolve_execution_settings(
-            &args,
-            &["ERCs".to_owned()],
-            Some(&workspace_config),
-            Some(&selected_profile),
-        )
-        .unwrap();
-
-        assert_eq!(selected_profile.name, "local");
-        assert_eq!(
-            settings,
-            ExecutionSettings {
-                build_root: None,
-                staging: true,
-                allow_dirty: false,
-                theme: SelectedSource::Remote,
-                sibling: SelectedSource::WorkspaceLocal,
-            }
-        );
-    }
-
-    #[test]
-    fn built_in_profile_can_be_selected_through_profile_flag_without_workspace_config() {
-        let args = parse_args(&["build-eips", "--profile", "dirty", "build"]);
-        let selected_profile = selected_profile(&args, None);
-
-        assert_eq!(selected_profile.name, config::DIRTY_PROFILE);
     }
 }
 
