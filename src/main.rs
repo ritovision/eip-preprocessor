@@ -75,17 +75,9 @@ struct Args {
     #[clap(long)]
     no_staging: bool,
 
-    /// Use a local theme checkout at PATH
-    #[clap(long)]
-    theme: Option<PathBuf>,
-
     /// Use the configured remote theme instead of a workspace-local theme
     #[clap(long)]
     remote_theme: bool,
-
-    /// Use a local sibling content repository checkout at PATH
-    #[clap(long)]
-    sibling_repo: Option<PathBuf>,
 
     /// Use the configured remote sibling content repository
     #[clap(long)]
@@ -282,7 +274,6 @@ enum RuntimeOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelectedSource {
     WorkspaceLocal,
-    ExplicitLocal(PathBuf),
     Remote,
 }
 
@@ -604,9 +595,7 @@ fn has_execution_override_flags(args: &Args) -> bool {
     args.profile.is_some()
         || args.staging
         || args.no_staging
-        || args.theme.is_some()
         || args.remote_theme
-        || args.sibling_repo.is_some()
         || args.remote_sibling_repo
         || args.build_root.is_some()
         || args.allow_dirty
@@ -657,42 +646,12 @@ fn resolve_bool_override(
     }
 }
 
-fn resolve_source_override(
-    local_path: Option<PathBuf>,
-    force_remote: bool,
-    local_flag: &str,
-    remote_flag: &str,
-) -> Result<Option<SelectedSource>, Whatever> {
-    match (local_path, force_remote) {
-        (Some(_), true) => snafu::whatever!("cannot pass both `{local_flag}` and `{remote_flag}`"),
-        (Some(path), false) => Ok(Some(SelectedSource::ExplicitLocal(path))),
-        (None, true) => Ok(Some(SelectedSource::Remote)),
-        (None, false) => Ok(None),
-    }
+fn remote_source_override(force_remote: bool) -> Option<SelectedSource> {
+    force_remote.then_some(SelectedSource::Remote)
 }
 
 fn format_sibling_ids(sibling_ids: &[String]) -> String {
     sibling_ids.join(", ")
-}
-
-fn validate_sibling_override(
-    sibling_ids: &[String],
-    sibling_override: Option<&SelectedSource>,
-) -> Result<(), Whatever> {
-    if !matches!(sibling_override, Some(SelectedSource::ExplicitLocal(_))) {
-        return Ok(());
-    }
-
-    match sibling_ids.len() {
-        0 => snafu::whatever!(
-            "`--sibling-repo <path>` cannot be used because active repo declares no sibling content repos"
-        ),
-        1 => Ok(()),
-        _ => snafu::whatever!(
-            "`--sibling-repo <path>` is ambiguous because active repo declares multiple sibling content repos: {}. Run `build-eips workspace init <workspace-root>` for local sibling provisioning, or pass `--remote-sibling-repo` to force all siblings remote",
-            format_sibling_ids(sibling_ids)
-        ),
-    }
 }
 
 fn resolve_execution_settings(
@@ -724,22 +683,8 @@ fn resolve_execution_settings(
             .map(|profile| profile.profile.allow_dirty)
             .unwrap_or(false)
     });
-    let theme_override = resolve_source_override(
-        args.theme.as_deref().map(resolve_input_path).transpose()?,
-        args.remote_theme,
-        "--theme",
-        "--remote-theme",
-    )?;
-    let sibling_override = resolve_source_override(
-        args.sibling_repo
-            .as_deref()
-            .map(resolve_input_path)
-            .transpose()?,
-        args.remote_sibling_repo,
-        "--sibling-repo",
-        "--remote-sibling-repo",
-    )?;
-    validate_sibling_override(sibling_ids, sibling_override.as_ref())?;
+    let theme_override = remote_source_override(args.remote_theme);
+    let sibling_override = remote_source_override(args.remote_sibling_repo);
 
     let default_theme = selected_profile
         .map(|profile| profile.profile.theme)
@@ -767,7 +712,7 @@ fn resolve_execution_settings(
         };
 
         snafu::whatever!(
-            "profile `{profile_name}` requires workspace-local {required_sources} sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips workspace init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--theme <path>` and/or `--sibling-repo <path>` for local overrides\n3. pass `--remote-theme` and/or `--remote-sibling-repo` for remote overrides\n4. switch to `--profile parity` if remote defaults are what you actually want",
+            "profile `{profile_name}` requires workspace-local {required_sources} sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips workspace init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-theme` and/or `--remote-sibling-repo` for remote overrides\n3. switch to `--profile parity` if remote defaults are what you actually want",
             config::LOCAL_CONFIG_FILE
         );
     }
@@ -1171,31 +1116,6 @@ fn apply_sibling_sources(
 ) -> Result<(), Whatever> {
     match sibling {
         SelectedSource::Remote => Ok(()),
-        SelectedSource::ExplicitLocal(path) => {
-            let [repo_id] = sibling_ids else {
-                match sibling_ids {
-                    [] => snafu::whatever!(
-                        "`--sibling-repo <path>` cannot be used because active repo declares no sibling content repos"
-                    ),
-                    _ => snafu::whatever!(
-                        "`--sibling-repo <path>` is ambiguous because active repo declares multiple sibling content repos: {}. Run `build-eips workspace init <workspace-root>` for local sibling provisioning, or pass `--remote-sibling-repo` to force all siblings remote",
-                        format_sibling_ids(sibling_ids)
-                    ),
-                }
-            };
-
-            if !local_repo_available(path) {
-                snafu::whatever!(
-                    "local sibling `{repo_id}` is missing or is not a git repository at `{}`",
-                    path.to_string_lossy()
-                );
-            }
-
-            repository_use
-                .other_repos
-                .insert(repo_id.clone(), local_repo_url(path)?);
-            Ok(())
-        }
         SelectedSource::WorkspaceLocal => {
             if sibling_ids.is_empty() {
                 return Ok(());
@@ -1257,7 +1177,6 @@ fn theme_source(
     theme: &SelectedSource,
 ) -> ThemeSource {
     match theme {
-        SelectedSource::ExplicitLocal(path) => ThemeSource::Local { path: path.clone() },
         SelectedSource::WorkspaceLocal => ThemeSource::Local {
             path: workspace_config
                 .expect("workspace-local theme selection requires a workspace config")
@@ -2016,7 +1935,7 @@ mod tests {
         requested_profile_name, resolve_execution, resolve_execution_settings,
         validate_non_execution_command_flags, Args, EditorialCommand, EditorialSelectorArgs,
         ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation, SelectedSource,
-        WorkspaceCommand, WorkspaceInitRepositories, REPO_DIR,
+        ThemeSource, WorkspaceCommand, WorkspaceInitRepositories, REPO_DIR,
     };
     use crate::config::{self, LoadedWorkspaceConfig};
 
@@ -2315,22 +2234,6 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
-    fn source_override_conflicts_are_hard_errors() {
-        let args = parse_args(&[
-            "build-eips",
-            "--theme",
-            "/tmp/theme",
-            "--remote-theme",
-            "build",
-        ]);
-        let error = resolve_execution_settings(&args, &[], None, None).unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("cannot pass both `--theme` and `--remote-theme`"));
-    }
-
-    #[test]
     fn dirty_profile_without_workspace_config_requires_explicit_resolution() {
         let args = parse_args(&["build-eips", "dirty", "build"]);
         let selected_profile = selected_profile(&args, None);
@@ -2343,9 +2246,10 @@ base_url = "https://staging.example.test/{sibling_id}/"
             message.contains("profile `dirty` requires workspace-local theme and sibling sources")
         );
         assert!(message.contains("build-eips workspace init <workspace-root>"));
-        assert!(message.contains("--theme <path>` and/or `--sibling-repo <path>"));
         assert!(message.contains("--remote-theme` and/or `--remote-sibling-repo"));
         assert!(message.contains("switch to `--profile parity`"));
+        assert!(!message.contains("--theme <path>"));
+        assert!(!message.contains("--sibling-repo <path>"));
     }
 
     #[test]
@@ -2392,44 +2296,13 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
-    fn zero_sibling_remote_override_is_noop_but_local_override_errors() {
+    fn zero_sibling_remote_override_is_noop() {
         let remote_args = parse_args(&["build-eips", "--remote-sibling-repo", "parity", "build"]);
         let remote_profile = selected_profile(&remote_args, None);
         let remote_settings =
             resolve_execution_settings(&remote_args, &[], None, Some(&remote_profile)).unwrap();
 
         assert_eq!(remote_settings.sibling, SelectedSource::Remote);
-
-        let local_args = parse_args(&["build-eips", "--sibling-repo", "/tmp/ERCs", "build"]);
-        let error = resolve_execution_settings(&local_args, &[], None, None).unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("active repo declares no sibling content repos"));
-    }
-
-    #[test]
-    fn single_sibling_local_override_remains_supported() {
-        let args = parse_args(&["build-eips", "--sibling-repo", "/tmp/ERCs", "build"]);
-        let sibling_ids = vec!["ERCs".to_owned()];
-        let settings = resolve_execution_settings(&args, &sibling_ids, None, None).unwrap();
-
-        assert_eq!(
-            settings.sibling,
-            SelectedSource::ExplicitLocal(PathBuf::from("/tmp/ERCs"))
-        );
-    }
-
-    #[test]
-    fn multi_sibling_local_override_is_ambiguous() {
-        let args = parse_args(&["build-eips", "--sibling-repo", "/tmp/proposals", "build"]);
-        let sibling_ids = vec!["EIPs".to_owned(), "ERCs".to_owned()];
-        let error = resolve_execution_settings(&args, &sibling_ids, None, None).unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains("`--sibling-repo <path>` is ambiguous"));
-        assert!(message.contains("EIPs, ERCs"));
-        assert!(message.contains("--remote-sibling-repo"));
     }
 
     #[test]
@@ -2442,6 +2315,8 @@ base_url = "https://staging.example.test/{sibling_id}/"
 
         assert!(message.contains("profile `dirty` requires workspace-local theme sources"));
         assert!(!message.contains("theme and sibling"));
+        assert!(!message.contains("--theme <path>"));
+        assert!(!message.contains("--sibling-repo <path>"));
     }
 
     #[test]
@@ -2544,31 +2419,6 @@ allow_dirty = true
     }
 
     #[test]
-    fn sibling_override_validation_uses_manifest_cardinality() {
-        let workspace = TempDir::new().unwrap();
-        let active_path = workspace.path().join("Core");
-        let active_url = file_url(&active_path);
-        write_manifest_repo(&active_path, "Core", &active_url, &[]);
-        let sibling_path = workspace.path().join("Sibling");
-        init_repo(&sibling_path, &[("content/0002.md", "# Sibling\n")]);
-        let args = parse_args(&[
-            "build-eips",
-            "-C",
-            active_path.to_str().unwrap(),
-            "--sibling-repo",
-            sibling_path.to_str().unwrap(),
-            "parity",
-            "build",
-        ]);
-
-        let error = resolve_execution(&args).unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("active repo declares no sibling content repos"));
-    }
-
-    #[test]
     fn workspace_local_sibling_mode_is_all_or_nothing() {
         let workspace = TempDir::new().unwrap();
         let active_path = workspace.path().join("Core");
@@ -2592,6 +2442,46 @@ allow_dirty = true
 
         assert!(message.contains("requires all declared sibling repos"));
         assert!(message.contains("ERCs"));
+    }
+
+    #[test]
+    fn workspace_local_sources_resolve_from_standard_layout() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let eips_path = workspace.path().join("EIPs");
+        let ercs_path = workspace.path().join("ERCs");
+        init_repo(&eips_path, &[("content/0002.md", "# EIP\n")]);
+        init_repo(&ercs_path, &[("content/0003.md", "# ERC\n")]);
+        std::fs::create_dir(workspace.path().join(config::DEFAULT_THEME_DIR)).unwrap();
+        let siblings = vec![
+            ("EIPs", file_url(&eips_path)),
+            ("ERCs", file_url(&ercs_path)),
+        ];
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &siblings);
+        std::fs::write(
+            workspace.path().join(config::LOCAL_CONFIG_FILE),
+            config::default_workspace_config_text(),
+        )
+        .unwrap();
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "build"]);
+
+        let resolved = resolve_execution(&args).unwrap();
+
+        match resolved.theme {
+            ThemeSource::Local { path } => {
+                assert_eq!(path, workspace.path().join(config::DEFAULT_THEME_DIR));
+            }
+            ThemeSource::Remote { .. } => panic!("expected workspace-local theme"),
+        }
+        assert_eq!(
+            resolved.repository_use.other_repos["EIPs"],
+            file_url(&eips_path)
+        );
+        assert_eq!(
+            resolved.repository_use.other_repos["ERCs"],
+            file_url(&ercs_path)
+        );
     }
 
     fn init_workspace_source_repo(remotes_root: &Path, name: &str) -> Url {

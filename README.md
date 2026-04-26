@@ -126,10 +126,9 @@ Built-in profile behavior:
 
 `dirty` is still selectable without `.build-eips.toml`, but it cannot infer
 local workspace paths on its own. If you run `dirty` without workspace config,
-either bootstrap the workspace first, pass explicit local paths, or force the
-remote sources with `--remote-theme` and `--remote-sibling-repo`. That remote
-override form is still distinct from `parity`, because `dirty` keeps
-`allow_dirty = true`.
+either bootstrap the workspace first or force the remote sources with
+`--remote-theme` and `--remote-sibling-repo`. That remote override form is still
+distinct from `parity`, because `dirty` keeps `allow_dirty = true`.
 
 ### Explicit overrides
 
@@ -137,15 +136,15 @@ Use these flags to override the selected profile directly:
 
 - `--staging` / `--no-staging`
 - `--allow-dirty` / `--no-allow-dirty`
-- `--theme <path>` / `--remote-theme`
-- `--sibling-repo <path>` / `--remote-sibling-repo`
+- `--remote-theme`
+- `--remote-sibling-repo`
 - `--build-root <path>`
 - `--profile <name>`
 
-`--sibling-repo <path>` applies only when the active repo has exactly one
-declared sibling. For repos with multiple siblings, use `workspace init` for
-local sibling provisioning or `--remote-sibling-repo` to force all siblings
-remote.
+Workspace-local sources come from the standard workspace layout. The local theme
+is `workspace/theme`, and local sibling repos are `workspace/<sibling_repo_id>`
+from the active repo manifest. Use `--remote-theme` or `--remote-sibling-repo`
+when you need to force remote sources for a single command.
 
 Example:
 
@@ -153,13 +152,11 @@ Example:
 build-eips \
   -C /work/EIPs-project/EIPs \
   --staging \
-  --theme /work/EIPs-project/theme \
-  --sibling-repo /work/EIPs-project/ERCs \
+  --remote-theme \
+  --remote-sibling-repo \
   --build-root /work/EIPs-project/.local-build/EIPs \
   check
 ```
-
-The local theme override also reuses that checkout's `config/eipw.toml`.
 
 ## Dirty Mode
 
@@ -191,7 +188,7 @@ Dirty-mode limits:
 
 - dirty mode is opt-in and non-parity
 - only the active content repo is materialized dirty
-- sibling repo and theme still follow the selected profile or explicit overrides
+- sibling repo and theme still follow the selected profile or remote overrides
 - untracked files in the active content repo are ignored
 - clean `build-eips serve` remains the clean runtime serve path
 - tracked deletions are mirrored into the materialized repo, but served route
