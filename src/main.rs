@@ -45,6 +45,7 @@ const CONTENT_DIR: &str = "content";
 const BUILD_DIR: &str = "build";
 const REPO_DIR: &str = "repo";
 const OUTPUT_DIR: &str = "output";
+const PROPOSAL_TEMPLATE_URL: &str = "https://github.com/eips-wg/template.git";
 const PLATFORM_PREPROCESSOR_URL: &str = "https://github.com/eips-wg/preprocessor.git";
 const PLATFORM_EIPW_URL: &str = "https://github.com/ethereum/eipw.git";
 
@@ -197,6 +198,10 @@ enum WorkspaceCommand {
         /// Workspace root directory
         path: PathBuf,
 
+        /// Also clone template for proposal-family scaffold work
+        #[arg(long)]
+        template: bool,
+
         /// Also clone preprocessor and eipw for platform development
         #[arg(long)]
         platform_dev: bool,
@@ -307,6 +312,13 @@ struct DoctorReport {
 struct WorkspaceCommandContext {
     search_from: PathBuf,
     config_path: Option<PathBuf>,
+}
+
+struct WorkspaceInitRepositories<'a> {
+    theme: &'a Url,
+    template: &'a Url,
+    preprocessor: &'a Url,
+    eipw: &'a Url,
 }
 
 #[derive(Debug, Clone)]
@@ -1789,16 +1801,35 @@ fn editorial_runtime_execution(
     runtime
 }
 
-fn init_workspace(args: &Args, path: PathBuf, platform_dev: bool) -> Result<(), Whatever> {
-    let theme_repository = Config::staging().theme.repository;
-    init_workspace_with_theme_repository(args, path, platform_dev, &theme_repository)
-}
-
-fn init_workspace_with_theme_repository(
+fn init_workspace(
     args: &Args,
     path: PathBuf,
+    include_template: bool,
     platform_dev: bool,
-    theme_repository: &Url,
+) -> Result<(), Whatever> {
+    let theme_repository = Config::staging().theme.repository;
+    let template_repository = Url::parse(PROPOSAL_TEMPLATE_URL)
+        .whatever_context("invalid proposal template repository URL")?;
+    let preprocessor_repository = Url::parse(PLATFORM_PREPROCESSOR_URL)
+        .whatever_context("invalid platform preprocessor repository URL")?;
+    let eipw_repository =
+        Url::parse(PLATFORM_EIPW_URL).whatever_context("invalid platform eipw repository URL")?;
+    let repositories = WorkspaceInitRepositories {
+        theme: &theme_repository,
+        template: &template_repository,
+        preprocessor: &preprocessor_repository,
+        eipw: &eipw_repository,
+    };
+
+    init_workspace_with_repositories(args, path, include_template, platform_dev, &repositories)
+}
+
+fn init_workspace_with_repositories(
+    args: &Args,
+    path: PathBuf,
+    include_template: bool,
+    platform_dev: bool,
+    repositories: &WorkspaceInitRepositories<'_>,
 ) -> Result<(), Whatever> {
     let root_path = root(args)?;
     let active_repo = ActiveRepoIdentity::load(&root_path)?;
@@ -1829,18 +1860,26 @@ fn init_workspace_with_theme_repository(
     }
 
     git::clone_missing_repo(
-        theme_repository.as_str(),
+        repositories.theme.as_str(),
         &workspace_root.join(config::DEFAULT_THEME_DIR),
     )
     .whatever_context("unable to clone workspace theme repo")?;
 
+    if include_template {
+        git::clone_missing_repo(
+            repositories.template.as_str(),
+            &workspace_root.join("template"),
+        )
+        .whatever_context("unable to clone workspace template repo")?;
+    }
+
     if platform_dev {
         git::clone_missing_repo(
-            PLATFORM_PREPROCESSOR_URL,
+            repositories.preprocessor.as_str(),
             &workspace_root.join("preprocessor"),
         )
         .whatever_context("unable to clone workspace preprocessor repo")?;
-        git::clone_missing_repo(PLATFORM_EIPW_URL, &workspace_root.join("eipw"))
+        git::clone_missing_repo(repositories.eipw.as_str(), &workspace_root.join("eipw"))
             .whatever_context("unable to clone workspace eipw repo")?;
     }
 
@@ -1872,9 +1911,11 @@ fn run() -> Result<(), Whatever> {
 
     if let Operation::Workspace { command } = &args.operation {
         match command.clone() {
-            WorkspaceCommand::Init { path, platform_dev } => {
-                init_workspace(&args, path, platform_dev)?
-            }
+            WorkspaceCommand::Init {
+                path,
+                template,
+                platform_dev,
+            } => init_workspace(&args, path, template, platform_dev)?,
             WorkspaceCommand::Doctor => doctor_workspace(&args)?,
         }
         return Ok(());
@@ -1971,11 +2012,11 @@ mod tests {
     use url::Url;
 
     use super::{
-        collect_doctor_report, editorial_targets, init_workspace_with_theme_repository,
+        collect_doctor_report, editorial_targets, init_workspace_with_repositories,
         requested_profile_name, resolve_execution, resolve_execution_settings,
         validate_non_execution_command_flags, Args, EditorialCommand, EditorialSelectorArgs,
         ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation, SelectedSource,
-        WorkspaceCommand, REPO_DIR,
+        WorkspaceCommand, WorkspaceInitRepositories, REPO_DIR,
     };
     use crate::config::{self, LoadedWorkspaceConfig};
 
@@ -2202,6 +2243,46 @@ base_url = "https://staging.example.test/{sibling_id}/"
             requested_profile_name(&editorial_lint).unwrap(),
             Some(config::PARITY_PROFILE)
         );
+    }
+
+    #[test]
+    fn workspace_init_optional_flags_parse() {
+        let template = parse_args(&[
+            "build-eips",
+            "workspace",
+            "init",
+            "/tmp/workspace",
+            "--template",
+        ]);
+        let combined = parse_args(&[
+            "build-eips",
+            "workspace",
+            "init",
+            "/tmp/workspace",
+            "--template",
+            "--platform-dev",
+        ]);
+
+        assert!(matches!(
+            template.operation,
+            Operation::Workspace {
+                command: WorkspaceCommand::Init {
+                    template: true,
+                    platform_dev: false,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            combined.operation,
+            Operation::Workspace {
+                command: WorkspaceCommand::Init {
+                    template: true,
+                    platform_dev: true,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
@@ -2513,13 +2594,53 @@ allow_dirty = true
         assert!(message.contains("ERCs"));
     }
 
+    fn init_workspace_source_repo(remotes_root: &Path, name: &str) -> Url {
+        let path = remotes_root.join(name);
+        init_repo(&path, &[("README.md", "workspace init test repo\n")]);
+        file_url(&path)
+    }
+
+    fn workspace_init_test_repository_urls(remotes_root: &Path) -> (Url, Url, Url, Url) {
+        (
+            init_workspace_source_repo(remotes_root, "theme"),
+            init_workspace_source_repo(remotes_root, "template"),
+            init_workspace_source_repo(remotes_root, "preprocessor"),
+            init_workspace_source_repo(remotes_root, "eipw"),
+        )
+    }
+
+    fn assert_workspace_init_optional_repos(
+        workspace_root: &Path,
+        expect_template: bool,
+        expect_platform_dev: bool,
+    ) {
+        assert!(Repository::open(workspace_root.join(config::DEFAULT_THEME_DIR)).is_ok());
+        assert_eq!(
+            Repository::open(workspace_root.join("template")).is_ok(),
+            expect_template
+        );
+        assert_eq!(
+            Repository::open(workspace_root.join("preprocessor")).is_ok(),
+            expect_platform_dev
+        );
+        assert_eq!(
+            Repository::open(workspace_root.join("eipw")).is_ok(),
+            expect_platform_dev
+        );
+    }
+
     fn assert_workspace_init_and_doctor_for_siblings(sibling_ids: &[&str]) {
         let temp = TempDir::new().unwrap();
         let workspace_root = temp.path().join("workspace");
         let remotes_root = temp.path().join("remotes");
-        let theme_path = remotes_root.join("theme");
-        init_repo(&theme_path, &[("theme.txt", "theme\n")]);
-        let theme_url = file_url(&theme_path);
+        let (theme_url, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitRepositories {
+            theme: &theme_url,
+            template: &template_url,
+            preprocessor: &preprocessor_url,
+            eipw: &eipw_url,
+        };
 
         let sibling_repositories = sibling_ids
             .iter()
@@ -2547,11 +2668,17 @@ allow_dirty = true
             workspace_root.to_str().unwrap(),
         ]);
 
-        init_workspace_with_theme_repository(&init_args, workspace_root.clone(), false, &theme_url)
-            .unwrap();
+        init_workspace_with_repositories(
+            &init_args,
+            workspace_root.clone(),
+            false,
+            false,
+            &repositories,
+        )
+        .unwrap();
 
         assert!(workspace_root.join(config::LOCAL_CONFIG_FILE).is_file());
-        assert!(Repository::open(workspace_root.join(config::DEFAULT_THEME_DIR)).is_ok());
+        assert_workspace_init_optional_repos(&workspace_root, false, false);
         for sibling_id in sibling_ids {
             assert!(Repository::open(workspace_root.join(sibling_id)).is_ok());
         }
@@ -2568,11 +2695,87 @@ allow_dirty = true
         assert_eq!(report.failures, 0);
     }
 
+    fn assert_workspace_init_optional_clone_behavior(
+        flags: &[&str],
+        expect_template: bool,
+        expect_platform_dev: bool,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitRepositories {
+            theme: &theme_url,
+            template: &template_url,
+            preprocessor: &preprocessor_url,
+            eipw: &eipw_url,
+        };
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let active_path = active_path.to_string_lossy();
+        let workspace_root_arg = workspace_root.to_string_lossy();
+        let mut arguments = vec![
+            "build-eips",
+            "-C",
+            active_path.as_ref(),
+            "workspace",
+            "init",
+            workspace_root_arg.as_ref(),
+        ];
+        arguments.extend_from_slice(flags);
+        let init_args = parse_args(&arguments);
+        let Operation::Workspace {
+            command:
+                WorkspaceCommand::Init {
+                    path,
+                    template,
+                    platform_dev,
+                },
+        } = init_args.operation.clone()
+        else {
+            panic!("expected workspace init command");
+        };
+
+        assert_eq!(template, expect_template);
+        assert_eq!(platform_dev, expect_platform_dev);
+
+        init_workspace_with_repositories(&init_args, path, template, platform_dev, &repositories)
+            .unwrap();
+
+        assert_workspace_init_optional_repos(&workspace_root, expect_template, expect_platform_dev);
+    }
+
     #[test]
     fn workspace_init_and_doctor_cover_zero_one_and_many_siblings() {
         assert_workspace_init_and_doctor_for_siblings(&[]);
         assert_workspace_init_and_doctor_for_siblings(&["ERCs"]);
         assert_workspace_init_and_doctor_for_siblings(&["EIPs", "ERCs"]);
+    }
+
+    #[test]
+    fn default_workspace_init_clones_required_repos_only() {
+        assert_workspace_init_optional_clone_behavior(&[], false, false);
+    }
+
+    #[test]
+    fn workspace_init_template_clones_template_only_as_optional_repo() {
+        assert_workspace_init_optional_clone_behavior(&["--template"], true, false);
+    }
+
+    #[test]
+    fn workspace_init_platform_dev_clones_platform_repos_only_as_optional_repos() {
+        assert_workspace_init_optional_clone_behavior(&["--platform-dev"], false, true);
+    }
+
+    #[test]
+    fn workspace_init_template_and_platform_dev_clone_all_optional_repos() {
+        assert_workspace_init_optional_clone_behavior(
+            &["--template", "--platform-dev"],
+            true,
+            true,
+        );
     }
 
     #[test]

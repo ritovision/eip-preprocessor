@@ -68,11 +68,20 @@ By default this:
 - creates `.local-build/`
 - writes `.build-eips.toml`
 
+For proposal-family template work, you can additionally clone `template`:
+
+```bash
+build-eips workspace init /work/EIPs-project --template
+```
+
 For platform development, you can additionally clone `preprocessor` and `eipw`:
 
 ```bash
 build-eips workspace init /work/EIPs-project --platform-dev
 ```
+
+The optional `--template` and `--platform-dev` flags can be combined when both
+sets of optional repositories are needed.
 
 Validate the workspace bootstrap at any point with:
 
