@@ -99,8 +99,10 @@ build-eips build
 build-eips serve
 ```
 
-The generated starter config contains local workspace preferences such as
-`build_root_base`, `[server]`, and `[site]`. Command behavior is built in.
+The generated starter config contains local workspace preferences for
+`[server]` and `[site]`. Command behavior is built in. Workspace build artifacts
+use `.local-build/<repo_id>` by convention; pass `--build-root <path>` for a
+one-off output-location override.
 
 Tracked active-repo metadata lives separately in `.build-eips.repo.toml` when a
 repo provides one. That manifest owns the repo identity, environment URLs, and

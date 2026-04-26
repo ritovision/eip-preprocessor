@@ -73,16 +73,6 @@ pub enum WorkspaceError {
         source: Box<toml::de::Error>,
         backtrace: Backtrace,
     },
-
-    #[snafu(display(
-        "workspace config `{}` uses removed profile field(s): {fields}\nCommand behavior is now built in; remove stale profile fields manually or delete `.build-eips.toml` and rerun `build-eips workspace init <workspace-root>`.\nSupported local preference fields are `build_root_base`, `[server]`, and `[site]` until build-root config is removed in a later phase.",
-        config_path.to_string_lossy()
-    ))]
-    StaleProfileSchema {
-        config_path: PathBuf,
-        fields: String,
-        backtrace: Backtrace,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,12 +458,9 @@ impl LegacyLocation {
 }
 
 /// Workspace-local configuration loaded from `.build-eips.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspaceConfig {
-    /// Directory under the workspace root where local build artifacts are written.
-    pub build_root_base: PathBuf,
-
     /// Local server defaults for `build-eips serve` and `build-eips preview`.
     #[serde(default)]
     pub server: ServerSettings,
@@ -483,20 +470,9 @@ pub struct WorkspaceConfig {
     pub site: SiteSettings,
 }
 
-impl Default for WorkspaceConfig {
-    fn default() -> Self {
-        Self {
-            build_root_base: DEFAULT_BUILD_ROOT_BASE.into(),
-            server: ServerSettings::default(),
-            site: SiteSettings::default(),
-        }
-    }
-}
-
 impl WorkspaceConfig {
     fn starter() -> Self {
         Self {
-            build_root_base: DEFAULT_BUILD_ROOT_BASE.into(),
             server: ServerSettings::default(),
             site: SiteSettings::starter(),
         }
@@ -621,15 +597,9 @@ impl LoadedWorkspaceConfig {
         let contents = std::fs::read_to_string(&config_path).with_context(|_| FsSnafu {
             path: config_path.clone(),
         })?;
-        let value = toml::from_str::<toml::Value>(&contents).with_context(|_| ParseSnafu {
+        let config = toml::from_str::<WorkspaceConfig>(&contents).with_context(|_| ParseSnafu {
             config_path: config_path.clone(),
         })?;
-        reject_stale_profile_schema(&config_path, &value)?;
-        let config = value
-            .try_into::<WorkspaceConfig>()
-            .with_context(|_| ParseSnafu {
-                config_path: config_path.clone(),
-            })?;
 
         let workspace_root = config_path
             .parent()
@@ -658,8 +628,9 @@ impl LoadedWorkspaceConfig {
         &self.workspace_root
     }
 
-    pub fn build_root_for(&self, repo_name: &str) -> PathBuf {
-        self.resolve_path(&self.config.build_root_base)
+    pub fn workspace_build_root(&self, repo_name: &str) -> PathBuf {
+        self.workspace_root
+            .join(DEFAULT_BUILD_ROOT_BASE)
             .join(repo_name)
     }
 
@@ -677,35 +648,6 @@ impl LoadedWorkspaceConfig {
 
     pub fn local_repo_path(&self, repo_name: &str) -> PathBuf {
         self.workspace_root.join(repo_name)
-    }
-
-    fn resolve_path(&self, path: &Path) -> PathBuf {
-        self.workspace_root.join(path)
-    }
-}
-
-fn reject_stale_profile_schema(
-    config_path: &Path,
-    value: &toml::Value,
-) -> Result<(), WorkspaceError> {
-    let mut fields = Vec::new();
-    if let Some(table) = value.as_table() {
-        if table.contains_key("default_profile") {
-            fields.push("default_profile");
-        }
-        if table.contains_key("profiles") {
-            fields.push("profiles");
-        }
-    }
-
-    if fields.is_empty() {
-        Ok(())
-    } else {
-        StaleProfileSchemaSnafu {
-            config_path: config_path.to_path_buf(),
-            fields: fields.join(", "),
-        }
-        .fail()
     }
 }
 
@@ -986,10 +928,7 @@ base_url = "https://staging.example.test/ERCs/"
 
         let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
 
-        assert_eq!(
-            config.build_root_for("EIPs"),
-            workspace.path(".local-build/EIPs")
-        );
+        assert_eq!(config.workspace_root(), workspace.root());
         assert_eq!(config.server_settings(), &ServerSettings::default());
         assert_eq!(
             config.site_settings().base_url.as_ref().unwrap().as_str(),
@@ -1004,7 +943,7 @@ base_url = "https://staging.example.test/ERCs/"
         let reparsed = toml::to_string_pretty(&parsed).unwrap();
 
         assert_eq!(reparsed, original);
-        assert!(original.contains("build_root_base = \".local-build\""));
+        assert!(!original.contains("build_root_base"));
         assert!(original.contains("[server]"));
         assert!(original.contains("host = \"127.0.0.1\""));
         assert!(original.contains("port = 1111"));
@@ -1043,7 +982,8 @@ port = 8080
         let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
-build_root_base = ".local-build"
+[site]
+base_url = "http://localhost:4000"
 "#,
         );
 
@@ -1097,7 +1037,9 @@ base_url = "not a url"
         let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
-build_root_base = ".local-build"
+[server]
+host = "127.0.0.1"
+port = 1111
 "#,
         );
 
@@ -1107,84 +1049,64 @@ build_root_base = ".local-build"
     }
 
     #[test]
-    fn stale_default_profile_errors_with_migration_guidance() {
+    fn minimal_workspace_config_parses() {
         let workspace = TestWorkspace::new();
         let config_path = workspace.write_file(
             LOCAL_CONFIG_FILE,
             r#"
-default_profile = "local"
+[server]
+host = "127.0.0.1"
+port = 1111
+
+[site]
+base_url = "http://127.0.0.1:1111"
 "#,
         );
 
-        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
-        let message = error.to_string();
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
 
-        assert!(matches!(error, WorkspaceError::StaleProfileSchema { .. }));
-        assert!(message.contains("default_profile"));
-        assert!(message.contains("Command behavior is now built in"));
-        assert!(message.contains(
-            "delete `.build-eips.toml` and rerun `build-eips workspace init <workspace-root>`"
-        ));
-        assert!(message.contains("build_root_base"));
-        assert!(message.contains("[server]"));
-        assert!(message.contains("[site]"));
+        assert_eq!(config.server_settings(), &ServerSettings::default());
+        assert_eq!(
+            config.site_settings().base_url.as_ref().unwrap().as_str(),
+            "http://127.0.0.1:1111/"
+        );
     }
 
     #[test]
-    fn stale_profiles_table_errors_with_migration_guidance() {
+    fn empty_workspace_config_uses_defaults() {
         let workspace = TestWorkspace::new();
-        let config_path = workspace.write_file(
-            LOCAL_CONFIG_FILE,
-            r#"
+        let config_path = workspace.write_file(LOCAL_CONFIG_FILE, " \n");
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(config.server_settings(), &ServerSettings::default());
+        assert!(config.site_settings().base_url.is_none());
+    }
+
+    #[test]
+    fn removed_workspace_config_fields_use_strict_parse_errors() {
+        let cases = [
+            ("build_root_base", r#"build_root_base = ".local-build""#),
+            ("default_profile", r#"default_profile = "local""#),
+            (
+                "profiles",
+                r#"
 [profiles.local]
 staging = true
 "#,
-        );
+            ),
+        ];
 
-        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
-        let message = error.to_string();
+        for (field, contents) in cases {
+            let workspace = TestWorkspace::new();
+            let config_path = workspace.write_file(LOCAL_CONFIG_FILE, contents);
+            let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
 
-        assert!(matches!(error, WorkspaceError::StaleProfileSchema { .. }));
-        assert!(message.contains("profiles"));
-        assert!(message.contains("Command behavior is now built in"));
-    }
-
-    #[test]
-    fn stale_default_profile_and_profiles_table_errors_name_both_fields() {
-        let workspace = TestWorkspace::new();
-        let config_path = workspace.write_file(
-            LOCAL_CONFIG_FILE,
-            r#"
-default_profile = "parity"
-
-[profiles.local]
-staging = true
-"#,
-        );
-
-        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
-        let message = error.to_string();
-
-        assert!(matches!(error, WorkspaceError::StaleProfileSchema { .. }));
-        assert!(message.contains("default_profile"));
-        assert!(message.contains("profiles"));
-    }
-
-    #[test]
-    fn unrelated_unknown_workspace_config_field_uses_normal_parse_error() {
-        let workspace = TestWorkspace::new();
-        let config_path = workspace.write_file(
-            LOCAL_CONFIG_FILE,
-            r#"
-unknown = true
-"#,
-        );
-
-        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
-        let message = error.to_string();
-
-        assert!(matches!(error, WorkspaceError::Parse { .. }));
-        assert!(!message.contains("Command behavior is now built in"));
+            assert!(
+                matches!(error, WorkspaceError::Parse { .. }),
+                "expected strict parse error for removed field `{field}`, got {error:?}"
+            );
+        }
     }
 
     #[test]

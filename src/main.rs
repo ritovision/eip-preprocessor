@@ -1220,8 +1220,9 @@ fn build_path(
     build_root
         .map(Path::to_path_buf)
         .or_else(|| {
-            workspace_config
-                .map(|workspace_config| workspace_config.build_root_for(&repository_use.title))
+            workspace_config.map(|workspace_config| {
+                workspace_config.workspace_build_root(&repository_use.title)
+            })
         })
         .unwrap_or_else(|| root_path.join(BUILD_DIR))
 }
@@ -3153,9 +3154,7 @@ base_url = "http://localhost:4000"
         write_file(
             &workspace_root,
             config::LOCAL_CONFIG_FILE,
-            r#"
-build_root_base = "custom-build"
-"#,
+            &config::default_workspace_config_text(),
         );
         let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "build"]);
 
@@ -3163,12 +3162,61 @@ build_root_base = "custom-build"
 
         assert_eq!(
             resolved.build_path,
-            workspace_root.join("custom-build/Core")
+            workspace_root
+                .join(config::DEFAULT_BUILD_ROOT_BASE)
+                .join("Core")
         );
         assert_eq!(
             resolved.source_materialization,
             crate::git::SourceMaterialization::Dirty
         );
+    }
+
+    #[test]
+    fn build_root_override_wins_with_workspace_config() {
+        let workspace = TempDir::new().unwrap();
+        let workspace_root = workspace.path().join("workspace");
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        let build_root = workspace.path().join("override-build-root");
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        std::fs::create_dir(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+        write_file(
+            &workspace_root,
+            config::LOCAL_CONFIG_FILE,
+            &config::default_workspace_config_text(),
+        );
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "--build-root",
+            build_root.to_str().unwrap(),
+            "build",
+        ]);
+
+        let resolved = resolve_execution(&args).unwrap();
+
+        assert_eq!(resolved.build_path, build_root);
+    }
+
+    #[test]
+    fn non_workspace_build_path_falls_back_to_active_repo_build_dir() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "parity",
+            "build",
+        ]);
+
+        let resolved = resolve_execution(&args).unwrap();
+
+        assert_eq!(resolved.build_path, active_path.join(super::BUILD_DIR));
     }
 
     #[test]
@@ -3503,14 +3551,16 @@ build_root_base = "custom-build"
     }
 
     #[test]
-    fn workspace_doctor_stale_profile_schema_reports_failing_config_check() {
+    fn workspace_doctor_removed_config_fields_report_parse_failure_check() {
         let workspace = TempDir::new().unwrap();
         let active_path = workspace.path().join("Core");
         let active_url = file_url(&active_path);
         write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
         std::fs::write(
-            workspace.path().join(config::LOCAL_CONFIG_FILE),
+            &config_path,
             r#"
+build_root_base = ".local-build"
 default_profile = "local"
 
 [profiles.local]
@@ -3518,6 +3568,8 @@ staging = true
 "#,
         )
         .unwrap();
+        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+        assert!(matches!(error, config::WorkspaceError::Parse { .. }));
         let args = parse_args(&[
             "build-eips",
             "-C",
