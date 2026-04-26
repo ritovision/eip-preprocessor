@@ -62,10 +62,6 @@ struct Args {
     #[clap(short = 'C')]
     root: Option<PathBuf>,
 
-    /// Load workspace defaults from CONFIG instead of auto-discovering `.build-eips.toml`
-    #[clap(long)]
-    config: Option<PathBuf>,
-
     /// Use the named custom or built-in profile
     #[clap(long)]
     profile: Option<String>,
@@ -584,10 +580,7 @@ fn workspace_search_start(args: &Args) -> Result<PathBuf, Whatever> {
 
 fn load_workspace_command_context(args: &Args) -> Result<WorkspaceCommandContext, Whatever> {
     let search_from = workspace_search_start(args)?;
-    let config_path = match args.config.as_deref() {
-        Some(path) => Some(resolve_input_path(path)?),
-        None => config::discover_path(&search_from),
-    };
+    let config_path = config::discover_path(&search_from);
 
     Ok(WorkspaceCommandContext {
         search_from,
@@ -1269,7 +1262,7 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     let root_path = root(args)?;
     let active_repo = ActiveRepoIdentity::load(&root_path)?;
     let sibling_ids = active_repo.sibling_ids();
-    let workspace_config = LoadedWorkspaceConfig::load(args.config.as_deref(), &root_path)
+    let workspace_config = LoadedWorkspaceConfig::discover(&root_path)
         .whatever_context("unable to load workspace config")?;
     let requested_profile = requested_profile_name(args)?;
     let selected_profile = match workspace_config.as_ref() {
@@ -2212,6 +2205,14 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
+    fn explicit_workspace_config_path_is_not_accepted() {
+        let error = Args::try_parse_from(["build-eips", "--config", "/tmp/config.toml", "build"])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unexpected argument '--config'"));
+    }
+
+    #[test]
     fn reserved_command_group_name_is_not_a_profile() {
         let args = parse_args(&["build-eips", "--profile", "editorial", "build"]);
         let requested = requested_profile_name(&args).unwrap();
@@ -2385,6 +2386,40 @@ base_url = "https://staging.example.test/{sibling_id}/"
         assert_eq!(resolved.repository_use.location.repository, active_url);
         assert!(resolved.repository_use.other_repos.is_empty());
         assert_eq!(resolved.build_path, build_root);
+    }
+
+    #[test]
+    fn execution_commands_discover_workspace_config_from_active_repo_root() {
+        let workspace = TempDir::new().unwrap();
+        let workspace_root = workspace.path().join("workspace");
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        write_file(
+            &workspace_root,
+            config::LOCAL_CONFIG_FILE,
+            r#"
+default_profile = "custom"
+build_root_base = "custom-build"
+
+[profiles.custom]
+theme = "remote"
+sibling = "remote"
+allow_dirty = true
+"#,
+        );
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "build"]);
+
+        let resolved = resolve_execution(&args).unwrap();
+
+        assert_eq!(
+            resolved.build_path,
+            workspace_root.join("custom-build/Core")
+        );
+        assert_eq!(
+            resolved.source_materialization,
+            crate::git::SourceMaterialization::Dirty
+        );
     }
 
     #[test]

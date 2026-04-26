@@ -131,7 +131,6 @@ Use these flags to override the selected profile directly:
 - `--theme <path>` / `--remote-theme`
 - `--sibling-repo <path>` / `--remote-sibling-repo`
 - `--build-root <path>`
-- `--config <path>`
 - `--profile <name>`
 
 `--sibling-repo <path>` applies only when the active repo has exactly one

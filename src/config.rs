@@ -608,16 +608,6 @@ pub struct LoadedWorkspaceConfig {
 }
 
 impl LoadedWorkspaceConfig {
-    pub fn load(
-        explicit: Option<&Path>,
-        search_from: &Path,
-    ) -> Result<Option<Self>, WorkspaceError> {
-        match explicit {
-            Some(path) => Self::from_path(path).map(Some),
-            None => Self::discover(search_from),
-        }
-    }
-
     pub fn from_path(path: &Path) -> Result<Self, WorkspaceError> {
         let config_path = path.canonicalize().with_context(|_| FsSnafu {
             path: path.to_path_buf(),
