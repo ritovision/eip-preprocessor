@@ -74,7 +74,7 @@ struct Args {
 
     /// Force the production repositories and base URLs
     #[clap(long)]
-    no_staging: bool,
+    production: bool,
 
     /// Use the configured remote theme instead of a workspace-local theme
     #[clap(long)]
@@ -87,14 +87,6 @@ struct Args {
     /// Write build artifacts under BUILD_ROOT instead of the default location
     #[clap(long)]
     build_root: Option<PathBuf>,
-
-    /// Force dirty mode on for tracked working-tree changes
-    #[clap(long)]
-    allow_dirty: bool,
-
-    /// Force dirty mode off
-    #[clap(long)]
-    no_allow_dirty: bool,
 
     #[clap(subcommand)]
     operation: Operation,
@@ -118,6 +110,13 @@ struct BaseUrlCliArgs {
     base_url: Option<Url>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+struct CleanCliArgs {
+    /// Ignore tracked working-tree changes in the active repo
+    #[arg(long)]
+    clean: bool,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 enum Operation {
     /// Print various useful things, like available lints
@@ -130,6 +129,9 @@ enum Operation {
     Build {
         #[command(flatten)]
         base_url: BaseUrlCliArgs,
+
+        #[command(flatten)]
+        clean: CleanCliArgs,
     },
 
     /// Build the project and launch a web server to preview it
@@ -139,6 +141,9 @@ enum Operation {
 
         #[command(flatten)]
         base_url: BaseUrlCliArgs,
+
+        #[command(flatten)]
+        clean: CleanCliArgs,
     },
 
     /// Serve the existing built output without rebuilding it
@@ -151,7 +156,10 @@ enum Operation {
     Clean,
 
     /// Analyze the repository and report errors, but don't build HTML files
-    Check,
+    Check {
+        #[command(flatten)]
+        clean: CleanCliArgs,
+    },
 
     /// List files changed since the last commit common to both the local and upstream repositories
     Changed {
@@ -179,12 +187,6 @@ enum Operation {
         #[command(subcommand)]
         command: ProfiledOperation,
     },
-
-    /// Run a normal command with the built-in dirty profile
-    Dirty {
-        #[command(subcommand)]
-        command: ProfiledOperation,
-    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -204,26 +206,8 @@ enum ProfiledOperation {
         base_url: BaseUrlCliArgs,
     },
 
-    /// Serve the existing built output without rebuilding it
-    Preview {
-        #[command(flatten)]
-        server: ServerCliArgs,
-    },
-
-    /// Remove temporary and output files
-    Clean,
-
     /// Analyze the repository and report errors, but don't build HTML files
     Check,
-
-    /// List files changed since the last commit common to both the local and upstream repositories
-    Changed {
-        /// List all changed files, not just proposals
-        #[arg(long, short)]
-        all: bool,
-        #[clap(long, value_enum, default_value_t)]
-        format: ChangedFormat,
-    },
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -453,11 +437,11 @@ impl Operation {
     fn server_cli_args(&self) -> ServerCliArgs {
         match self {
             Self::Serve { server, .. } | Self::Preview { server } => server.clone(),
-            Self::Parity { command } | Self::Dirty { command } => command.server_cli_args(),
+            Self::Parity { command } => command.server_cli_args(),
             Self::Print { .. }
             | Self::Build { .. }
             | Self::Clean
-            | Self::Check
+            | Self::Check { .. }
             | Self::Changed { .. }
             | Self::Editorial { .. }
             | Self::Workspace { .. } => ServerCliArgs::default(),
@@ -466,28 +450,58 @@ impl Operation {
 
     fn base_url_cli_args(&self) -> BaseUrlCliArgs {
         match self {
-            Self::Build { base_url } | Self::Serve { base_url, .. } => base_url.clone(),
-            Self::Parity { command } | Self::Dirty { command } => command.base_url_cli_args(),
+            Self::Build { base_url, .. } | Self::Serve { base_url, .. } => base_url.clone(),
+            Self::Parity { command } => command.base_url_cli_args(),
             Self::Print { .. }
             | Self::Preview { .. }
             | Self::Clean
-            | Self::Check
+            | Self::Check { .. }
             | Self::Changed { .. }
             | Self::Editorial { .. }
             | Self::Workspace { .. } => BaseUrlCliArgs::default(),
         }
     }
 
+    fn clean_cli_args(&self) -> CleanCliArgs {
+        match self {
+            Self::Build { clean, .. } | Self::Serve { clean, .. } | Self::Check { clean } => {
+                clean.clone()
+            }
+            Self::Print { .. }
+            | Self::Preview { .. }
+            | Self::Clean
+            | Self::Changed { .. }
+            | Self::Editorial { .. }
+            | Self::Workspace { .. }
+            | Self::Parity { .. } => CleanCliArgs::default(),
+        }
+    }
+
+    fn is_plain_site_command(&self) -> bool {
+        matches!(
+            self,
+            Self::Build { .. } | Self::Serve { .. } | Self::Check { .. }
+        )
+    }
+
+    fn is_editorial_build_command(&self) -> bool {
+        matches!(
+            self,
+            Self::Editorial {
+                command: EditorialCommand::Build { .. }
+            }
+        )
+    }
+
     fn profile_alias_name(&self) -> Option<&'static str> {
         match self {
             Self::Parity { .. } => Some(config::PARITY_PROFILE),
-            Self::Dirty { .. } => Some(config::DIRTY_PROFILE),
             Self::Print { .. }
             | Self::Build { .. }
             | Self::Serve { .. }
             | Self::Preview { .. }
             | Self::Clean
-            | Self::Check
+            | Self::Check { .. }
             | Self::Changed { .. }
             | Self::Editorial { .. }
             | Self::Workspace { .. } => None,
@@ -501,7 +515,7 @@ impl Operation {
             Self::Serve { .. } => Some(RuntimeOperation::Serve),
             Self::Preview { .. } => Some(RuntimeOperation::Preview),
             Self::Clean => Some(RuntimeOperation::Clean),
-            Self::Check => Some(RuntimeOperation::Check),
+            Self::Check { .. } => Some(RuntimeOperation::Check),
             Self::Changed { all, format } => Some(RuntimeOperation::Changed {
                 all: *all,
                 format: format.clone(),
@@ -509,7 +523,7 @@ impl Operation {
             Self::Editorial { command } => Some(RuntimeOperation::Editorial {
                 command: command.clone(),
             }),
-            Self::Parity { command } | Self::Dirty { command } => Some(command.runtime_operation()),
+            Self::Parity { command } => Some(command.runtime_operation()),
         }
     }
 
@@ -525,19 +539,15 @@ impl Operation {
 impl ProfiledOperation {
     fn server_cli_args(&self) -> ServerCliArgs {
         match self {
-            Self::Serve { server, .. } | Self::Preview { server } => server.clone(),
-            Self::Build { .. } | Self::Clean | Self::Check | Self::Changed { .. } => {
-                ServerCliArgs::default()
-            }
+            Self::Serve { server, .. } => server.clone(),
+            Self::Build { .. } | Self::Check => ServerCliArgs::default(),
         }
     }
 
     fn base_url_cli_args(&self) -> BaseUrlCliArgs {
         match self {
             Self::Build { base_url } | Self::Serve { base_url, .. } => base_url.clone(),
-            Self::Preview { .. } | Self::Clean | Self::Check | Self::Changed { .. } => {
-                BaseUrlCliArgs::default()
-            }
+            Self::Check => BaseUrlCliArgs::default(),
         }
     }
 
@@ -545,13 +555,7 @@ impl ProfiledOperation {
         match self {
             Self::Build { .. } => RuntimeOperation::Build,
             Self::Serve { .. } => RuntimeOperation::Serve,
-            Self::Preview { .. } => RuntimeOperation::Preview,
-            Self::Clean => RuntimeOperation::Clean,
             Self::Check => RuntimeOperation::Check,
-            Self::Changed { all, format } => RuntimeOperation::Changed {
-                all: *all,
-                format: format.clone(),
-            },
         }
     }
 }
@@ -685,12 +689,10 @@ fn load_workspace_command_context(args: &Args) -> Result<WorkspaceCommandContext
 fn has_execution_override_flags(args: &Args) -> bool {
     args.profile.is_some()
         || args.staging
-        || args.no_staging
+        || args.production
         || args.remote_theme
         || args.remote_sibling_repo
         || args.build_root.is_some()
-        || args.allow_dirty
-        || args.no_allow_dirty
 }
 
 fn validate_non_execution_command_flags(args: &Args) -> Result<(), Whatever> {
@@ -745,6 +747,10 @@ fn format_sibling_ids(sibling_ids: &[String]) -> String {
     sibling_ids.join(", ")
 }
 
+fn resolve_environment_override(args: &Args) -> Result<Option<bool>, Whatever> {
+    resolve_bool_override(args.staging, args.production, "--staging", "--production")
+}
+
 fn resolve_execution_settings(
     args: &Args,
     sibling_ids: &[String],
@@ -756,33 +762,49 @@ fn resolve_execution_settings(
         .as_deref()
         .map(resolve_input_path)
         .transpose()?;
-    let staging =
-        resolve_bool_override(args.staging, args.no_staging, "--staging", "--no-staging")?
-            .unwrap_or_else(|| {
-                selected_profile
-                    .map(|profile| profile.profile.staging)
-                    .unwrap_or(false)
-            });
-    let allow_dirty = resolve_bool_override(
-        args.allow_dirty,
-        args.no_allow_dirty,
-        "--allow-dirty",
-        "--no-allow-dirty",
-    )?
-    .unwrap_or_else(|| {
-        selected_profile
-            .map(|profile| profile.profile.allow_dirty)
-            .unwrap_or(false)
-    });
+    let environment_override = resolve_environment_override(args)?;
     let theme_override = remote_source_override(args.remote_theme);
     let sibling_override = remote_source_override(args.remote_sibling_repo);
+    let requested_profile = requested_profile_name(args)?;
+    let clean = args.operation.clean_cli_args().clean;
 
-    let default_theme = selected_profile
-        .map(|profile| profile.profile.theme)
-        .unwrap_or(SourceSelection::Remote);
-    let default_sibling = selected_profile
-        .map(|profile| profile.profile.sibling)
-        .unwrap_or(SourceSelection::Remote);
+    let (staging, allow_dirty, default_theme, default_sibling) = if let Some(staging) =
+        environment_override
+    {
+        (
+            staging,
+            false,
+            SourceSelection::Remote,
+            SourceSelection::Remote,
+        )
+    } else if matches!(args.operation, Operation::Parity { .. })
+        || requested_profile == Some(config::PARITY_PROFILE)
+    {
+        (
+            true,
+            false,
+            SourceSelection::Remote,
+            SourceSelection::Remote,
+        )
+    } else if let Some(profile) = selected_profile {
+        (
+            profile.profile.staging,
+            profile.profile.allow_dirty && !clean,
+            profile.profile.theme,
+            profile.profile.sibling,
+        )
+    } else if args.operation.is_plain_site_command() || args.operation.is_editorial_build_command()
+    {
+        (true, !clean, SourceSelection::Local, SourceSelection::Local)
+    } else {
+        (
+            false,
+            false,
+            SourceSelection::Remote,
+            SourceSelection::Remote,
+        )
+    };
+
     let missing_theme = theme_override.is_none()
         && default_theme == SourceSelection::Local
         && workspace_config.is_none();
@@ -792,9 +814,6 @@ fn resolve_execution_settings(
         && workspace_config.is_none();
 
     if missing_theme || missing_sibling {
-        let profile_name = selected_profile
-            .map(|profile| profile.name.as_str())
-            .unwrap_or("selected profile");
         let required_sources = match (missing_theme, missing_sibling) {
             (true, true) => "theme and sibling",
             (true, false) => "theme",
@@ -803,7 +822,7 @@ fn resolve_execution_settings(
         };
 
         snafu::whatever!(
-            "profile `{profile_name}` requires workspace-local {required_sources} sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips workspace init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-theme` and/or `--remote-sibling-repo` for remote overrides\n3. switch to `--profile parity` if remote defaults are what you actually want",
+            "the selected command requires workspace-local {required_sources} sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips workspace init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-theme` and/or `--remote-sibling-repo` for remote source overrides\n3. use `parity <command>`, `--staging <command>`, or `--production <command>` for remote clean environment behavior",
             config::LOCAL_CONFIG_FILE
         );
     }
@@ -1299,31 +1318,23 @@ fn resolve_server_binding(
     binding
 }
 
-fn is_explicit_env_or_parity(
-    args: &Args,
-    requested_profile: Option<&str>,
-    selected_profile: Option<&SelectedProfile>,
-) -> bool {
+fn is_explicit_env_or_parity(args: &Args, requested_profile: Option<&str>) -> bool {
     args.staging
-        || args.no_staging
+        || args.production
         || matches!(args.operation, Operation::Parity { .. })
         || requested_profile == Some(config::PARITY_PROFILE)
-        || selected_profile
-            .map(|profile| profile.name.as_str())
-            .is_some_and(|name| name == config::PARITY_PROFILE)
 }
 
 fn resolve_base_url_override(
     args: &Args,
     requested_profile: Option<&str>,
-    selected_profile: Option<&SelectedProfile>,
     workspace_config: Option<&LoadedWorkspaceConfig>,
 ) -> Option<Url> {
     if let Some(base_url) = args.operation.base_url_cli_args().base_url {
         return Some(base_url);
     }
 
-    if is_explicit_env_or_parity(args, requested_profile, selected_profile) {
+    if is_explicit_env_or_parity(args, requested_profile) {
         return None;
     }
 
@@ -1337,12 +1348,15 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     let workspace_config = LoadedWorkspaceConfig::discover(&root_path)
         .whatever_context("unable to load workspace config")?;
     let requested_profile = requested_profile_name(args)?;
-    let selected_profile = match workspace_config.as_ref() {
-        Some(workspace_config) => workspace_config
-            .selected_profile(requested_profile)
-            .whatever_context("unable to select profile")?,
-        None => config::selected_profile(None, requested_profile)
-            .whatever_context("unable to select profile")?,
+    let selected_profile = match requested_profile {
+        Some(_) => match workspace_config.as_ref() {
+            Some(workspace_config) => workspace_config
+                .selected_profile(requested_profile)
+                .whatever_context("unable to select profile")?,
+            None => config::selected_profile(None, requested_profile)
+                .whatever_context("unable to select profile")?,
+        },
+        None => None,
     };
 
     if let Some(workspace_config) = workspace_config.as_ref() {
@@ -1391,12 +1405,8 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     } else {
         git::SourceMaterialization::Clean
     };
-    let base_url_override = resolve_base_url_override(
-        args,
-        requested_profile,
-        selected_profile.as_ref(),
-        workspace_config.as_ref(),
-    );
+    let base_url_override =
+        resolve_base_url_override(args, requested_profile, workspace_config.as_ref());
 
     Ok(ResolvedExecution {
         root_path,
@@ -2100,12 +2110,13 @@ mod tests {
     use url::Url;
 
     use super::{
-        collect_doctor_report, editorial_targets, init_workspace_with_repositories,
-        is_explicit_env_or_parity, requested_profile_name, resolve_base_url_override,
-        resolve_execution, resolve_execution_settings, resolve_server_binding,
-        validate_non_execution_command_flags, Args, EditorialCommand, EditorialSelectorArgs,
-        ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation, SelectedSource,
-        ServerCliArgs, ThemeSource, WorkspaceCommand, WorkspaceInitRepositories, REPO_DIR,
+        collect_doctor_report, editorial_runtime_execution, editorial_targets,
+        init_workspace_with_repositories, is_explicit_env_or_parity, requested_profile_name,
+        resolve_base_url_override, resolve_execution, resolve_execution_settings,
+        resolve_server_binding, validate_non_execution_command_flags, Args, EditorialCommand,
+        EditorialSelectorArgs, ExecutionSettings, Operation, ProfiledOperation, ResolvedExecution,
+        RuntimeOperation, SelectedSource, ServerCliArgs, ThemeSource, WorkspaceCommand,
+        WorkspaceInitRepositories, REPO_DIR,
     };
     use crate::config::{self, LoadedWorkspaceConfig, ServerBinding};
 
@@ -2128,6 +2139,43 @@ mod tests {
         config::selected_profile(workspace_config, requested)
             .unwrap()
             .unwrap()
+    }
+
+    fn settings_for(
+        arguments: &[&str],
+        sibling_ids: &[&str],
+        workspace_config: Option<&LoadedWorkspaceConfig>,
+    ) -> ExecutionSettings {
+        let args = parse_args(arguments);
+        let requested = requested_profile_name(&args).unwrap();
+        let selected_profile = match requested {
+            Some(_) => config::selected_profile(workspace_config, requested).unwrap(),
+            None => None,
+        };
+        let sibling_ids = sibling_ids
+            .iter()
+            .map(|sibling_id| (*sibling_id).to_owned())
+            .collect::<Vec<_>>();
+
+        resolve_execution_settings(
+            &args,
+            &sibling_ids,
+            workspace_config,
+            selected_profile.as_ref(),
+        )
+        .unwrap()
+    }
+
+    fn assert_settings(
+        arguments: &[&str],
+        sibling_ids: &[&str],
+        workspace_config: Option<&LoadedWorkspaceConfig>,
+        expected: ExecutionSettings,
+    ) {
+        assert_eq!(
+            settings_for(arguments, sibling_ids, workspace_config),
+            expected
+        );
     }
 
     fn file_url(path: &Path) -> Url {
@@ -2364,42 +2412,6 @@ base_url = "https://staging.example.test/{sibling_id}/"
                 ],
                 true,
             ),
-            (
-                &[
-                    "build-eips",
-                    "parity",
-                    "preview",
-                    "--host",
-                    "0.0.0.0",
-                    "--port",
-                    "8080",
-                ],
-                false,
-            ),
-            (
-                &[
-                    "build-eips",
-                    "dirty",
-                    "serve",
-                    "--host",
-                    "0.0.0.0",
-                    "--port",
-                    "8080",
-                ],
-                true,
-            ),
-            (
-                &[
-                    "build-eips",
-                    "dirty",
-                    "preview",
-                    "--host",
-                    "0.0.0.0",
-                    "--port",
-                    "8080",
-                ],
-                false,
-            ),
         ];
 
         for (arguments, expect_serve) in cases {
@@ -2504,22 +2516,13 @@ port = 8080
             (
                 &[
                     "build-eips",
+                    "--profile",
                     "dirty",
                     "build",
                     "--base-url",
                     "http://localhost:4000",
                 ],
                 RuntimeOperation::Build,
-            ),
-            (
-                &[
-                    "build-eips",
-                    "dirty",
-                    "serve",
-                    "--base-url",
-                    "http://localhost:4000",
-                ],
-                RuntimeOperation::Serve,
             ),
         ];
 
@@ -2547,6 +2550,44 @@ port = 8080
     }
 
     #[test]
+    fn clean_flags_parse_only_on_plain_site_commands() {
+        for arguments in [
+            &["build-eips", "build", "--clean"][..],
+            &["build-eips", "serve", "--clean"][..],
+            &["build-eips", "check", "--clean"][..],
+        ] {
+            let args = parse_args(arguments);
+            assert!(args.operation.clean_cli_args().clean);
+        }
+
+        for arguments in [
+            &["build-eips", "parity", "build", "--clean"][..],
+            &["build-eips", "parity", "serve", "--clean"][..],
+            &["build-eips", "parity", "check", "--clean"][..],
+            &["build-eips", "preview", "--clean"][..],
+            &["build-eips", "changed", "--clean"][..],
+            &["build-eips", "clean", "--clean"][..],
+        ] {
+            assert!(Args::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn removed_dirty_command_surface_is_rejected() {
+        for arguments in [
+            &["build-eips", "dirty", "build"][..],
+            &["build-eips", "--allow-dirty", "build"][..],
+            &["build-eips", "--no-allow-dirty", "build"][..],
+            &["build-eips", "--no-staging", "build"][..],
+            &["build-eips", "parity", "preview"][..],
+            &["build-eips", "parity", "clean"][..],
+            &["build-eips", "parity", "changed"][..],
+        ] {
+            assert!(Args::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
     fn base_url_flag_is_rejected_on_non_rendering_forms() {
         let cases: &[&[&str]] = &[
             &[
@@ -2558,13 +2599,6 @@ port = 8080
             &[
                 "build-eips",
                 "parity",
-                "preview",
-                "--base-url",
-                "http://localhost:4000",
-            ],
-            &[
-                "build-eips",
-                "dirty",
                 "preview",
                 "--base-url",
                 "http://localhost:4000",
@@ -2622,46 +2656,30 @@ sibling = "remote"
         let selected_parity_default = config::selected_profile(Some(&workspace_config), None)
             .unwrap()
             .unwrap();
-        let selected_local = crate::config::SelectedProfile {
-            name: "local".to_owned(),
-            profile: config::LocalProfile {
-                staging: true,
-                theme: config::SourceSelection::Remote,
-                sibling: config::SourceSelection::Remote,
-                allow_dirty: false,
-            },
-        };
-        let cases: &[(&[&str], Option<&crate::config::SelectedProfile>, bool)] = &[
-            (&["build-eips", "--staging", "build"], None, true),
-            (&["build-eips", "--no-staging", "build"], None, true),
-            (&["build-eips", "parity", "build"], None, true),
-            (&["build-eips", "--profile", "parity", "build"], None, true),
-            (&["build-eips", "build"], None, false),
-            (&["build-eips", "dirty", "build"], None, false),
-            (&["build-eips", "--profile", "dirty", "build"], None, false),
-            (
-                &["build-eips", "--profile", "local", "build"],
-                Some(&selected_local),
-                false,
-            ),
-            (
-                &["build-eips", "build"],
-                Some(&selected_parity_default),
-                true,
-            ),
+        let cases: &[(&[&str], bool)] = &[
+            (&["build-eips", "--staging", "build"], true),
+            (&["build-eips", "--production", "build"], true),
+            (&["build-eips", "parity", "build"], true),
+            (&["build-eips", "--profile", "parity", "build"], true),
+            (&["build-eips", "build"], false),
+            (&["build-eips", "--profile", "dirty", "build"], false),
+            (&["build-eips", "--profile", "local", "build"], false),
         ];
 
-        for (arguments, selected_profile, expected) in cases {
+        for (arguments, expected) in cases {
             let args = parse_args(arguments);
             assert_eq!(
-                is_explicit_env_or_parity(
-                    &args,
-                    requested_profile_name(&args).unwrap(),
-                    *selected_profile,
-                ),
+                is_explicit_env_or_parity(&args, requested_profile_name(&args).unwrap()),
                 *expected
             );
         }
+
+        let plain_args = parse_args(&["build-eips", "build"]);
+        assert!(!is_explicit_env_or_parity(
+            &plain_args,
+            requested_profile_name(&plain_args).unwrap(),
+        ));
+        assert_eq!(selected_parity_default.name, config::PARITY_PROFILE);
     }
 
     #[test]
@@ -2680,32 +2698,23 @@ default_profile = "parity"
 base_url = "http://localhost:4000"
 "#,
         );
-        let parity_default = parity_default_config
-            .selected_profile(None)
-            .unwrap()
-            .unwrap();
 
         let none = parse_args(&["build-eips", "build"]);
-        assert!(resolve_base_url_override(
-            &none,
-            requested_profile_name(&none).unwrap(),
-            None,
-            None,
-        )
-        .is_none());
+        assert!(
+            resolve_base_url_override(&none, requested_profile_name(&none).unwrap(), None,)
+                .is_none()
+        );
 
         for arguments in [
             &["build-eips", "build"][..],
             &["build-eips", "serve"][..],
-            &["build-eips", "dirty", "build"][..],
-            &["build-eips", "dirty", "serve"][..],
+            &["build-eips", "--profile", "dirty", "build"][..],
         ] {
             let args = parse_args(arguments);
             assert_eq!(
                 resolve_base_url_override(
                     &args,
                     requested_profile_name(&args).unwrap(),
-                    None,
                     Some(&workspace_config),
                 )
                 .unwrap()
@@ -2719,7 +2728,6 @@ base_url = "http://localhost:4000"
             resolve_base_url_override(
                 &cli,
                 requested_profile_name(&cli).unwrap(),
-                None,
                 Some(&workspace_config),
             )
             .unwrap()
@@ -2729,7 +2737,7 @@ base_url = "http://localhost:4000"
 
         for arguments in [
             &["build-eips", "--staging", "build"][..],
-            &["build-eips", "--no-staging", "build"][..],
+            &["build-eips", "--production", "build"][..],
             &["build-eips", "parity", "build"][..],
             &["build-eips", "parity", "serve"][..],
             &["build-eips", "--profile", "parity", "build"][..],
@@ -2738,20 +2746,22 @@ base_url = "http://localhost:4000"
             assert!(resolve_base_url_override(
                 &args,
                 requested_profile_name(&args).unwrap(),
-                None,
                 Some(&workspace_config),
             )
             .is_none());
         }
 
         let default_parity = parse_args(&["build-eips", "build"]);
-        assert!(resolve_base_url_override(
-            &default_parity,
-            requested_profile_name(&default_parity).unwrap(),
-            Some(&parity_default),
-            Some(&parity_default_config),
-        )
-        .is_none());
+        assert_eq!(
+            resolve_base_url_override(
+                &default_parity,
+                requested_profile_name(&default_parity).unwrap(),
+                Some(&parity_default_config),
+            )
+            .unwrap()
+            .as_str(),
+            "http://localhost:4000/"
+        );
 
         for arguments in [
             &[
@@ -2763,7 +2773,7 @@ base_url = "http://localhost:4000"
             ][..],
             &[
                 "build-eips",
-                "--no-staging",
+                "--production",
                 "build",
                 "--base-url",
                 "http://localhost:5000",
@@ -2788,7 +2798,6 @@ base_url = "http://localhost:4000"
                 resolve_base_url_override(
                     &args,
                     requested_profile_name(&args).unwrap(),
-                    None,
                     Some(&workspace_config),
                 )
                 .unwrap()
@@ -2799,28 +2808,21 @@ base_url = "http://localhost:4000"
     }
 
     #[test]
-    fn dirty_site_base_url_override_does_not_change_execution_settings() {
+    fn local_site_base_url_override_does_not_change_execution_settings() {
         let workspace_config = load_workspace_config(
             r#"
 [site]
 base_url = "http://localhost:4000"
 "#,
         );
-        let args = parse_args(&["build-eips", "dirty", "build"]);
-        let selected_profile = selected_profile(&args, Some(&workspace_config));
-        let settings = resolve_execution_settings(
-            &args,
-            &[],
-            Some(&workspace_config),
-            Some(&selected_profile),
-        )
-        .unwrap();
+        let args = parse_args(&["build-eips", "build"]);
+        let settings =
+            resolve_execution_settings(&args, &[], Some(&workspace_config), None).unwrap();
 
         assert_eq!(
             resolve_base_url_override(
                 &args,
                 requested_profile_name(&args).unwrap(),
-                Some(&selected_profile),
                 Some(&workspace_config),
             )
             .unwrap()
@@ -2837,6 +2839,382 @@ base_url = "http://localhost:4000"
                 sibling: SelectedSource::WorkspaceLocal,
             }
         );
+    }
+
+    #[test]
+    fn plain_site_commands_are_local_first_dirty_staging() {
+        let workspace_config = load_workspace_config("");
+        let expected = ExecutionSettings {
+            build_root: None,
+            staging: true,
+            allow_dirty: true,
+            theme: SelectedSource::WorkspaceLocal,
+            sibling: SelectedSource::WorkspaceLocal,
+        };
+
+        for arguments in [
+            &["build-eips", "build"][..],
+            &["build-eips", "serve"][..],
+            &["build-eips", "check"][..],
+        ] {
+            assert_settings(
+                arguments,
+                &["ERCs"],
+                Some(&workspace_config),
+                expected.clone(),
+            );
+        }
+    }
+
+    #[test]
+    fn clean_plain_site_commands_keep_local_sources_but_disable_dirty_materialization() {
+        let workspace_config = load_workspace_config("");
+        let expected = ExecutionSettings {
+            build_root: None,
+            staging: true,
+            allow_dirty: false,
+            theme: SelectedSource::WorkspaceLocal,
+            sibling: SelectedSource::WorkspaceLocal,
+        };
+
+        for arguments in [
+            &["build-eips", "build", "--clean"][..],
+            &["build-eips", "serve", "--clean"][..],
+            &["build-eips", "check", "--clean"][..],
+        ] {
+            assert_settings(
+                arguments,
+                &["ERCs"],
+                Some(&workspace_config),
+                expected.clone(),
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_environment_site_commands_are_remote_clean_without_workspace_config() {
+        for (arguments, expected_staging) in [
+            (&["build-eips", "--staging", "build"][..], true),
+            (&["build-eips", "--staging", "serve"][..], true),
+            (&["build-eips", "--staging", "check"][..], true),
+            (&["build-eips", "--production", "build"][..], false),
+            (&["build-eips", "--production", "serve"][..], false),
+            (&["build-eips", "--production", "check"][..], false),
+        ] {
+            assert_settings(
+                arguments,
+                &["ERCs"],
+                None,
+                ExecutionSettings {
+                    build_root: None,
+                    staging: expected_staging,
+                    allow_dirty: false,
+                    theme: SelectedSource::Remote,
+                    sibling: SelectedSource::Remote,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn clean_environment_commands_are_accepted_as_redundant_remote_clean() {
+        for (arguments, expected_staging) in [
+            (&["build-eips", "--staging", "build", "--clean"][..], true),
+            (&["build-eips", "--staging", "serve", "--clean"][..], true),
+            (&["build-eips", "--staging", "check", "--clean"][..], true),
+            (
+                &["build-eips", "--production", "build", "--clean"][..],
+                false,
+            ),
+            (
+                &["build-eips", "--production", "serve", "--clean"][..],
+                false,
+            ),
+            (
+                &["build-eips", "--production", "check", "--clean"][..],
+                false,
+            ),
+        ] {
+            assert_settings(
+                arguments,
+                &["ERCs"],
+                None,
+                ExecutionSettings {
+                    build_root: None,
+                    staging: expected_staging,
+                    allow_dirty: false,
+                    theme: SelectedSource::Remote,
+                    sibling: SelectedSource::Remote,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn remote_source_overrides_compose_with_local_dirty_and_clean_modes() {
+        let workspace_config = load_workspace_config("");
+        let cases = [
+            (
+                &["build-eips", "--remote-theme", "build"][..],
+                true,
+                SelectedSource::Remote,
+                SelectedSource::WorkspaceLocal,
+            ),
+            (
+                &["build-eips", "--remote-sibling-repo", "build"][..],
+                true,
+                SelectedSource::WorkspaceLocal,
+                SelectedSource::Remote,
+            ),
+            (
+                &["build-eips", "--remote-theme", "build", "--clean"][..],
+                false,
+                SelectedSource::Remote,
+                SelectedSource::WorkspaceLocal,
+            ),
+            (
+                &["build-eips", "--remote-sibling-repo", "build", "--clean"][..],
+                false,
+                SelectedSource::WorkspaceLocal,
+                SelectedSource::Remote,
+            ),
+        ];
+
+        for (arguments, allow_dirty, theme, sibling) in cases {
+            assert_settings(
+                arguments,
+                &["ERCs"],
+                Some(&workspace_config),
+                ExecutionSettings {
+                    build_root: None,
+                    staging: true,
+                    allow_dirty,
+                    theme,
+                    sibling,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn non_site_commands_do_not_require_workspace_local_sources() {
+        for arguments in [
+            &["build-eips", "changed"][..],
+            &["build-eips", "clean"][..],
+            &["build-eips", "preview"][..],
+            &["build-eips", "editorial", "lint", "content/0001.md"][..],
+        ] {
+            assert_settings(
+                arguments,
+                &["ERCs"],
+                None,
+                ExecutionSettings {
+                    build_root: None,
+                    staging: false,
+                    allow_dirty: false,
+                    theme: SelectedSource::Remote,
+                    sibling: SelectedSource::Remote,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn changed_environment_flags_use_remote_clean_metadata_without_workspace_config() {
+        for (arguments, expected_staging) in [
+            (&["build-eips", "--staging", "changed"][..], true),
+            (&["build-eips", "--production", "changed"][..], false),
+        ] {
+            assert_settings(
+                arguments,
+                &["ERCs"],
+                None,
+                ExecutionSettings {
+                    build_root: None,
+                    staging: expected_staging,
+                    allow_dirty: false,
+                    theme: SelectedSource::Remote,
+                    sibling: SelectedSource::Remote,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn editorial_dispatch_uses_local_first_only_for_runtime_build_path() {
+        let workspace_config = load_workspace_config("");
+
+        assert_settings(
+            &["build-eips", "editorial", "lint", "content/0001.md"],
+            &["ERCs"],
+            None,
+            ExecutionSettings {
+                build_root: None,
+                staging: false,
+                allow_dirty: false,
+                theme: SelectedSource::Remote,
+                sibling: SelectedSource::Remote,
+            },
+        );
+        assert_settings(
+            &["build-eips", "editorial", "build", "content/0001.md"],
+            &["ERCs"],
+            Some(&workspace_config),
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: true,
+                theme: SelectedSource::WorkspaceLocal,
+                sibling: SelectedSource::WorkspaceLocal,
+            },
+        );
+        assert_settings(
+            &[
+                "build-eips",
+                "--staging",
+                "editorial",
+                "build",
+                "--against-upstream",
+            ],
+            &["ERCs"],
+            None,
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: false,
+                theme: SelectedSource::Remote,
+                sibling: SelectedSource::Remote,
+            },
+        );
+        assert_settings(
+            &[
+                "build-eips",
+                "--production",
+                "editorial",
+                "build",
+                "--against-upstream",
+            ],
+            &["ERCs"],
+            None,
+            ExecutionSettings {
+                build_root: None,
+                staging: false,
+                allow_dirty: false,
+                theme: SelectedSource::Remote,
+                sibling: SelectedSource::Remote,
+            },
+        );
+    }
+
+    #[test]
+    fn editorial_working_tree_build_still_forces_dirty_runtime_materialization() {
+        let resolved = ResolvedExecution {
+            root_path: PathBuf::from("/workspace/Core"),
+            build_path: PathBuf::from("/workspace/build/Core"),
+            repository_use: crate::git::RepositoryUse {
+                title: "Core".to_owned(),
+                location: config::RepositoryEndpoint {
+                    repository: "https://example.test/Core.git".parse().unwrap(),
+                    base_url: "https://example.test/Core/".parse().unwrap(),
+                },
+                other_repos: Default::default(),
+            },
+            theme: ThemeSource::Remote {
+                repository: "https://example.test/theme.git".to_owned(),
+                commit: "HEAD".to_owned(),
+            },
+            source_materialization: crate::git::SourceMaterialization::Clean,
+            server_binding: ServerBinding::default(),
+            base_url_override: None,
+        };
+        let selectors = EditorialSelectorArgs {
+            paths: Vec::new(),
+            batch: None,
+            working_tree: true,
+            against_upstream: false,
+        };
+
+        assert_eq!(
+            editorial_runtime_execution(&resolved, &selectors).source_materialization,
+            crate::git::SourceMaterialization::Dirty
+        );
+    }
+
+    #[test]
+    fn parity_site_commands_remain_remote_clean_staging() {
+        for arguments in [
+            &["build-eips", "parity", "build"][..],
+            &["build-eips", "parity", "serve"][..],
+            &["build-eips", "parity", "check"][..],
+        ] {
+            assert_settings(
+                arguments,
+                &["ERCs"],
+                None,
+                ExecutionSettings {
+                    build_root: None,
+                    staging: true,
+                    allow_dirty: false,
+                    theme: SelectedSource::Remote,
+                    sibling: SelectedSource::Remote,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn default_profile_does_not_affect_plain_commands_in_phase_one() {
+        let workspace_config = load_workspace_config(
+            r#"
+default_profile = "parity"
+"#,
+        );
+
+        assert_settings(
+            &["build-eips", "build"],
+            &["ERCs"],
+            Some(&workspace_config),
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: true,
+                theme: SelectedSource::WorkspaceLocal,
+                sibling: SelectedSource::WorkspaceLocal,
+            },
+        );
+    }
+
+    #[test]
+    fn downstream_ci_environment_forms_do_not_need_workspace_config() {
+        for (arguments, expected_staging) in [
+            (&["build-eips", "--staging", "build"][..], true),
+            (&["build-eips", "--staging", "changed"][..], true),
+            (
+                &[
+                    "build-eips",
+                    "--staging",
+                    "editorial",
+                    "build",
+                    "--against-upstream",
+                ][..],
+                true,
+            ),
+            (&["build-eips", "--production", "build"][..], false),
+            (&["build-eips", "--production", "changed"][..], false),
+        ] {
+            assert_settings(
+                arguments,
+                &["ERCs"],
+                None,
+                ExecutionSettings {
+                    build_root: None,
+                    staging: expected_staging,
+                    allow_dirty: false,
+                    theme: SelectedSource::Remote,
+                    sibling: SelectedSource::Remote,
+                },
+            );
+        }
     }
 
     #[test]
@@ -2900,47 +3278,46 @@ base_url = "http://localhost:4000"
 
     #[test]
     fn boolean_override_conflicts_are_hard_errors() {
-        let args = parse_args(&["build-eips", "--staging", "--no-staging", "build"]);
+        let args = parse_args(&["build-eips", "--staging", "--production", "build"]);
         let error = resolve_execution_settings(&args, &[], None, None).unwrap_err();
 
         assert!(error
             .to_string()
-            .contains("cannot pass both `--staging` and `--no-staging`"));
+            .contains("cannot pass both `--staging` and `--production`"));
     }
 
     #[test]
-    fn dirty_profile_without_workspace_config_requires_explicit_resolution() {
-        let args = parse_args(&["build-eips", "dirty", "build"]);
-        let selected_profile = selected_profile(&args, None);
+    fn local_first_without_workspace_config_requires_explicit_resolution() {
+        let args = parse_args(&["build-eips", "build"]);
         let sibling_ids = vec!["ERCs".to_owned()];
-        let error = resolve_execution_settings(&args, &sibling_ids, None, Some(&selected_profile))
-            .unwrap_err();
+        let error = resolve_execution_settings(&args, &sibling_ids, None, None).unwrap_err();
         let message = error.to_string();
 
         assert!(
-            message.contains("profile `dirty` requires workspace-local theme and sibling sources")
+            message.contains("selected command requires workspace-local theme and sibling sources")
         );
         assert!(message.contains("build-eips workspace init <workspace-root>"));
         assert!(message.contains("--remote-theme` and/or `--remote-sibling-repo"));
-        assert!(message.contains("switch to `--profile parity`"));
+        assert!(message.contains(
+            "use `parity <command>`, `--staging <command>`, or `--production <command>`"
+        ));
+        assert!(!message.contains("--profile"));
+        assert!(!message.contains("--allow-dirty"));
         assert!(!message.contains("--theme <path>"));
         assert!(!message.contains("--sibling-repo <path>"));
     }
 
     #[test]
-    fn dirty_with_remote_overrides_is_not_parity() {
-        let dirty_args = parse_args(&[
+    fn local_first_with_remote_overrides_is_not_parity() {
+        let local_args = parse_args(&[
             "build-eips",
             "--remote-theme",
             "--remote-sibling-repo",
-            "dirty",
             "build",
         ]);
-        let dirty_profile = selected_profile(&dirty_args, None);
         let sibling_ids = vec!["ERCs".to_owned()];
-        let dirty_settings =
-            resolve_execution_settings(&dirty_args, &sibling_ids, None, Some(&dirty_profile))
-                .unwrap();
+        let local_settings =
+            resolve_execution_settings(&local_args, &sibling_ids, None, None).unwrap();
 
         let parity_args = parse_args(&["build-eips", "parity", "build"]);
         let parity_profile = selected_profile(&parity_args, None);
@@ -2949,7 +3326,7 @@ base_url = "http://localhost:4000"
                 .unwrap();
 
         assert_eq!(
-            dirty_settings,
+            local_settings,
             ExecutionSettings {
                 build_root: None,
                 staging: true,
@@ -2981,14 +3358,12 @@ base_url = "http://localhost:4000"
     }
 
     #[test]
-    fn zero_sibling_dirty_profile_without_workspace_config_only_requires_theme_resolution() {
-        let args = parse_args(&["build-eips", "dirty", "build"]);
-        let selected_profile = selected_profile(&args, None);
-        let error =
-            resolve_execution_settings(&args, &[], None, Some(&selected_profile)).unwrap_err();
+    fn zero_sibling_local_first_without_workspace_config_only_requires_theme_resolution() {
+        let args = parse_args(&["build-eips", "build"]);
+        let error = resolve_execution_settings(&args, &[], None, None).unwrap_err();
         let message = error.to_string();
 
-        assert!(message.contains("profile `dirty` requires workspace-local theme sources"));
+        assert!(message.contains("selected command requires workspace-local theme sources"));
         assert!(!message.contains("theme and sibling"));
         assert!(!message.contains("--theme <path>"));
         assert!(!message.contains("--sibling-repo <path>"));
@@ -3026,6 +3401,7 @@ base_url = "http://localhost:4000"
         let active_path = workspace_root.join("Core");
         let active_url = file_url(&active_path);
         write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        std::fs::create_dir(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
         write_file(
             &workspace_root,
             config::LOCAL_CONFIG_FILE,
@@ -3460,7 +3836,7 @@ allow_dirty = true
     }
 
     #[test]
-    fn default_profile_selection_and_overrides_share_the_same_path() {
+    fn explicit_profile_selection_and_overrides_share_the_same_path() {
         let workspace_config = load_workspace_config(
             r#"
 default_profile = "local"
@@ -3471,7 +3847,13 @@ theme = "local"
 sibling = "local"
 "#,
         );
-        let args = parse_args(&["build-eips", "--no-staging", "--remote-theme", "build"]);
+        let args = parse_args(&[
+            "build-eips",
+            "--profile",
+            "local",
+            "--remote-theme",
+            "build",
+        ]);
         let selected_profile = config::selected_profile(
             Some(&workspace_config),
             requested_profile_name(&args).unwrap(),
@@ -3491,7 +3873,7 @@ sibling = "local"
             settings,
             ExecutionSettings {
                 build_root: None,
-                staging: false,
+                staging: true,
                 allow_dirty: false,
                 theme: SelectedSource::Remote,
                 sibling: SelectedSource::WorkspaceLocal,

@@ -99,9 +99,9 @@ build-eips build
 build-eips serve
 ```
 
-The generated starter config uses a custom `local` profile as the default
-workspace-local profile. The built-in `parity` and `dirty` profiles live in
-Rust and do not appear in `.build-eips.toml`.
+The generated starter config includes transitional profile fields for older
+explicit `--profile` invocations. Plain site commands use the local-first
+defaults described below instead of reading `default_profile`.
 
 Tracked active-repo metadata lives separately in `.build-eips.repo.toml` when a
 repo provides one. That manifest owns the repo identity, environment URLs, and
@@ -109,33 +109,46 @@ declared sibling topology; `.build-eips.toml` remains workspace-local execution
 config. During the migration window, current `EIPs` and `ERCs` checkouts without
 that manifest still use the legacy identity fallback.
 
+## Local Site Commands
+
+Plain site commands are local-first:
+
+- `build-eips check`
+- `build-eips build`
+- `build-eips serve`
+
+They use the workspace-local `theme/`, workspace-local sibling repos, tracked
+working-tree changes from the active repo, and staging environment endpoints.
+Use `--clean` on these commands when you want to ignore tracked working-tree
+changes in the active repo:
+
+```bash
+build-eips check --clean
+build-eips build --clean
+build-eips serve --clean
+```
+
+`--clean` keeps workspace-local theme and sibling sources. Use explicit
+environment commands when you need remote sources and a clean active repo:
+
+```bash
+build-eips --staging build
+build-eips --production build
+build-eips parity build
+```
+
 ## Profiles And Overrides
 
-The command surface has three profile-selection paths:
-
-- no explicit selection, which uses `default_profile` when configured
-- `build-eips --profile <name> ...`
-- built-in profile aliases such as `build-eips parity build` and
-  `build-eips dirty serve`
-
-Built-in profile behavior:
-
-- `parity` uses staging plus remote theme and sibling sources
-- `dirty` uses staging plus local theme and sibling sources, and enables dirty
-  mode
-
-`dirty` is still selectable without `.build-eips.toml`, but it cannot infer
-local workspace paths on its own. If you run `dirty` without workspace config,
-either bootstrap the workspace first or force the remote sources with
-`--remote-theme` and `--remote-sibling-repo`. That remote override form is still
-distinct from `parity`, because `dirty` keeps `allow_dirty = true`.
+The transitional `--profile <name>` flag is still accepted for explicit profile
+invocations, and `build-eips parity build|serve|check` remains the built-in
+remote clean staging/parity alias. Plain commands do not read
+`default_profile`.
 
 ### Explicit overrides
 
 Use these flags to override the selected profile directly:
 
-- `--staging` / `--no-staging`
-- `--allow-dirty` / `--no-allow-dirty`
+- `--staging` / `--production`
 - `--remote-theme`
 - `--remote-sibling-repo`
 - `--build-root <path>`
@@ -160,39 +173,18 @@ build-eips \
 
 ## Dirty Mode
 
-Dirty mode is the explicit local-only path for tracked working-tree changes in
-the active content repo.
+This compatibility heading now describes the default local development path.
+Plain `check`, `build`, and `serve` include tracked active-repo edits by default.
+Only the active content repo is materialized this way; sibling repos and theme
+still come from the workspace layout unless you pass `--remote-theme` or
+`--remote-sibling-repo`.
 
-Use the built-in alias:
+Local development limits:
 
-```bash
-cd /work/EIPs-project/EIPs
-build-eips dirty check
-build-eips dirty build
-build-eips dirty serve
-```
-
-Or enable the same behavior ad hoc:
-
-```bash
-build-eips --allow-dirty check
-build-eips --allow-dirty build
-build-eips --allow-dirty serve
-```
-
-`build-eips dirty serve` performs the expensive runtime preparation once at
-startup, then watches the real active content repo and mirrors tracked changes
-into the materialized repo that Zola is serving from.
-
-Dirty-mode limits:
-
-- dirty mode is opt-in and non-parity
-- only the active content repo is materialized dirty
-- sibling repo and theme still follow the selected profile or remote overrides
 - untracked files in the active content repo are ignored
-- clean `build-eips serve` remains the clean runtime serve path
 - tracked deletions are mirrored into the materialized repo, but served route
   invalidation under Zola fast serve remains best-effort
+- `--clean` ignores tracked active-repo edits for one command
 
 ## Editorial Commands
 
@@ -237,9 +229,9 @@ The workspace config `[site].base_url` value is a local rendered-site URL
 default. Starter configs set it to `http://127.0.0.1:1111`; if you change
 `[server].port`, update `[site].base_url` too when generated links should match
 the local server. Explicit environment and parity commands ignore
-`[site].base_url`, including `--staging`, `--no-staging`, `parity`, and commands
-resolved through `default_profile = "parity"`. Per-command `--base-url` on
-`build` or `serve` is a one-run override and wins even with staging or parity.
+`[site].base_url`, including `--staging`, `--production`, `parity`, and
+`--profile parity`. Per-command `--base-url` on `build` or `serve` is a one-run
+override and wins even with staging or parity.
 `preview` serves existing output, so build with `--base-url` first when previewed
 HTML should contain a different local link target.
 

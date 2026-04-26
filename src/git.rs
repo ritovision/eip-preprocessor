@@ -182,7 +182,7 @@ fn dirty_statuses(repo: &git2::Repository) -> Result<git2::Statuses<'_>, Error> 
 
 fn format_dirty_rejection(tracked_paths: &BTreeSet<PathBuf>, untracked_count: usize) -> String {
     let mut lines = vec![String::from(
-        "working tree or index has uncommitted modifications; the clean/default path requires a clean working tree:",
+        "working tree or index has uncommitted modifications; the selected clean source path requires a clean working tree:",
     )];
 
     for path in tracked_paths.iter().take(DIRTY_PATH_DISPLAY_LIMIT) {
@@ -207,11 +207,11 @@ fn format_dirty_rejection(tracked_paths: &BTreeSet<PathBuf>, untracked_count: us
 
     if untracked_count > 0 {
         lines.push(String::from(
-            "Use `--profile dirty` or `--allow-dirty` to include tracked local changes, and commit/stash/remove any untracked files first.",
+            "For local build/serve/check commands, run without `--clean` to include tracked local changes. For remote/parity/clean runs, commit or stash tracked changes first. Commit/stash/remove untracked files before retrying.",
         ));
     } else {
         lines.push(String::from(
-            "Use `--profile dirty` or `--allow-dirty` to include tracked local changes, or commit/stash them first.",
+            "For local build/serve/check commands, run without `--clean` to include tracked local changes. For remote/parity/clean runs, commit or stash tracked changes first.",
         ));
     }
 
