@@ -233,5 +233,15 @@ The workspace config `[server]` table controls the local bind address for both
 and `--port` flags override that config for one run. These settings do not
 change build base URLs.
 
+The workspace config `[site].base_url` value is a local rendered-site URL
+default. Starter configs set it to `http://127.0.0.1:1111`; if you change
+`[server].port`, update `[site].base_url` too when generated links should match
+the local server. Explicit environment and parity commands ignore
+`[site].base_url`, including `--staging`, `--no-staging`, `parity`, and commands
+resolved through `default_profile = "parity"`. Per-command `--base-url` on
+`build` or `serve` is a one-run override and wins even with staging or parity.
+`preview` serves existing output, so build with `--base-url` first when previewed
+HTML should contain a different local link target.
+
 [`ethereum/EIPs`]: https://github.com/ethereum/EIPs/
 [`ethereum/ERCs`]: https://github.com/ethereum/ERCs/

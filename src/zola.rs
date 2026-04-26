@@ -112,7 +112,7 @@ mod tests {
         };
 
         assert_eq!(
-            serve_args(&server_binding, Path::new("/tmp/build-output")),
+            serve_args(&server_binding, Path::new("/tmp/build-output"), None),
             vec![
                 OsString::from("serve"),
                 OsString::from("--drafts"),
@@ -122,6 +122,38 @@ mod tests {
                 OsString::from("0.0.0.0"),
                 OsString::from("--port"),
                 OsString::from("8080"),
+                OsString::from("-o"),
+                OsString::from("/tmp/build-output"),
+            ]
+        );
+    }
+
+    #[test]
+    fn serve_args_include_base_url_override_when_present() {
+        let server_binding = ServerBinding {
+            host: "127.0.0.1".to_owned(),
+            port: 1111,
+        };
+        let base_url = "http://127.0.0.1:1111".parse().unwrap();
+
+        assert_eq!(
+            serve_args(
+                &server_binding,
+                Path::new("/tmp/build-output"),
+                Some(&base_url)
+            ),
+            vec![
+                OsString::from("serve"),
+                OsString::from("--drafts"),
+                OsString::from("--fast"),
+                OsString::from("--force"),
+                OsString::from("--interface"),
+                OsString::from("127.0.0.1"),
+                OsString::from("--port"),
+                OsString::from("1111"),
+                OsString::from("-u"),
+                OsString::from("http://127.0.0.1:1111/"),
+                OsString::from("--no-port-append"),
                 OsString::from("-o"),
                 OsString::from("/tmp/build-output"),
             ]
@@ -160,16 +192,21 @@ pub fn serve(
     project_path: &Path,
     output_path: &Path,
     server_binding: &ServerBinding,
+    base_url_override: Option<&Url>,
 ) -> Result<(), Error> {
     // TODO: Properly kill the child process when we receive ctrl-c.
     remove_output(output_path);
-    let args = serve_args(server_binding, output_path);
+    let args = serve_args(server_binding, output_path, base_url_override);
     spawn_log(theme, cache, project_path, args)?;
     Ok(())
 }
 
-pub(crate) fn serve_args(server_binding: &ServerBinding, output_path: &Path) -> Vec<OsString> {
-    [
+pub(crate) fn serve_args(
+    server_binding: &ServerBinding,
+    output_path: &Path,
+    base_url_override: Option<&Url>,
+) -> Vec<OsString> {
+    let mut args = [
         "serve",
         "--drafts",
         "--fast",
@@ -179,13 +216,20 @@ pub(crate) fn serve_args(server_binding: &ServerBinding, output_path: &Path) -> 
         "--port",
     ]
     .map(OsString::from)
-    .into_iter()
-    .chain([
-        OsString::from(server_binding.port.to_string()),
-        OsString::from("-o"),
-        output_path.as_os_str().to_os_string(),
-    ])
-    .collect()
+    .to_vec();
+
+    args.push(OsString::from(server_binding.port.to_string()));
+
+    if let Some(base_url) = base_url_override {
+        args.extend([
+            OsString::from("-u"),
+            OsString::from(base_url.as_str()),
+            OsString::from("--no-port-append"),
+        ]);
+    }
+
+    args.extend([OsString::from("-o"), output_path.as_os_str().to_os_string()]);
+    args
 }
 
 fn remove_output(output_path: &Path) {

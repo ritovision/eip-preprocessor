@@ -111,6 +111,13 @@ struct ServerCliArgs {
     port: Option<u16>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+struct BaseUrlCliArgs {
+    /// Override the rendered-site base URL for this command
+    #[arg(long, value_parser = clap::value_parser!(Url))]
+    base_url: Option<Url>,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 enum Operation {
     /// Print various useful things, like available lints
@@ -120,12 +127,18 @@ enum Operation {
     },
 
     /// Build the project and output HTML
-    Build,
+    Build {
+        #[command(flatten)]
+        base_url: BaseUrlCliArgs,
+    },
 
     /// Build the project and launch a web server to preview it
     Serve {
         #[command(flatten)]
         server: ServerCliArgs,
+
+        #[command(flatten)]
+        base_url: BaseUrlCliArgs,
     },
 
     /// Serve the existing built output without rebuilding it
@@ -177,12 +190,18 @@ enum Operation {
 #[derive(Debug, Clone, Subcommand)]
 enum ProfiledOperation {
     /// Build the project and output HTML
-    Build,
+    Build {
+        #[command(flatten)]
+        base_url: BaseUrlCliArgs,
+    },
 
     /// Build the project and launch a web server to preview it
     Serve {
         #[command(flatten)]
         server: ServerCliArgs,
+
+        #[command(flatten)]
+        base_url: BaseUrlCliArgs,
     },
 
     /// Serve the existing built output without rebuilding it
@@ -283,6 +302,7 @@ struct ResolvedExecution {
     theme: ThemeSource,
     source_materialization: git::SourceMaterialization,
     server_binding: ServerBinding,
+    base_url_override: Option<Url>,
 }
 
 #[derive(Debug, Clone)]
@@ -432,10 +452,10 @@ impl ActiveRepoIdentity {
 impl Operation {
     fn server_cli_args(&self) -> ServerCliArgs {
         match self {
-            Self::Serve { server } | Self::Preview { server } => server.clone(),
+            Self::Serve { server, .. } | Self::Preview { server } => server.clone(),
             Self::Parity { command } | Self::Dirty { command } => command.server_cli_args(),
             Self::Print { .. }
-            | Self::Build
+            | Self::Build { .. }
             | Self::Clean
             | Self::Check
             | Self::Changed { .. }
@@ -444,12 +464,26 @@ impl Operation {
         }
     }
 
+    fn base_url_cli_args(&self) -> BaseUrlCliArgs {
+        match self {
+            Self::Build { base_url } | Self::Serve { base_url, .. } => base_url.clone(),
+            Self::Parity { command } | Self::Dirty { command } => command.base_url_cli_args(),
+            Self::Print { .. }
+            | Self::Preview { .. }
+            | Self::Clean
+            | Self::Check
+            | Self::Changed { .. }
+            | Self::Editorial { .. }
+            | Self::Workspace { .. } => BaseUrlCliArgs::default(),
+        }
+    }
+
     fn profile_alias_name(&self) -> Option<&'static str> {
         match self {
             Self::Parity { .. } => Some(config::PARITY_PROFILE),
             Self::Dirty { .. } => Some(config::DIRTY_PROFILE),
             Self::Print { .. }
-            | Self::Build
+            | Self::Build { .. }
             | Self::Serve { .. }
             | Self::Preview { .. }
             | Self::Clean
@@ -463,7 +497,7 @@ impl Operation {
     fn runtime_operation(&self) -> Option<RuntimeOperation> {
         match self {
             Self::Print { .. } | Self::Workspace { .. } => None,
-            Self::Build => Some(RuntimeOperation::Build),
+            Self::Build { .. } => Some(RuntimeOperation::Build),
             Self::Serve { .. } => Some(RuntimeOperation::Serve),
             Self::Preview { .. } => Some(RuntimeOperation::Preview),
             Self::Clean => Some(RuntimeOperation::Clean),
@@ -491,16 +525,25 @@ impl Operation {
 impl ProfiledOperation {
     fn server_cli_args(&self) -> ServerCliArgs {
         match self {
-            Self::Serve { server } | Self::Preview { server } => server.clone(),
-            Self::Build | Self::Clean | Self::Check | Self::Changed { .. } => {
+            Self::Serve { server, .. } | Self::Preview { server } => server.clone(),
+            Self::Build { .. } | Self::Clean | Self::Check | Self::Changed { .. } => {
                 ServerCliArgs::default()
+            }
+        }
+    }
+
+    fn base_url_cli_args(&self) -> BaseUrlCliArgs {
+        match self {
+            Self::Build { base_url } | Self::Serve { base_url, .. } => base_url.clone(),
+            Self::Preview { .. } | Self::Clean | Self::Check | Self::Changed { .. } => {
+                BaseUrlCliArgs::default()
             }
         }
     }
 
     fn runtime_operation(&self) -> RuntimeOperation {
         match self {
-            Self::Build => RuntimeOperation::Build,
+            Self::Build { .. } => RuntimeOperation::Build,
             Self::Serve { .. } => RuntimeOperation::Serve,
             Self::Preview { .. } => RuntimeOperation::Preview,
             Self::Clean => RuntimeOperation::Clean,
@@ -1256,6 +1299,37 @@ fn resolve_server_binding(
     binding
 }
 
+fn is_explicit_env_or_parity(
+    args: &Args,
+    requested_profile: Option<&str>,
+    selected_profile: Option<&SelectedProfile>,
+) -> bool {
+    args.staging
+        || args.no_staging
+        || matches!(args.operation, Operation::Parity { .. })
+        || requested_profile == Some(config::PARITY_PROFILE)
+        || selected_profile
+            .map(|profile| profile.name.as_str())
+            .is_some_and(|name| name == config::PARITY_PROFILE)
+}
+
+fn resolve_base_url_override(
+    args: &Args,
+    requested_profile: Option<&str>,
+    selected_profile: Option<&SelectedProfile>,
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+) -> Option<Url> {
+    if let Some(base_url) = args.operation.base_url_cli_args().base_url {
+        return Some(base_url);
+    }
+
+    if is_explicit_env_or_parity(args, requested_profile, selected_profile) {
+        return None;
+    }
+
+    workspace_config.and_then(|config| config.site_settings().base_url.clone())
+}
+
 fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     let root_path = root(args)?;
     let active_repo = ActiveRepoIdentity::load(&root_path)?;
@@ -1317,6 +1391,12 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
     } else {
         git::SourceMaterialization::Clean
     };
+    let base_url_override = resolve_base_url_override(
+        args,
+        requested_profile,
+        selected_profile.as_ref(),
+        workspace_config.as_ref(),
+    );
 
     Ok(ResolvedExecution {
         root_path,
@@ -1328,6 +1408,7 @@ fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatever> {
             workspace_config.as_ref(),
             &args.operation.server_cli_args(),
         ),
+        base_url_override,
     })
 }
 
@@ -1675,6 +1756,7 @@ struct Prepared {
     source_root: PathBuf,
     source_materialization: git::SourceMaterialization,
     server_binding: ServerBinding,
+    base_url_override: Option<Url>,
 }
 
 impl Prepared {
@@ -1688,6 +1770,7 @@ impl Prepared {
             theme,
             source_materialization,
             server_binding,
+            base_url_override,
         } = resolved;
 
         let repo_path = build_path.join(REPO_DIR);
@@ -1722,16 +1805,21 @@ impl Prepared {
             source_root: root_path,
             source_materialization,
             server_binding,
+            base_url_override,
         })
     }
 
     fn build(self) -> Result<(), Whatever> {
+        let base_url = self
+            .base_url_override
+            .as_ref()
+            .unwrap_or(&self.repository_use.location.base_url);
         zola::build(
             &self.theme,
             &self.cache,
             &self.repo_path,
             &self.output_path,
-            self.repository_use.location.base_url.as_str(),
+            base_url.as_str(),
         )
         .whatever_context("zola build failed")?;
         Ok(())
@@ -1753,6 +1841,7 @@ impl Prepared {
             &self.repo_path,
             &self.output_path,
             &self.server_binding,
+            self.base_url_override.as_ref(),
         )
         .whatever_context("zola serve failed");
 
@@ -2012,11 +2101,11 @@ mod tests {
 
     use super::{
         collect_doctor_report, editorial_targets, init_workspace_with_repositories,
-        requested_profile_name, resolve_execution, resolve_execution_settings,
-        resolve_server_binding, validate_non_execution_command_flags, Args, EditorialCommand,
-        EditorialSelectorArgs, ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation,
-        SelectedSource, ServerCliArgs, ThemeSource, WorkspaceCommand, WorkspaceInitRepositories,
-        REPO_DIR,
+        is_explicit_env_or_parity, requested_profile_name, resolve_base_url_override,
+        resolve_execution, resolve_execution_settings, resolve_server_binding,
+        validate_non_execution_command_flags, Args, EditorialCommand, EditorialSelectorArgs,
+        ExecutionSettings, Operation, ProfiledOperation, RuntimeOperation, SelectedSource,
+        ServerCliArgs, ThemeSource, WorkspaceCommand, WorkspaceInitRepositories, REPO_DIR,
     };
     use crate::config::{self, LoadedWorkspaceConfig, ServerBinding};
 
@@ -2164,7 +2253,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
         assert!(matches!(
             args.operation,
             Operation::Parity {
-                command: ProfiledOperation::Build
+                command: ProfiledOperation::Build { .. }
             }
         ));
         assert_eq!(
@@ -2377,6 +2466,375 @@ port = 8080
             ServerBinding {
                 host: "0.0.0.0".to_owned(),
                 port: 4000,
+            }
+        );
+    }
+
+    #[test]
+    fn base_url_flags_parse_on_build_and_serve_forms() {
+        let cases: &[(&[&str], RuntimeOperation)] = &[
+            (
+                &["build-eips", "build", "--base-url", "http://localhost:4000"],
+                RuntimeOperation::Build,
+            ),
+            (
+                &["build-eips", "serve", "--base-url", "http://localhost:4000"],
+                RuntimeOperation::Serve,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "build",
+                    "--base-url",
+                    "http://localhost:4000",
+                ],
+                RuntimeOperation::Build,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "serve",
+                    "--base-url",
+                    "http://localhost:4000",
+                ],
+                RuntimeOperation::Serve,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "dirty",
+                    "build",
+                    "--base-url",
+                    "http://localhost:4000",
+                ],
+                RuntimeOperation::Build,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "dirty",
+                    "serve",
+                    "--base-url",
+                    "http://localhost:4000",
+                ],
+                RuntimeOperation::Serve,
+            ),
+        ];
+
+        for (arguments, expected_runtime_operation) in cases {
+            let args = parse_args(arguments);
+
+            assert!(matches!(
+                (
+                    args.operation.runtime_operation().unwrap(),
+                    (*expected_runtime_operation).clone()
+                ),
+                (RuntimeOperation::Build, RuntimeOperation::Build)
+                    | (RuntimeOperation::Serve, RuntimeOperation::Serve)
+            ));
+            assert_eq!(
+                args.operation
+                    .base_url_cli_args()
+                    .base_url
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                "http://localhost:4000/"
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_flag_is_rejected_on_non_rendering_forms() {
+        let cases: &[&[&str]] = &[
+            &[
+                "build-eips",
+                "preview",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "parity",
+                "preview",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "dirty",
+                "preview",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &["build-eips", "check", "--base-url", "http://localhost:4000"],
+            &[
+                "build-eips",
+                "changed",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "workspace",
+                "doctor",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "workspace",
+                "init",
+                "/tmp/workspace",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "editorial",
+                "lint",
+                "--working-tree",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &["build-eips", "print", "--base-url", "http://localhost:4000"],
+        ];
+
+        for arguments in cases {
+            assert!(Args::try_parse_from(*arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_env_or_parity_provenance_is_classified_separately_from_dirty_defaults() {
+        let workspace_config = load_workspace_config(
+            r#"
+default_profile = "parity"
+
+[profiles.local]
+staging = true
+theme = "remote"
+sibling = "remote"
+"#,
+        );
+        let selected_parity_default = config::selected_profile(Some(&workspace_config), None)
+            .unwrap()
+            .unwrap();
+        let selected_local = crate::config::SelectedProfile {
+            name: "local".to_owned(),
+            profile: config::LocalProfile {
+                staging: true,
+                theme: config::SourceSelection::Remote,
+                sibling: config::SourceSelection::Remote,
+                allow_dirty: false,
+            },
+        };
+        let cases: &[(&[&str], Option<&crate::config::SelectedProfile>, bool)] = &[
+            (&["build-eips", "--staging", "build"], None, true),
+            (&["build-eips", "--no-staging", "build"], None, true),
+            (&["build-eips", "parity", "build"], None, true),
+            (&["build-eips", "--profile", "parity", "build"], None, true),
+            (&["build-eips", "build"], None, false),
+            (&["build-eips", "dirty", "build"], None, false),
+            (&["build-eips", "--profile", "dirty", "build"], None, false),
+            (
+                &["build-eips", "--profile", "local", "build"],
+                Some(&selected_local),
+                false,
+            ),
+            (
+                &["build-eips", "build"],
+                Some(&selected_parity_default),
+                true,
+            ),
+        ];
+
+        for (arguments, selected_profile, expected) in cases {
+            let args = parse_args(arguments);
+            assert_eq!(
+                is_explicit_env_or_parity(
+                    &args,
+                    requested_profile_name(&args).unwrap(),
+                    *selected_profile,
+                ),
+                *expected
+            );
+        }
+    }
+
+    #[test]
+    fn base_url_override_resolution_uses_cli_config_then_provenance() {
+        let workspace_config = load_workspace_config(
+            r#"
+[site]
+base_url = "http://localhost:4000"
+"#,
+        );
+        let parity_default_config = load_workspace_config(
+            r#"
+default_profile = "parity"
+
+[site]
+base_url = "http://localhost:4000"
+"#,
+        );
+        let parity_default = parity_default_config
+            .selected_profile(None)
+            .unwrap()
+            .unwrap();
+
+        let none = parse_args(&["build-eips", "build"]);
+        assert!(resolve_base_url_override(
+            &none,
+            requested_profile_name(&none).unwrap(),
+            None,
+            None,
+        )
+        .is_none());
+
+        for arguments in [
+            &["build-eips", "build"][..],
+            &["build-eips", "serve"][..],
+            &["build-eips", "dirty", "build"][..],
+            &["build-eips", "dirty", "serve"][..],
+        ] {
+            let args = parse_args(arguments);
+            assert_eq!(
+                resolve_base_url_override(
+                    &args,
+                    requested_profile_name(&args).unwrap(),
+                    None,
+                    Some(&workspace_config),
+                )
+                .unwrap()
+                .as_str(),
+                "http://localhost:4000/"
+            );
+        }
+
+        let cli = parse_args(&["build-eips", "build", "--base-url", "http://localhost:5000"]);
+        assert_eq!(
+            resolve_base_url_override(
+                &cli,
+                requested_profile_name(&cli).unwrap(),
+                None,
+                Some(&workspace_config),
+            )
+            .unwrap()
+            .as_str(),
+            "http://localhost:5000/"
+        );
+
+        for arguments in [
+            &["build-eips", "--staging", "build"][..],
+            &["build-eips", "--no-staging", "build"][..],
+            &["build-eips", "parity", "build"][..],
+            &["build-eips", "parity", "serve"][..],
+            &["build-eips", "--profile", "parity", "build"][..],
+        ] {
+            let args = parse_args(arguments);
+            assert!(resolve_base_url_override(
+                &args,
+                requested_profile_name(&args).unwrap(),
+                None,
+                Some(&workspace_config),
+            )
+            .is_none());
+        }
+
+        let default_parity = parse_args(&["build-eips", "build"]);
+        assert!(resolve_base_url_override(
+            &default_parity,
+            requested_profile_name(&default_parity).unwrap(),
+            Some(&parity_default),
+            Some(&parity_default_config),
+        )
+        .is_none());
+
+        for arguments in [
+            &[
+                "build-eips",
+                "--staging",
+                "build",
+                "--base-url",
+                "http://localhost:5000",
+            ][..],
+            &[
+                "build-eips",
+                "--no-staging",
+                "build",
+                "--base-url",
+                "http://localhost:5000",
+            ][..],
+            &[
+                "build-eips",
+                "parity",
+                "build",
+                "--base-url",
+                "http://localhost:5000",
+            ][..],
+            &[
+                "build-eips",
+                "parity",
+                "serve",
+                "--base-url",
+                "http://localhost:5000",
+            ][..],
+        ] {
+            let args = parse_args(arguments);
+            assert_eq!(
+                resolve_base_url_override(
+                    &args,
+                    requested_profile_name(&args).unwrap(),
+                    None,
+                    Some(&workspace_config),
+                )
+                .unwrap()
+                .as_str(),
+                "http://localhost:5000/"
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_site_base_url_override_does_not_change_execution_settings() {
+        let workspace_config = load_workspace_config(
+            r#"
+[site]
+base_url = "http://localhost:4000"
+"#,
+        );
+        let args = parse_args(&["build-eips", "dirty", "build"]);
+        let selected_profile = selected_profile(&args, Some(&workspace_config));
+        let settings = resolve_execution_settings(
+            &args,
+            &[],
+            Some(&workspace_config),
+            Some(&selected_profile),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_base_url_override(
+                &args,
+                requested_profile_name(&args).unwrap(),
+                Some(&selected_profile),
+                Some(&workspace_config),
+            )
+            .unwrap()
+            .as_str(),
+            "http://localhost:4000/"
+        );
+        assert_eq!(
+            settings,
+            ExecutionSettings {
+                build_root: None,
+                staging: true,
+                allow_dirty: true,
+                theme: SelectedSource::WorkspaceLocal,
+                sibling: SelectedSource::WorkspaceLocal,
             }
         );
     }

@@ -10,9 +10,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use snafu::{Backtrace, IntoError, OptionExt, ResultExt, Snafu};
-use url::Url;
+use url::{Position, Url};
 
 pub const LOCAL_CONFIG_FILE: &str = ".build-eips.toml";
 pub const REPO_MANIFEST_FILE: &str = ".build-eips.repo.toml";
@@ -23,6 +23,7 @@ pub const PARITY_PROFILE: &str = "parity";
 pub const DIRTY_PROFILE: &str = "dirty";
 pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_SERVER_PORT: u16 = 1111;
+pub const DEFAULT_SITE_BASE_URL: &str = "http://127.0.0.1:1111";
 const RESERVED_WORKSPACE_NAMES: &[&str] = &[DEFAULT_THEME_DIR, "preprocessor", "eipw"];
 
 #[derive(Debug, Snafu)]
@@ -520,6 +521,10 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub server: ServerSettings,
 
+    /// Local rendered-site URL defaults for build and serve commands.
+    #[serde(default)]
+    pub site: SiteSettings,
+
     /// Custom profile definitions keyed by profile name.
     pub profiles: BTreeMap<String, LocalProfile>,
 }
@@ -530,6 +535,7 @@ impl Default for WorkspaceConfig {
             default_profile: None,
             build_root_base: DEFAULT_BUILD_ROOT_BASE.into(),
             server: ServerSettings::default(),
+            site: SiteSettings::default(),
             profiles: BTreeMap::new(),
         }
     }
@@ -544,6 +550,7 @@ impl WorkspaceConfig {
             default_profile: Some(LOCAL_PROFILE.into()),
             build_root_base: DEFAULT_BUILD_ROOT_BASE.into(),
             server: ServerSettings::default(),
+            site: SiteSettings::starter(),
             profiles,
         }
     }
@@ -613,6 +620,56 @@ impl From<&ServerSettings> for ServerBinding {
 impl fmt::Display for ServerBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}:{}", self.host, self.port)
+    }
+}
+
+/// Workspace-local rendered-site URL defaults for build and serve commands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SiteSettings {
+    /// Base URL written into rendered HTML, feeds, canonical links, and sitemaps.
+    #[serde(
+        default,
+        serialize_with = "serialize_optional_base_url",
+        deserialize_with = "deserialize_optional_base_url"
+    )]
+    pub base_url: Option<Url>,
+}
+
+impl SiteSettings {
+    fn starter() -> Self {
+        Self {
+            base_url: Some(
+                DEFAULT_SITE_BASE_URL
+                    .parse()
+                    .expect("default site base URL should parse"),
+            ),
+        }
+    }
+}
+
+fn serialize_optional_base_url<S>(base_url: &Option<Url>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match base_url {
+        Some(base_url) => serializer.serialize_some(&format_base_url(base_url)),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_optional_base_url<'de, D>(deserializer: D) -> Result<Option<Url>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Url>::deserialize(deserializer)
+}
+
+fn format_base_url(base_url: &Url) -> String {
+    if base_url.path() == "/" && base_url.query().is_none() && base_url.fragment().is_none() {
+        base_url[..Position::BeforePath].to_owned()
+    } else {
+        base_url.as_str().to_owned()
     }
 }
 
@@ -723,6 +780,10 @@ impl LoadedWorkspaceConfig {
 
     pub fn server_settings(&self) -> &ServerSettings {
         &self.config.server
+    }
+
+    pub fn site_settings(&self) -> &SiteSettings {
+        &self.config.site
     }
 
     pub fn local_theme_path(&self) -> PathBuf {
@@ -859,8 +920,9 @@ mod tests {
     use super::{
         default_workspace_config_text, discover_path, selected_profile, LoadedRepoManifest,
         LoadedWorkspaceConfig, LocalProfile, RepoManifestError, ServerBinding, ServerSettings,
-        SourceSelection, WorkspaceError, DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT, DIRTY_PROFILE,
-        LOCAL_CONFIG_FILE, LOCAL_PROFILE, PARITY_PROFILE, REPO_MANIFEST_FILE,
+        SourceSelection, WorkspaceError, DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT,
+        DEFAULT_SITE_BASE_URL, DIRTY_PROFILE, LOCAL_CONFIG_FILE, LOCAL_PROFILE, PARITY_PROFILE,
+        REPO_MANIFEST_FILE,
     };
 
     struct TestWorkspace {
@@ -1124,6 +1186,10 @@ base_url = "https://staging.example.test/ERCs/"
             .unwrap()
             .is_some());
         assert_eq!(config.server_settings(), &ServerSettings::default());
+        assert_eq!(
+            config.site_settings().base_url.as_ref().unwrap().as_str(),
+            "http://127.0.0.1:1111/"
+        );
     }
 
     #[test]
@@ -1139,6 +1205,8 @@ base_url = "https://staging.example.test/ERCs/"
         assert!(original.contains("[server]"));
         assert!(original.contains("host = \"127.0.0.1\""));
         assert!(original.contains("port = 1111"));
+        assert!(original.contains("[site]"));
+        assert!(original.contains(&format!("base_url = \"{DEFAULT_SITE_BASE_URL}\"")));
         assert!(original.contains("[profiles.local]"));
     }
 
@@ -1185,6 +1253,61 @@ sibling = "remote"
         assert_eq!(binding.host, DEFAULT_SERVER_HOST);
         assert_eq!(binding.port, DEFAULT_SERVER_PORT);
         assert_eq!(binding.to_string(), "127.0.0.1:1111");
+    }
+
+    #[test]
+    fn parses_workspace_config_site_settings() {
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[site]
+base_url = "http://localhost:4000"
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(
+            config.site_settings().base_url.as_ref().unwrap().as_str(),
+            "http://localhost:4000/"
+        );
+    }
+
+    #[test]
+    fn invalid_workspace_config_site_base_url_errors() {
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[site]
+base_url = "not a url"
+"#,
+        );
+        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unable to parse workspace config"));
+    }
+
+    #[test]
+    fn missing_site_settings_preserve_no_base_url_override() {
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+default_profile = "custom"
+
+[profiles.custom]
+theme = "remote"
+sibling = "remote"
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert!(config.site_settings().base_url.is_none());
     }
 
     #[test]
