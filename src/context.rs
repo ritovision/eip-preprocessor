@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use snafu::{ResultExt, Whatever};
 
-use crate::{config, find_root, Args};
+use crate::{cli::Args, config, find_root};
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceCommandContext {
