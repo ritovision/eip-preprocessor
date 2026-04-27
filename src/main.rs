@@ -6,14 +6,17 @@
 
 mod cache;
 mod config;
+mod context;
 mod find_root;
 mod git;
 mod github;
+mod layout;
 mod lint;
 mod markdown;
 mod preview;
 mod print;
 mod progress;
+mod theme;
 mod zola;
 
 use std::{
@@ -37,21 +40,16 @@ use notify::{Event, RecursiveMode, Watcher};
 use snafu::{OptionExt, Report, ResultExt, Whatever};
 use url::Url;
 
-use crate::config::{Config, LoadedRepoManifest, LoadedWorkspaceConfig, ServerBinding};
+use crate::{
+    config::{Config, LoadedRepoManifest, LoadedWorkspaceConfig, ServerBinding},
+    context::{load_workspace_command_context, resolve_input_path, root},
+    layout::{mounted_theme_path, output_path, BUILD_DIR, CONTENT_DIR, REPO_DIR},
+    theme::ThemeSource,
+};
 
-const CONTENT_DIR: &str = "content";
-const BUILD_DIR: &str = "build";
-const REPO_DIR: &str = "repo";
-const OUTPUT_DIR: &str = "output";
 const PROPOSAL_TEMPLATE_URL: &str = "https://github.com/eips-wg/template.git";
 const PLATFORM_PREPROCESSOR_URL: &str = "https://github.com/eips-wg/preprocessor.git";
 const PLATFORM_EIPW_URL: &str = "https://github.com/ethereum/eipw.git";
-
-#[derive(Debug, Clone)]
-enum ThemeSource {
-    Remote { repository: String, commit: String },
-    Local { path: PathBuf },
-}
 
 /// Build script for Ethereum EIPs and ERCs.
 #[derive(Parser, Debug)]
@@ -319,12 +317,6 @@ enum DoctorStatus {
 struct DoctorReport {
     warnings: usize,
     failures: usize,
-}
-
-#[derive(Debug, Clone)]
-struct WorkspaceCommandContext {
-    search_from: PathBuf,
-    config_path: Option<PathBuf>,
 }
 
 struct WorkspaceInitRepositories<'a> {
@@ -619,49 +611,6 @@ fn lock(build_path: &Path) -> Result<LockFile, Whatever> {
             .whatever_context("unable to lock build directory")?;
     }
     Ok(lock_file)
-}
-
-fn resolve_input_path(path: &Path) -> Result<PathBuf, Whatever> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        let cwd = std::env::current_dir().whatever_context("unable to get current directory")?;
-        Ok(cwd.join(path))
-    }
-}
-
-fn root(args: &Args) -> Result<PathBuf, Whatever> {
-    let dir = match &args.root {
-        None => find_root::find_root().whatever_context("cannot find repository root")?,
-        Some(path) => {
-            find_root::is_root(path).whatever_context("invalid root directory")?;
-            path.canonicalize()
-                .whatever_context("unable to canonicalize root directory")?
-        }
-    };
-    find_root::is_root(&dir).whatever_context("invalid root directory")?;
-    Ok(dir)
-}
-
-fn workspace_search_start(args: &Args) -> Result<PathBuf, Whatever> {
-    match &args.root {
-        Some(path) => {
-            let path = resolve_input_path(path)?;
-            path.canonicalize()
-                .whatever_context("unable to canonicalize workspace search path")
-        }
-        None => std::env::current_dir().whatever_context("unable to get current directory"),
-    }
-}
-
-fn load_workspace_command_context(args: &Args) -> Result<WorkspaceCommandContext, Whatever> {
-    let search_from = workspace_search_start(args)?;
-    let config_path = config::discover_path(&search_from);
-
-    Ok(WorkspaceCommandContext {
-        search_from,
-        config_path,
-    })
 }
 
 fn has_execution_override_flags(args: &Args) -> bool {
@@ -1225,10 +1174,6 @@ fn build_path(
             })
         })
         .unwrap_or_else(|| root_path.join(BUILD_DIR))
-}
-
-fn output_path(build_path: &Path) -> PathBuf {
-    build_path.join(OUTPUT_DIR)
 }
 
 fn theme_source(
@@ -1889,7 +1834,7 @@ fn prepare_theme_for_zola(
 ) -> Result<(ThemeSource, Option<LocalThemeServeSync>), Whatever> {
     match theme {
         ThemeSource::Local { path } => {
-            let mounted_theme_dir = zola::mounted_theme_path(repo_path);
+            let mounted_theme_dir = mounted_theme_path(repo_path);
             git::materialize_working_tree(&path, &mounted_theme_dir)
                 .whatever_context("unable to materialize workspace-local theme")?;
             let theme_index_path = git::index_path(&path)
@@ -2297,10 +2242,14 @@ mod tests {
         resolve_execution, resolve_execution_settings, resolve_server_binding, serve_sync_config,
         validate_non_execution_command_flags, Args, EditorialCommand, EditorialSelectorArgs,
         ExecutionSettings, LocalThemeServeSync, Operation, ProfiledOperation, ResolvedExecution,
-        RuntimeOperation, SelectedSource, ServerCliArgs, ThemeSource, WorkspaceCommand,
-        WorkspaceInitRepositories, REPO_DIR,
+        RuntimeOperation, SelectedSource, ServerCliArgs, WorkspaceCommand,
+        WorkspaceInitRepositories,
     };
-    use crate::config::{self, LoadedWorkspaceConfig, ServerBinding};
+    use crate::{
+        config::{self, LoadedWorkspaceConfig, ServerBinding},
+        layout::{mounted_theme_path, theme_config_path, BUILD_DIR, REPO_DIR},
+        theme::ThemeSource,
+    };
 
     fn parse_args(arguments: &[&str]) -> Args {
         Args::try_parse_from(arguments).unwrap()
@@ -2974,10 +2923,10 @@ base_url = "http://localhost:4000"
         )
         .unwrap();
 
-        let mounted_theme_dir = crate::zola::mounted_theme_path(&repo_path);
+        let mounted_theme_dir = mounted_theme_path(&repo_path);
         assert!(matches!(theme, ThemeSource::Local { path } if path == mounted_theme_dir));
         assert_eq!(
-            crate::zola::theme_config_path(&mounted_theme_dir),
+            theme_config_path(&mounted_theme_dir),
             repo_path.join("themes/eips-theme/config/zola.toml")
         );
         assert_eq!(
@@ -3624,7 +3573,7 @@ base_url = "http://localhost:4000"
 
         let resolved = resolve_execution(&args).unwrap();
 
-        assert_eq!(resolved.build_path, active_path.join(super::BUILD_DIR));
+        assert_eq!(resolved.build_path, active_path.join(BUILD_DIR));
     }
 
     #[test]

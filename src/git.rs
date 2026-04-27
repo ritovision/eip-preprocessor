@@ -13,6 +13,7 @@ use std::{
 use crate::{
     cache::Cache,
     config::{LegacyLocations, RepositoryEndpoint},
+    layout::{BUILD_DIR, CONTENT_DIR},
     progress::{Git, ProgressIteratorExt},
 };
 use git2::{
@@ -164,7 +165,7 @@ pub fn clone_missing_repo(url: &str, destination: &Path) -> Result<(), Error> {
 fn is_generated_path(path: &Path) -> bool {
     path.components()
         .next()
-        .map(|component| component.as_os_str() == OsStr::new(super::BUILD_DIR))
+        .map(|component| component.as_os_str() == OsStr::new(BUILD_DIR))
         .unwrap_or(false)
 }
 
@@ -961,12 +962,10 @@ impl SourceWithUpstream {
             })?;
 
             let mut tree_builder = TreeUpdateBuilder::new();
-            let prefix = format!("{}/", super::CONTENT_DIR);
+            let prefix = format!("{}/", CONTENT_DIR);
             let mut walk_error: Option<Error> = None;
             let walk_result = other_tree.walk(git2::TreeWalkMode::PreOrder, |a, b| {
-                if !a.starts_with(&prefix)
-                    && (!a.is_empty() || b.name() != Some(super::CONTENT_DIR))
-                {
+                if !a.starts_with(&prefix) && (!a.is_empty() || b.name() != Some(CONTENT_DIR)) {
                     return TreeWalkResult::Skip;
                 }
 

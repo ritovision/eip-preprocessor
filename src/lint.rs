@@ -11,8 +11,7 @@ use clap::ValueEnum;
 use log::debug;
 use semver::{Comparator, Op, VersionReq};
 
-use crate::progress::ProgressIteratorExt;
-use crate::{cache::Cache, ThemeSource};
+use crate::{cache::Cache, progress::ProgressIteratorExt, theme::ThemeSource};
 
 use eipw_lint::reporters::{AdditionalHelp, Count, Json, Reporter, Text};
 use eipw_lint::Linter;

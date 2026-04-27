@@ -15,7 +15,13 @@ use semver::Version;
 use snafu::{ensure, Backtrace, IntoError, Report, ResultExt, Snafu};
 use url::Url;
 
-use crate::{cache::Cache, config::ServerBinding, git, ThemeSource};
+use crate::{
+    cache::Cache,
+    config::ServerBinding,
+    git,
+    layout::{mounted_theme_path, theme_config_path},
+    theme::ThemeSource,
+};
 
 const MINIMUM_VERSION: Version = Version::new(0, 22, 1);
 
@@ -48,16 +54,6 @@ fn force_symlink_dir(original: &Path, link: &Path) -> Result<(), std::io::Error>
     }
 
     symlink_dir(original, link)
-}
-
-pub(crate) fn mounted_theme_path(project_path: &Path) -> PathBuf {
-    project_path.join("themes").join("eips-theme")
-}
-
-pub(crate) fn theme_config_path(theme_path: &Path) -> PathBuf {
-    [theme_path, Path::new("config"), Path::new("zola.toml")]
-        .iter()
-        .collect()
 }
 
 fn mount_theme(theme_dir: &Path, project_path: &Path) -> Result<PathBuf, std::io::Error> {
@@ -130,10 +126,13 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use crate::config::ServerBinding;
+    use crate::{
+        config::ServerBinding,
+        layout::{mounted_theme_path, theme_config_path},
+    };
     use tempfile::TempDir;
 
-    use super::{mount_theme, mounted_theme_path, serve_args, theme_config_path};
+    use super::{mount_theme, serve_args};
 
     #[test]
     fn serve_args_include_configured_interface_and_port() {
