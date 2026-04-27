@@ -17,6 +17,7 @@ mod identity;
 mod layout;
 mod lint;
 mod markdown;
+mod pipeline;
 mod preview;
 mod print;
 mod progress;
@@ -32,17 +33,14 @@ use clap::Parser;
 use fslock::LockFile;
 use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
-use url::Url;
 
 use crate::{
     cli::{Args, EditorialCommand, Operation, RuntimeOperation, WorkspaceCommand},
-    config::ServerBinding,
     editorial::{editorial_runtime_execution, run_editorial_lint},
-    execution::{resolve_execution, validate_non_execution_command_flags, ResolvedExecution},
-    layout::{mounted_theme_path, output_path, CONTENT_DIR, REPO_DIR},
+    execution::{resolve_execution, validate_non_execution_command_flags},
+    layout::{output_path, REPO_DIR},
+    pipeline::Prepared,
     proposal::is_proposal_path,
-    serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
-    theme::ThemeSource,
     workspace::{doctor_workspace, init_workspace},
 };
 
@@ -70,155 +68,6 @@ fn make_build_dir(build_path: &Path) -> Result<PathBuf, Whatever> {
         );
     }
     Ok(build_path.to_path_buf())
-}
-
-fn prepare_theme_for_zola(
-    theme: ThemeSource,
-    repo_path: &Path,
-) -> Result<(ThemeSource, Option<LocalThemeServeSync>), Whatever> {
-    match theme {
-        ThemeSource::Local { path } => {
-            let mounted_theme_dir = mounted_theme_path(repo_path);
-            git::materialize_working_tree(&path, &mounted_theme_dir)
-                .whatever_context("unable to materialize workspace-local theme")?;
-            let theme_index_path = git::index_path(&path)
-                .whatever_context("unable to resolve workspace-local theme Git index path")?;
-
-            Ok((
-                ThemeSource::Local {
-                    path: mounted_theme_dir.clone(),
-                },
-                Some(LocalThemeServeSync {
-                    theme_source_root: path,
-                    mounted_theme_dir,
-                    theme_index_path,
-                }),
-            ))
-        }
-        ThemeSource::Remote { .. } => Ok((theme, None)),
-    }
-}
-
-#[derive(Debug)]
-struct Prepared {
-    cache: cache::Cache,
-    repo_path: PathBuf,
-    output_path: PathBuf,
-    repository_use: git::RepositoryUse,
-    theme: ThemeSource,
-    local_theme_sync: Option<LocalThemeServeSync>,
-    source_root: PathBuf,
-    source_materialization: git::SourceMaterialization,
-    server_binding: ServerBinding,
-    base_url_override: Option<Url>,
-}
-
-impl Prepared {
-    fn prepare(resolved: ResolvedExecution) -> Result<Self, Whatever> {
-        zola::find_zola().whatever_context("unable to find suitable zola binary")?;
-
-        let ResolvedExecution {
-            root_path,
-            build_path,
-            repository_use,
-            theme,
-            source_materialization,
-            server_binding,
-            base_url_override,
-        } = resolved;
-
-        let repo_path = build_path.join(REPO_DIR);
-        let content_path = repo_path.join(CONTENT_DIR);
-        let output_path = output_path(&build_path);
-
-        let both = git::Fresh::new(
-            &root_path,
-            &repo_path,
-            repository_use.clone(),
-            source_materialization,
-        )
-        .whatever_context("initializing build repo")?
-        .clone_src()
-        .whatever_context("cloning source repo")?
-        .fetch_upstream()
-        .whatever_context("fetching upstream repo")?;
-
-        both.merge()
-            .whatever_context("unable to merge ERC/EIP repositories")?;
-
-        let cache = cache::Cache::open().whatever_context("unable to open cache")?;
-
-        markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
-        let (theme, local_theme_sync) = prepare_theme_for_zola(theme, &repo_path)?;
-
-        Ok(Prepared {
-            repository_use,
-            theme,
-            local_theme_sync,
-            cache,
-            repo_path,
-            output_path,
-            source_root: root_path,
-            source_materialization,
-            server_binding,
-            base_url_override,
-        })
-    }
-
-    fn build(self) -> Result<(), Whatever> {
-        let base_url = self
-            .base_url_override
-            .as_ref()
-            .unwrap_or(&self.repository_use.location.base_url);
-        zola::build(
-            &self.theme,
-            &self.cache,
-            &self.repo_path,
-            &self.output_path,
-            base_url.as_str(),
-        )
-        .whatever_context("zola build failed")?;
-        Ok(())
-    }
-
-    fn serve(self) -> Result<(), Whatever> {
-        let sync_config = serve_sync_config(
-            self.source_materialization,
-            &self.source_root,
-            &self.repo_path,
-            self.local_theme_sync.clone(),
-        );
-        let dirty_watcher = if sync_config.has_targets() {
-            Some(
-                DirtyServeWatcher::start(sync_config)
-                    .whatever_context("unable to start dirty serve watcher")?,
-            )
-        } else {
-            None
-        };
-
-        let result = zola::serve(
-            &self.theme,
-            &self.cache,
-            &self.repo_path,
-            &self.output_path,
-            &self.server_binding,
-            self.base_url_override.as_ref(),
-        )
-        .whatever_context("zola serve failed");
-
-        if let Some(dirty_watcher) = dirty_watcher {
-            dirty_watcher.stop();
-        }
-
-        result
-    }
-
-    fn check(self) -> Result<(), Whatever> {
-        zola::check(&self.theme, &self.cache, &self.repo_path)
-            .whatever_context("zola check failed")?;
-        Ok(())
-    }
 }
 
 fn run() -> Result<(), Whatever> {
@@ -333,7 +182,6 @@ mod tests {
     use tempfile::TempDir;
     use url::Url;
 
-    use super::prepare_theme_for_zola;
     use crate::{
         cli::{
             Args, EditorialCommand, EditorialSelectorArgs, Operation, ProfiledOperation,
@@ -348,6 +196,7 @@ mod tests {
             SelectedSource,
         },
         layout::{mounted_theme_path, theme_config_path, BUILD_DIR, REPO_DIR},
+        pipeline::prepare_theme_for_zola,
         serve::{event_has_theme_index_path, serve_sync_config, LocalThemeServeSync},
         theme::ThemeSource,
         workspace::{
