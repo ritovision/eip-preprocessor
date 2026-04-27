@@ -11,6 +11,7 @@ mod context;
 mod find_root;
 mod git;
 mod github;
+mod identity;
 mod layout;
 mod lint;
 mod markdown;
@@ -41,6 +42,7 @@ use crate::{
     },
     config::{Config, LoadedRepoManifest, LoadedWorkspaceConfig, ServerBinding},
     context::{load_workspace_command_context, resolve_input_path, root},
+    identity::ActiveRepoIdentity,
     layout::{mounted_theme_path, output_path, BUILD_DIR, CONTENT_DIR, REPO_DIR},
     serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
     theme::ThemeSource,
@@ -94,98 +96,6 @@ struct WorkspaceInitRepositories<'a> {
     template: &'a Url,
     preprocessor: &'a Url,
     eipw: &'a Url,
-}
-
-#[derive(Debug, Clone)]
-enum ActiveRepoIdentity {
-    Manifest(Box<LoadedRepoManifest>),
-    Legacy { repo_id: String },
-}
-
-impl ActiveRepoIdentity {
-    fn load(root_path: &Path) -> Result<Self, Whatever> {
-        if let Some(manifest) =
-            LoadedRepoManifest::load(root_path).whatever_context("unable to load repo manifest")?
-        {
-            return Ok(Self::Manifest(Box::new(manifest)));
-        }
-
-        match Config::production()
-            .locations
-            .identify_repository_title(root_path)
-        {
-            Ok(repo_id) => Ok(Self::Legacy { repo_id }),
-            Err(git::Error::NoIdentify { .. }) => {
-                snafu::whatever!(
-                    "active repository `{}` does not carry `{}` and does not match the legacy EIPs/ERCs identity fallback",
-                    root_path.to_string_lossy(),
-                    config::REPO_MANIFEST_FILE
-                )
-            }
-            Err(error) => Err(error).whatever_context("cannot identify legacy repository use"),
-        }
-    }
-
-    fn repo_id(&self) -> &str {
-        match self {
-            Self::Manifest(manifest) => &manifest.manifest().repo_id,
-            Self::Legacy { repo_id } => repo_id,
-        }
-    }
-
-    fn source_description(&self) -> &'static str {
-        match self {
-            Self::Manifest(_) => "repo manifest",
-            Self::Legacy { .. } => "legacy EIPs/ERCs fallback",
-        }
-    }
-
-    fn manifest(&self) -> Option<&LoadedRepoManifest> {
-        match self {
-            Self::Manifest(manifest) => Some(manifest.as_ref()),
-            Self::Legacy { .. } => None,
-        }
-    }
-
-    fn sibling_ids(&self) -> Vec<String> {
-        match self {
-            Self::Manifest(manifest) => manifest.manifest().siblings.keys().cloned().collect(),
-            Self::Legacy { repo_id } => Config::production()
-                .locations
-                .repository_use_for_title(repo_id)
-                .expect("legacy repository id should have metadata")
-                .other_repos
-                .keys()
-                .cloned()
-                .collect(),
-        }
-    }
-
-    fn repository_use(&self, staging: bool) -> Result<git::RepositoryUse, Whatever> {
-        match self {
-            Self::Manifest(manifest) => {
-                let manifest = manifest.manifest();
-                Ok(git::RepositoryUse {
-                    title: manifest.repo_id.clone(),
-                    location: manifest.active_endpoint(staging),
-                    other_repos: manifest.sibling_repositories(staging),
-                })
-            }
-            Self::Legacy { repo_id } => {
-                let baseline = if staging {
-                    Config::staging()
-                } else {
-                    Config::production()
-                };
-                baseline
-                    .locations
-                    .repository_use_for_title(repo_id)
-                    .with_whatever_context(|| {
-                        format!("legacy repository metadata for `{repo_id}` is unavailable")
-                    })
-            }
-        }
-    }
 }
 
 impl fmt::Display for DoctorStatus {
