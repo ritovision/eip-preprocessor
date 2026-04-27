@@ -219,7 +219,8 @@ fn format_dirty_rejection(tracked_paths: &BTreeSet<PathBuf>, untracked_count: us
 }
 
 pub fn check_dirty(root_path: &Path) -> Result<(), Error> {
-    let (tracked_paths, untracked_count) = collect_dirty_paths(root_path)?;
+    let (tracked_paths, untracked_count) =
+        collect_dirty_paths(root_path, |path| !is_generated_path(path))?;
 
     if tracked_paths.is_empty() && untracked_count == 0 {
         Ok(())
@@ -244,7 +245,10 @@ fn entry_path(entry: &git2::StatusEntry<'_>) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn collect_dirty_paths(root_path: &Path) -> Result<(BTreeSet<PathBuf>, usize), Error> {
+fn collect_dirty_paths(
+    root_path: &Path,
+    include_path: impl Fn(&Path) -> bool,
+) -> Result<(BTreeSet<PathBuf>, usize), Error> {
     let repo = git2::Repository::open(root_path).context(GitSnafu {
         what: "open root repository",
     })?;
@@ -265,47 +269,31 @@ fn collect_dirty_paths(root_path: &Path) -> Result<(BTreeSet<PathBuf>, usize), E
         }
 
         if status == Status::WT_NEW {
-            if !is_generated_path(&path) {
+            if include_path(&path) {
                 untracked_count += 1;
             }
             continue;
         }
 
         if let Some(delta) = entry.head_to_index() {
-            if let Some(old_path) = delta
-                .old_file()
-                .path()
-                .filter(|path| !is_generated_path(path))
-            {
+            if let Some(old_path) = delta.old_file().path().filter(|path| include_path(path)) {
                 paths.insert(old_path.to_path_buf());
             }
-            if let Some(new_path) = delta
-                .new_file()
-                .path()
-                .filter(|path| !is_generated_path(path))
-            {
+            if let Some(new_path) = delta.new_file().path().filter(|path| include_path(path)) {
                 paths.insert(new_path.to_path_buf());
             }
         }
 
         if let Some(delta) = entry.index_to_workdir() {
-            if let Some(old_path) = delta
-                .old_file()
-                .path()
-                .filter(|path| !is_generated_path(path))
-            {
+            if let Some(old_path) = delta.old_file().path().filter(|path| include_path(path)) {
                 paths.insert(old_path.to_path_buf());
             }
-            if let Some(new_path) = delta
-                .new_file()
-                .path()
-                .filter(|path| !is_generated_path(path))
-            {
+            if let Some(new_path) = delta.new_file().path().filter(|path| include_path(path)) {
                 paths.insert(new_path.to_path_buf());
             }
         }
 
-        if !is_generated_path(&path) {
+        if include_path(&path) {
             paths.insert(path);
         }
     }
@@ -314,8 +302,53 @@ fn collect_dirty_paths(root_path: &Path) -> Result<(BTreeSet<PathBuf>, usize), E
 }
 
 pub fn working_tree_paths(root_path: &Path) -> Result<Vec<PathBuf>, Error> {
-    let (paths, _) = collect_dirty_paths(root_path)?;
+    let (paths, _) = collect_dirty_paths(root_path, |path| !is_generated_path(path))?;
     Ok(paths.into_iter().collect())
+}
+
+pub fn tracked_working_tree_paths(root_path: &Path) -> Result<Vec<PathBuf>, Error> {
+    let (paths, _) = collect_dirty_paths(root_path, |_| true)?;
+    Ok(paths.into_iter().collect())
+}
+
+pub fn materialize_working_tree(source_root: &Path, destination_root: &Path) -> Result<(), Error> {
+    remove_existing_path(destination_root).context(IoSnafu {
+        path: destination_root.to_path_buf(),
+    })?;
+    std::fs::create_dir_all(destination_root).context(IoSnafu {
+        path: destination_root.to_path_buf(),
+    })?;
+
+    let mut paths = tracked_paths(source_root, |_| true)?;
+    paths.extend(tracked_working_tree_paths(source_root)?);
+    sync_working_tree_paths(source_root, destination_root, &paths)
+}
+
+pub fn sync_working_tree_paths(
+    source_root: &Path,
+    destination_root: &Path,
+    relative_paths: &BTreeSet<PathBuf>,
+) -> Result<(), Error> {
+    for path in relative_paths {
+        sync_working_tree_path(source_root, destination_root, path)?;
+    }
+
+    Ok(())
+}
+
+pub fn index_path(root_path: &Path) -> Result<PathBuf, Error> {
+    let repo = git2::Repository::open(root_path).context(GitSnafu {
+        what: "open root repository",
+    })?;
+    let index = repo.index().context(GitSnafu {
+        what: "open root repository index",
+    })?;
+    index
+        .path()
+        .map(Path::to_path_buf)
+        .context(UpdateTreeSnafu::<String> {
+            msg: "repository index is in-memory".into(),
+        })
 }
 
 pub fn sync_materialized_paths(
@@ -357,6 +390,65 @@ fn remove_existing_path(path: &Path) -> Result<(), std::io::Error> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn tracked_paths(
+    root_path: &Path,
+    include_path: impl Fn(&Path) -> bool,
+) -> Result<BTreeSet<PathBuf>, Error> {
+    let repo = git2::Repository::open(root_path).context(GitSnafu {
+        what: "open root repository",
+    })?;
+    let head = repo.head().context(GitSnafu { what: "head" })?;
+    let commit = head.peel_to_commit().context(GitSnafu {
+        what: "peel head to commit",
+    })?;
+    let tree = commit.tree().context(GitSnafu { what: "head tree" })?;
+    let mut paths = BTreeSet::new();
+    let mut walk_error = None;
+
+    let walk_result = tree.walk(git2::TreeWalkMode::PreOrder, |prefix, entry| {
+        let Some(name) = entry.name() else {
+            walk_error = Some(
+                UpdateTreeSnafu {
+                    msg: format!("tree entry without name in `{prefix}`"),
+                }
+                .build(),
+            );
+            return TreeWalkResult::Abort;
+        };
+
+        match entry.kind() {
+            Some(ObjectType::Blob) => (),
+            Some(ObjectType::Tree) => return TreeWalkResult::Ok,
+            kind => {
+                walk_error = Some(
+                    UpdateTreeSnafu {
+                        msg: format!("unknown blob type `{kind:?}` for `{}{name}`", prefix),
+                    }
+                    .build(),
+                );
+                return TreeWalkResult::Abort;
+            }
+        }
+
+        let path = PathBuf::from(format!("{prefix}{name}"));
+        if include_path(&path) {
+            paths.insert(path);
+        }
+
+        TreeWalkResult::Ok
+    });
+
+    if let Some(error) = walk_error {
+        return Err(error);
+    }
+
+    walk_result.context(GitSnafu {
+        what: "traverse tree",
+    })?;
+
+    Ok(paths)
 }
 
 fn remove_index_path(index: &mut git2::Index, path: &Path) -> Result<(), Error> {
@@ -468,12 +560,63 @@ fn sync_dirty_path(
     }
 }
 
+fn sync_working_tree_path(
+    source_root: &Path,
+    destination_root: &Path,
+    relative_path: &Path,
+) -> Result<(), Error> {
+    let source_path = source_root.join(relative_path);
+    let destination_path = destination_root.join(relative_path);
+
+    match std::fs::symlink_metadata(&source_path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            remove_existing_path(&destination_path).context(IoSnafu {
+                path: destination_path.clone(),
+            })
+        }
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent).context(IoSnafu {
+                    path: parent.to_path_buf(),
+                })?;
+            }
+
+            remove_existing_path(&destination_path).context(IoSnafu {
+                path: destination_path.clone(),
+            })?;
+
+            if metadata.file_type().is_symlink() {
+                copy_symlink(&source_path, &destination_path).context(IoSnafu {
+                    path: destination_path.clone(),
+                })?;
+            } else {
+                std::fs::copy(&source_path, &destination_path).context(IoSnafu {
+                    path: source_path.clone(),
+                })?;
+            }
+
+            Ok(())
+        }
+        Ok(_) => DirtyUnsupportedPathSnafu {
+            path: relative_path.to_path_buf(),
+        }
+        .fail(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_existing_path(&destination_path).context(IoSnafu {
+                path: destination_path,
+            })
+        }
+        Err(error) => Err(IoSnafu { path: source_path }.into_error(error)),
+    }
+}
+
 fn materialize_dirty_tree(
     source_root: &Path,
     working_repo: &git2::Repository,
     local_head: Oid,
 ) -> Result<Oid, Error> {
-    let (dirty_paths, untracked_count) = collect_dirty_paths(source_root)?;
+    let (dirty_paths, untracked_count) =
+        collect_dirty_paths(source_root, |path| !is_generated_path(path))?;
     if untracked_count > 0 {
         info!("dirty mode ignores untracked files in the active content repo");
     }
@@ -1021,5 +1164,196 @@ impl Cache {
         })?;
 
         Ok(dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use git2::{IndexAddOption, Repository, Signature};
+    use tempfile::TempDir;
+
+    use super::{materialize_working_tree, sync_working_tree_paths, tracked_working_tree_paths};
+
+    fn write_file(root: &Path, relative: impl AsRef<Path>, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn commit_all(repo: &Repository, message: &str) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
+    fn init_repo(path: &Path, files: &[(&str, &str)]) -> Repository {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = Repository::init(path).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        for (relative, contents) in files {
+            write_file(path, relative, contents);
+        }
+        commit_all(&repo, "initial");
+        repo
+    }
+
+    fn stage_path(repo: &Repository, relative: &str) {
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(relative)).unwrap();
+        index.write().unwrap();
+    }
+
+    #[test]
+    fn materialize_working_tree_uses_tracked_theme_scope() {
+        let temp = TempDir::new().unwrap();
+        let theme = temp.path().join("theme");
+        let mounted = temp.path().join("repo/themes/eips-theme");
+        let repo = init_repo(
+            &theme,
+            &[
+                ("config/zola.toml", "title = 'theme'\n"),
+                ("build/generated.txt", "tracked build path\n"),
+                ("delete.txt", "delete me\n"),
+                ("staged.txt", "old staged\n"),
+                ("tracked.txt", "old tracked\n"),
+            ],
+        );
+
+        write_file(&theme, "tracked.txt", "unstaged tracked edit\n");
+        write_file(&theme, "staged.txt", "staged tracked edit\n");
+        stage_path(&repo, "staged.txt");
+        write_file(&theme, "new-staged.txt", "new staged file\n");
+        stage_path(&repo, "new-staged.txt");
+        std::fs::remove_file(theme.join("delete.txt")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("delete.txt")).unwrap();
+        index.write().unwrap();
+        write_file(
+            &theme,
+            "untracked.txt",
+            "ignored by theme materialization\n",
+        );
+
+        materialize_working_tree(&theme, &mounted).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("config/zola.toml")).unwrap(),
+            "title = 'theme'\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("build/generated.txt")).unwrap(),
+            "tracked build path\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("tracked.txt")).unwrap(),
+            "unstaged tracked edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("staged.txt")).unwrap(),
+            "staged tracked edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("new-staged.txt")).unwrap(),
+            "new staged file\n"
+        );
+        assert!(!mounted.join("delete.txt").exists());
+        assert!(!mounted.join("untracked.txt").exists());
+    }
+
+    #[test]
+    fn newly_staged_theme_file_syncs_after_git_index_rescan() {
+        let temp = TempDir::new().unwrap();
+        let theme = temp.path().join("theme");
+        let mounted = temp.path().join("repo/themes/eips-theme");
+        let repo = init_repo(&theme, &[("config/zola.toml", "title = 'theme'\n")]);
+        materialize_working_tree(&theme, &mounted).unwrap();
+        let mut previous_dirty_paths = tracked_working_tree_paths(&theme)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        write_file(&theme, "templates/new.html", "new staged template\n");
+        stage_path(&repo, "templates/new.html");
+        let current_dirty_paths = tracked_working_tree_paths(&theme)
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let affected_paths = previous_dirty_paths
+            .union(&current_dirty_paths)
+            .cloned()
+            .collect();
+
+        sync_working_tree_paths(&theme, &mounted, &affected_paths).unwrap();
+        previous_dirty_paths = current_dirty_paths;
+
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("templates/new.html")).unwrap(),
+            "new staged template\n"
+        );
+        assert!(previous_dirty_paths.contains(Path::new("templates/new.html")));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn tracked_theme_symlinks_are_materialized_as_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let theme = temp.path().join("theme");
+        let mounted = temp.path().join("repo/themes/eips-theme");
+        std::fs::create_dir_all(&theme).unwrap();
+        let repo = Repository::init(&theme).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        write_file(&theme, "target.txt", "target\n");
+        std::os::unix::fs::symlink("target.txt", theme.join("linked.txt")).unwrap();
+        commit_all(&repo, "initial");
+
+        materialize_working_tree(&theme, &mounted).unwrap();
+
+        assert!(std::fs::symlink_metadata(mounted.join("linked.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(mounted.join("linked.txt")).unwrap(),
+            PathBuf::from("target.txt")
+        );
+    }
+
+    #[test]
+    fn materialize_working_tree_requires_git_repository() {
+        let temp = TempDir::new().unwrap();
+        let theme = temp.path().join("theme");
+        let mounted = temp.path().join("repo/themes/eips-theme");
+        std::fs::create_dir_all(&theme).unwrap();
+
+        let error = materialize_working_tree(&theme, &mounted).unwrap_err();
+
+        assert!(error.to_string().contains("unable to open root repository"));
     }
 }

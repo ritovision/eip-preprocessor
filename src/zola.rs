@@ -38,13 +38,39 @@ fn symlink_dir(original: &Path, link: &Path) -> Result<(), std::io::Error> {
 }
 
 fn force_symlink_dir(original: &Path, link: &Path) -> Result<(), std::io::Error> {
-    match std::fs::remove_file(link) {
-        Ok(()) => (),
+    match std::fs::symlink_metadata(link) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(link)?;
+        }
+        Ok(_) => std::fs::remove_file(link)?,
         Err(e) if e.kind() == ErrorKind::NotFound => (),
         Err(e) => return Err(e),
     }
 
     symlink_dir(original, link)
+}
+
+pub(crate) fn mounted_theme_path(project_path: &Path) -> PathBuf {
+    project_path.join("themes").join("eips-theme")
+}
+
+pub(crate) fn theme_config_path(theme_path: &Path) -> PathBuf {
+    [theme_path, Path::new("config"), Path::new("zola.toml")]
+        .iter()
+        .collect()
+}
+
+fn mount_theme(theme_dir: &Path, project_path: &Path) -> Result<PathBuf, std::io::Error> {
+    let mounted_theme_path = mounted_theme_path(project_path);
+    if theme_dir == mounted_theme_path {
+        return Ok(mounted_theme_path);
+    }
+
+    if let Some(parent) = mounted_theme_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    force_symlink_dir(theme_dir, &mounted_theme_path)?;
+    Ok(mounted_theme_path)
 }
 
 #[derive(Debug, Snafu)]
@@ -98,11 +124,16 @@ pub fn find_zola() -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::Path};
+    use std::{
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use crate::config::ServerBinding;
+    use tempfile::TempDir;
 
-    use super::serve_args;
+    use super::{mount_theme, mounted_theme_path, serve_args, theme_config_path};
 
     #[test]
     fn serve_args_include_configured_interface_and_port() {
@@ -157,6 +188,65 @@ mod tests {
                 OsString::from("-o"),
                 OsString::from("/tmp/build-output"),
             ]
+        );
+    }
+
+    #[test]
+    fn mounted_theme_paths_are_under_project_themes_directory() {
+        let project_path = PathBuf::from("/tmp/project");
+        let mounted_theme = mounted_theme_path(&project_path);
+
+        assert_eq!(
+            mounted_theme,
+            PathBuf::from("/tmp/project/themes/eips-theme")
+        );
+        assert_eq!(
+            theme_config_path(&mounted_theme),
+            PathBuf::from("/tmp/project/themes/eips-theme/config/zola.toml")
+        );
+    }
+
+    #[test]
+    fn mount_theme_does_not_symlink_mounted_local_theme_onto_itself() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path().join("repo");
+        let mounted_theme = mounted_theme_path(&project_path);
+        fs::create_dir_all(mounted_theme.join("config")).unwrap();
+        fs::write(mounted_theme.join("config/zola.toml"), "title = 'local'\n").unwrap();
+
+        let result = mount_theme(&mounted_theme, &project_path).unwrap();
+
+        assert_eq!(result, mounted_theme);
+        assert!(mounted_theme.join("config/zola.toml").is_file());
+        assert!(!fs::symlink_metadata(&mounted_theme)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn remote_theme_mount_replaces_prior_real_mounted_theme_directory() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path().join("repo");
+        let remote_theme = temp.path().join("remote-theme");
+        fs::create_dir_all(remote_theme.join("config")).unwrap();
+        fs::write(remote_theme.join("config/zola.toml"), "title = 'remote'\n").unwrap();
+
+        let mounted_theme = mounted_theme_path(&project_path);
+        fs::create_dir_all(&mounted_theme).unwrap();
+        fs::write(mounted_theme.join("stale.txt"), "stale").unwrap();
+
+        let result = mount_theme(&remote_theme, &project_path).unwrap();
+
+        assert_eq!(result, mounted_theme);
+        assert!(fs::symlink_metadata(&mounted_theme)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(theme_config_path(&mounted_theme)).unwrap(),
+            "title = 'remote'\n"
         );
     }
 }
@@ -264,16 +354,9 @@ where
         ThemeSource::Local { path } => path.to_path_buf(),
     };
 
-    let mut themes_dir = project_path.join("themes");
-    if let Err(e) = std::fs::create_dir(&themes_dir) {
-        debug!("got while creating themes dir: {}", Report::from_error(e));
-    }
-    themes_dir.push("eips-theme");
-    force_symlink_dir(&theme_dir, &themes_dir).context(FsSnafu { path: &themes_dir })?;
-
-    let config_path: PathBuf = [&theme_dir, Path::new("config"), Path::new("zola.toml")]
-        .iter()
-        .collect();
+    let mounted_theme_path =
+        mount_theme(&theme_dir, project_path).context(FsSnafu { path: &theme_dir })?;
+    let config_path = theme_config_path(&mounted_theme_path);
 
     let prefix = [OsString::from("-c"), config_path.into()].into_iter();
     let args = prefix.chain(args.into_iter().map(Into::into));

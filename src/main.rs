@@ -1509,14 +1509,38 @@ struct DirtyServeWatcher {
     thread: JoinHandle<()>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveRepoServeSync {
+    source_root: PathBuf,
+    build_repo_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct LocalThemeServeSync {
+    theme_source_root: PathBuf,
+    mounted_theme_dir: PathBuf,
+    theme_index_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ServeSyncConfig {
+    active_repo: Option<ActiveRepoServeSync>,
+    local_theme: Option<LocalThemeServeSync>,
+}
+
+impl ServeSyncConfig {
+    fn has_targets(&self) -> bool {
+        self.active_repo.is_some() || self.local_theme.is_some()
+    }
+}
+
 impl DirtyServeWatcher {
-    fn start(source_root: PathBuf, build_repo_path: PathBuf) -> Result<Self, Whatever> {
+    fn start(sync_config: ServeSyncConfig) -> Result<Self, Whatever> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
-        let thread = thread::spawn(move || {
-            dirty_serve_sync_loop(source_root, build_repo_path, stop_thread, ready_tx)
-        });
+        let thread =
+            thread::spawn(move || dirty_serve_sync_loop(sync_config, stop_thread, ready_tx));
 
         match ready_rx
             .recv()
@@ -1556,6 +1580,22 @@ fn event_has_watched_source_path(root_path: &Path, event: &Event) -> bool {
         .any(|path| path_is_watched_source_path(root_path, path))
 }
 
+fn index_lock_path(index_path: &Path) -> Option<PathBuf> {
+    let file_name = index_path.file_name()?.to_string_lossy();
+    Some(index_path.with_file_name(format!("{file_name}.lock")))
+}
+
+fn event_has_theme_index_path(index_path: &Path, event: &Event) -> bool {
+    let lock_path = index_lock_path(index_path);
+    event.paths.iter().any(|path| {
+        path == index_path
+            || lock_path
+                .as_ref()
+                .map(|lock_path| path == lock_path)
+                .unwrap_or(false)
+    })
+}
+
 fn sync_dirty_serve_state(
     source_root: &Path,
     build_repo_path: &Path,
@@ -1590,9 +1630,79 @@ fn sync_dirty_serve_state(
     Ok(())
 }
 
+fn sync_theme_serve_state(
+    theme_source_root: &Path,
+    mounted_theme_dir: &Path,
+    previous_dirty_paths: &mut BTreeSet<PathBuf>,
+) -> Result<(), Whatever> {
+    let current_dirty_paths: BTreeSet<_> = git::tracked_working_tree_paths(theme_source_root)
+        .whatever_context("unable to list tracked dirty paths for local theme serve")?
+        .into_iter()
+        .collect();
+
+    let affected_paths: BTreeSet<_> = previous_dirty_paths
+        .union(&current_dirty_paths)
+        .cloned()
+        .collect();
+
+    if affected_paths.is_empty() {
+        *previous_dirty_paths = current_dirty_paths;
+        return Ok(());
+    }
+
+    git::sync_working_tree_paths(theme_source_root, mounted_theme_dir, &affected_paths)
+        .whatever_context("unable to synchronize tracked local theme paths")?;
+
+    info!(
+        "synchronized {} tracked path(s) into the mounted local theme for serve",
+        affected_paths.len()
+    );
+
+    *previous_dirty_paths = current_dirty_paths;
+    Ok(())
+}
+
+fn watch_theme_index(
+    watcher: &mut notify::RecommendedWatcher,
+    theme_index_path: &Path,
+) -> Result<(), String> {
+    let file_result = watcher.watch(theme_index_path, RecursiveMode::NonRecursive);
+    let Some(parent) = theme_index_path.parent() else {
+        return file_result.map_err(|file_error| {
+            format!(
+                "unable to watch local theme Git index `{}`: {file_error}",
+                theme_index_path.to_string_lossy()
+            )
+        });
+    };
+    let parent_result = watcher.watch(parent, RecursiveMode::NonRecursive);
+
+    match (file_result, parent_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(parent_error)) => {
+            debug!(
+                "unable to watch local theme Git index parent `{}`: {parent_error}",
+                parent.to_string_lossy()
+            );
+            Ok(())
+        }
+        (Err(file_error), Ok(())) => {
+            debug!(
+                "using local theme Git index parent watch for `{}` after file watch failed: {file_error}",
+                theme_index_path.to_string_lossy()
+            );
+            Ok(())
+        }
+        (Err(file_error), Err(parent_error)) => Err(format!(
+            "unable to watch local theme Git index `{}`: {file_error}; fallback watch on `{}` also failed: {parent_error}",
+            theme_index_path.to_string_lossy(),
+            parent.to_string_lossy()
+        )),
+    }
+}
+
 fn dirty_serve_sync_loop(
-    source_root: PathBuf,
-    build_repo_path: PathBuf,
+    sync_config: ServeSyncConfig,
     stop: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<(), String>>,
 ) {
@@ -1607,29 +1717,85 @@ fn dirty_serve_sync_loop(
         }
     };
 
-    if let Err(error) = watcher.watch(&source_root, RecursiveMode::Recursive) {
-        let _ = ready_tx.send(Err(format!(
-            "unable to watch `{}` for dirty serve changes: {error}",
-            source_root.to_string_lossy()
-        )));
-        return;
-    }
-
-    let mut previous_dirty_paths: BTreeSet<_> = match git::working_tree_paths(&source_root) {
-        Ok(paths) => paths.into_iter().collect(),
-        Err(error) => {
+    if let Some(active_repo) = &sync_config.active_repo {
+        if let Err(error) = watcher.watch(&active_repo.source_root, RecursiveMode::Recursive) {
             let _ = ready_tx.send(Err(format!(
-                "unable to capture initial dirty serve state: {}",
-                Report::from_error(error)
+                "unable to watch `{}` for dirty serve changes: {error}",
+                active_repo.source_root.to_string_lossy()
             )));
             return;
         }
+    }
+
+    if let Some(local_theme) = &sync_config.local_theme {
+        if let Err(error) = watcher.watch(&local_theme.theme_source_root, RecursiveMode::Recursive)
+        {
+            let _ = ready_tx.send(Err(format!(
+                "unable to watch local theme `{}` for serve changes: {error}",
+                local_theme.theme_source_root.to_string_lossy()
+            )));
+            return;
+        }
+
+        if let Err(message) = watch_theme_index(&mut watcher, &local_theme.theme_index_path) {
+            let _ = ready_tx.send(Err(message));
+            return;
+        }
+    }
+
+    let mut previous_active_dirty_paths: BTreeSet<_> = match &sync_config.active_repo {
+        Some(active_repo) => match git::working_tree_paths(&active_repo.source_root) {
+            Ok(paths) => paths.into_iter().collect(),
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!(
+                    "unable to capture initial dirty serve state: {}",
+                    Report::from_error(error)
+                )));
+                return;
+            }
+        },
+        None => BTreeSet::new(),
     };
 
-    info!(
-        "watching `{}` for dirty serve changes",
-        source_root.to_string_lossy()
-    );
+    let mut previous_theme_dirty_paths: BTreeSet<_> = match &sync_config.local_theme {
+        Some(local_theme) => {
+            if let Err(error) = git::materialize_working_tree(
+                &local_theme.theme_source_root,
+                &local_theme.mounted_theme_dir,
+            ) {
+                let _ = ready_tx.send(Err(format!(
+                    "unable to synchronize initial local theme state after watcher setup: {}",
+                    Report::from_error(error)
+                )));
+                return;
+            }
+
+            match git::tracked_working_tree_paths(&local_theme.theme_source_root) {
+                Ok(paths) => paths.into_iter().collect(),
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "unable to capture initial local theme dirty state: {}",
+                        Report::from_error(error)
+                    )));
+                    return;
+                }
+            }
+        }
+        None => BTreeSet::new(),
+    };
+
+    if let Some(active_repo) = &sync_config.active_repo {
+        info!(
+            "watching `{}` for dirty serve changes",
+            active_repo.source_root.to_string_lossy()
+        );
+    }
+    if let Some(local_theme) = &sync_config.local_theme {
+        info!(
+            "watching `{}` for local theme serve changes",
+            local_theme.theme_source_root.to_string_lossy()
+        );
+    }
     let _ = ready_tx.send(Ok(()));
 
     while !stop.load(Ordering::Relaxed) {
@@ -1643,18 +1809,41 @@ fn dirty_serve_sync_loop(
             continue;
         };
 
-        let mut saw_relevant_event = match first_event {
-            Ok(event) => event_has_watched_source_path(&source_root, &event),
+        let mut saw_active_event = false;
+        let mut saw_theme_event = false;
+
+        match first_event {
+            Ok(event) => {
+                if let Some(active_repo) = &sync_config.active_repo {
+                    saw_active_event |=
+                        event_has_watched_source_path(&active_repo.source_root, &event);
+                }
+                if let Some(local_theme) = &sync_config.local_theme {
+                    saw_theme_event |=
+                        event_has_watched_source_path(&local_theme.theme_source_root, &event)
+                            || event_has_theme_index_path(&local_theme.theme_index_path, &event);
+                }
+            }
             Err(error) => {
                 warn!("filesystem watcher error: {error}");
-                false
             }
-        };
+        }
 
         loop {
             match event_rx.recv_timeout(Duration::from_millis(75)) {
                 Ok(Ok(event)) => {
-                    saw_relevant_event |= event_has_watched_source_path(&source_root, &event);
+                    if let Some(active_repo) = &sync_config.active_repo {
+                        saw_active_event |=
+                            event_has_watched_source_path(&active_repo.source_root, &event);
+                    }
+                    if let Some(local_theme) = &sync_config.local_theme {
+                        saw_theme_event |=
+                            event_has_watched_source_path(&local_theme.theme_source_root, &event)
+                                || event_has_theme_index_path(
+                                    &local_theme.theme_index_path,
+                                    &event,
+                                );
+                    }
                 }
                 Ok(Err(error)) => warn!("filesystem watcher error: {error}"),
                 Err(RecvTimeoutError::Timeout) => break,
@@ -1662,18 +1851,79 @@ fn dirty_serve_sync_loop(
             }
         }
 
-        if !saw_relevant_event {
-            continue;
+        if saw_active_event {
+            if let Some(active_repo) = &sync_config.active_repo {
+                if let Err(error) = sync_dirty_serve_state(
+                    &active_repo.source_root,
+                    &active_repo.build_repo_path,
+                    &mut previous_active_dirty_paths,
+                ) {
+                    warn!(
+                        "unable to synchronize dirty serve changes: {}",
+                        Report::from_error(error)
+                    );
+                }
+            }
         }
 
-        if let Err(error) =
-            sync_dirty_serve_state(&source_root, &build_repo_path, &mut previous_dirty_paths)
-        {
-            warn!(
-                "unable to synchronize dirty serve changes: {}",
-                Report::from_error(error)
-            );
+        if saw_theme_event {
+            if let Some(local_theme) = &sync_config.local_theme {
+                if let Err(error) = sync_theme_serve_state(
+                    &local_theme.theme_source_root,
+                    &local_theme.mounted_theme_dir,
+                    &mut previous_theme_dirty_paths,
+                ) {
+                    warn!(
+                        "unable to synchronize local theme serve changes: {}",
+                        Report::from_error(error)
+                    );
+                }
+            }
         }
+    }
+}
+
+fn prepare_theme_for_zola(
+    theme: ThemeSource,
+    repo_path: &Path,
+) -> Result<(ThemeSource, Option<LocalThemeServeSync>), Whatever> {
+    match theme {
+        ThemeSource::Local { path } => {
+            let mounted_theme_dir = zola::mounted_theme_path(repo_path);
+            git::materialize_working_tree(&path, &mounted_theme_dir)
+                .whatever_context("unable to materialize workspace-local theme")?;
+            let theme_index_path = git::index_path(&path)
+                .whatever_context("unable to resolve workspace-local theme Git index path")?;
+
+            Ok((
+                ThemeSource::Local {
+                    path: mounted_theme_dir.clone(),
+                },
+                Some(LocalThemeServeSync {
+                    theme_source_root: path,
+                    mounted_theme_dir,
+                    theme_index_path,
+                }),
+            ))
+        }
+        ThemeSource::Remote { .. } => Ok((theme, None)),
+    }
+}
+
+fn serve_sync_config(
+    source_materialization: git::SourceMaterialization,
+    source_root: &Path,
+    repo_path: &Path,
+    local_theme_sync: Option<LocalThemeServeSync>,
+) -> ServeSyncConfig {
+    ServeSyncConfig {
+        active_repo: (source_materialization == git::SourceMaterialization::Dirty).then(|| {
+            ActiveRepoServeSync {
+                source_root: source_root.to_path_buf(),
+                build_repo_path: repo_path.to_path_buf(),
+            }
+        }),
+        local_theme: local_theme_sync,
     }
 }
 
@@ -1684,6 +1934,7 @@ struct Prepared {
     output_path: PathBuf,
     repository_use: git::RepositoryUse,
     theme: ThemeSource,
+    local_theme_sync: Option<LocalThemeServeSync>,
     source_root: PathBuf,
     source_materialization: git::SourceMaterialization,
     server_binding: ServerBinding,
@@ -1726,10 +1977,12 @@ impl Prepared {
         let cache = cache::Cache::open().whatever_context("unable to open cache")?;
 
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
+        let (theme, local_theme_sync) = prepare_theme_for_zola(theme, &repo_path)?;
 
         Ok(Prepared {
             repository_use,
             theme,
+            local_theme_sync,
             cache,
             repo_path,
             output_path,
@@ -1757,9 +2010,15 @@ impl Prepared {
     }
 
     fn serve(self) -> Result<(), Whatever> {
-        let dirty_watcher = if self.source_materialization == git::SourceMaterialization::Dirty {
+        let sync_config = serve_sync_config(
+            self.source_materialization,
+            &self.source_root,
+            &self.repo_path,
+            self.local_theme_sync.clone(),
+        );
+        let dirty_watcher = if sync_config.has_targets() {
             Some(
-                DirtyServeWatcher::start(self.source_root.clone(), self.repo_path.clone())
+                DirtyServeWatcher::start(sync_config)
                     .whatever_context("unable to start dirty serve watcher")?,
             )
         } else {
@@ -2026,16 +2285,18 @@ mod tests {
 
     use clap::Parser;
     use git2::{IndexAddOption, Repository, Signature};
+    use notify::{Event, EventKind};
     use snafu::Report;
     use tempfile::TempDir;
     use url::Url;
 
     use super::{
         collect_doctor_report, editorial_runtime_execution, editorial_targets,
-        explicit_environment_or_parity, init_workspace_with_repositories,
-        resolve_base_url_override, resolve_execution, resolve_execution_settings,
-        resolve_server_binding, validate_non_execution_command_flags, Args, EditorialCommand,
-        EditorialSelectorArgs, ExecutionSettings, Operation, ProfiledOperation, ResolvedExecution,
+        event_has_theme_index_path, explicit_environment_or_parity,
+        init_workspace_with_repositories, prepare_theme_for_zola, resolve_base_url_override,
+        resolve_execution, resolve_execution_settings, resolve_server_binding, serve_sync_config,
+        validate_non_execution_command_flags, Args, EditorialCommand, EditorialSelectorArgs,
+        ExecutionSettings, LocalThemeServeSync, Operation, ProfiledOperation, ResolvedExecution,
         RuntimeOperation, SelectedSource, ServerCliArgs, ThemeSource, WorkspaceCommand,
         WorkspaceInitRepositories, REPO_DIR,
     };
@@ -2651,6 +2912,153 @@ base_url = "http://localhost:4000"
                 Some(&workspace_config),
                 expected.clone(),
             );
+        }
+    }
+
+    fn fake_theme_sync(root: &Path) -> LocalThemeServeSync {
+        LocalThemeServeSync {
+            theme_source_root: root.join("theme"),
+            mounted_theme_dir: root.join("repo/themes/eips-theme"),
+            theme_index_path: root.join("theme/.git/index"),
+        }
+    }
+
+    #[test]
+    fn local_theme_index_events_trigger_rescan() {
+        let index_path = PathBuf::from("/workspace/theme/.git/index");
+        let index_event = Event::new(EventKind::Any).add_path(index_path.clone());
+        let lock_event =
+            Event::new(EventKind::Any).add_path(PathBuf::from("/workspace/theme/.git/index.lock"));
+        let unrelated_event =
+            Event::new(EventKind::Any).add_path(PathBuf::from("/workspace/theme/.git/config"));
+
+        assert!(event_has_theme_index_path(&index_path, &index_event));
+        assert!(event_has_theme_index_path(&index_path, &lock_event));
+        assert!(!event_has_theme_index_path(&index_path, &unrelated_event));
+    }
+
+    #[test]
+    fn local_zola_runtime_commands_select_workspace_theme_for_materialization() {
+        let workspace_config = load_workspace_config("");
+
+        for arguments in [
+            &["build-eips", "build"][..],
+            &["build-eips", "check"][..],
+            &["build-eips", "serve"][..],
+            &["build-eips", "editorial", "build", "--against-upstream"][..],
+        ] {
+            let settings = settings_for(arguments, &["ERCs"], Some(&workspace_config));
+
+            assert_eq!(settings.theme, SelectedSource::WorkspaceLocal);
+        }
+    }
+
+    #[test]
+    fn workspace_local_theme_is_materialized_as_mounted_theme_for_zola() {
+        let temp = TempDir::new().unwrap();
+        let theme_root = temp.path().join("workspace/theme");
+        init_repo(
+            &theme_root,
+            &[
+                ("config/zola.toml", "title = 'theme'\n"),
+                ("templates/index.html", "local theme\n"),
+            ],
+        );
+        let repo_path = temp.path().join("workspace/.local-build/Core/repo");
+
+        let (theme, sync) = prepare_theme_for_zola(
+            ThemeSource::Local {
+                path: theme_root.clone(),
+            },
+            &repo_path,
+        )
+        .unwrap();
+
+        let mounted_theme_dir = crate::zola::mounted_theme_path(&repo_path);
+        assert!(matches!(theme, ThemeSource::Local { path } if path == mounted_theme_dir));
+        assert_eq!(
+            crate::zola::theme_config_path(&mounted_theme_dir),
+            repo_path.join("themes/eips-theme/config/zola.toml")
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted_theme_dir.join("templates/index.html")).unwrap(),
+            "local theme\n"
+        );
+        let sync = sync.expect("local theme should enable serve sync");
+        assert_eq!(sync.theme_source_root, theme_root);
+        assert_eq!(sync.mounted_theme_dir, mounted_theme_dir);
+        assert!(sync.theme_index_path.ends_with(".git/index"));
+    }
+
+    #[test]
+    fn local_serve_syncs_theme_and_dirty_active_repo() {
+        let temp = TempDir::new().unwrap();
+        let workspace_config = load_workspace_config("");
+        let settings = settings_for(&["build-eips", "serve"], &["ERCs"], Some(&workspace_config));
+        let source_materialization = if settings.allow_dirty {
+            crate::git::SourceMaterialization::Dirty
+        } else {
+            crate::git::SourceMaterialization::Clean
+        };
+
+        let sync_config = serve_sync_config(
+            source_materialization,
+            &temp.path().join("Core"),
+            &temp.path().join(".local-build/Core/repo"),
+            Some(fake_theme_sync(temp.path())),
+        );
+
+        assert!(sync_config.active_repo.is_some());
+        assert!(sync_config.local_theme.is_some());
+    }
+
+    #[test]
+    fn clean_local_serve_keeps_theme_sync_but_disables_active_repo_dirty_sync() {
+        let temp = TempDir::new().unwrap();
+        let workspace_config = load_workspace_config("");
+        let settings = settings_for(
+            &["build-eips", "serve", "--clean"],
+            &["ERCs"],
+            Some(&workspace_config),
+        );
+        let source_materialization = if settings.allow_dirty {
+            crate::git::SourceMaterialization::Dirty
+        } else {
+            crate::git::SourceMaterialization::Clean
+        };
+
+        let sync_config = serve_sync_config(
+            source_materialization,
+            &temp.path().join("Core"),
+            &temp.path().join(".local-build/Core/repo"),
+            Some(fake_theme_sync(temp.path())),
+        );
+
+        assert!(sync_config.active_repo.is_none());
+        assert!(sync_config.local_theme.is_some());
+    }
+
+    #[test]
+    fn remote_and_environment_serve_paths_do_not_enable_local_theme_sync() {
+        for arguments in [
+            &["build-eips", "--remote-theme", "serve"][..],
+            &["build-eips", "--staging", "serve"][..],
+            &["build-eips", "--production", "serve"][..],
+            &["build-eips", "parity", "serve"][..],
+        ] {
+            let settings = settings_for(arguments, &[], None);
+            assert_eq!(settings.theme, SelectedSource::Remote);
+
+            let (_theme, sync) = prepare_theme_for_zola(
+                ThemeSource::Remote {
+                    repository: "https://example.test/theme.git".to_owned(),
+                    commit: "HEAD".to_owned(),
+                },
+                Path::new("/tmp/build/repo"),
+            )
+            .unwrap();
+
+            assert!(sync.is_none());
         }
     }
 

@@ -118,10 +118,11 @@ Plain site commands are local-first:
 - `build-eips build`
 - `build-eips serve`
 
-They use the workspace-local `theme/`, workspace-local sibling repos, tracked
-working-tree changes from the active repo, and staging environment endpoints.
-Use `--clean` on these commands when you want to ignore tracked working-tree
-changes in the active repo:
+They use the tracked state from workspace-local `theme/`, workspace-local
+sibling repos, tracked working-tree changes from the active repo, and staging
+environment endpoints. Local Zola commands materialize tracked `workspace/theme`
+content into the build repo before running. Use `--clean` on these commands when
+you want to ignore tracked working-tree changes in the active repo:
 
 ```bash
 build-eips check --clean
@@ -129,8 +130,9 @@ build-eips build --clean
 build-eips serve --clean
 ```
 
-`--clean` keeps workspace-local theme and sibling sources. Use explicit
-environment commands when you need remote sources and a clean active repo:
+`--clean` keeps workspace-local theme and sibling sources; it only disables
+active-repo dirty materialization. Use explicit environment commands when you
+need remote sources and a clean active repo:
 
 ```bash
 build-eips --staging build
@@ -174,16 +176,22 @@ build-eips \
 
 This compatibility heading now describes the default local development path.
 Plain `check`, `build`, and `serve` include tracked active-repo edits by default.
-Only the active content repo is materialized this way; sibling repos and theme
-still come from the workspace layout unless you pass `--remote-theme` or
-`--remote-sibling-repo`.
+Local `check`, `build`, and `serve` also use a materialized tracked state from
+`workspace/theme`. Pass `--remote-theme` to use the configured remote theme.
+Sibling repos come from the workspace layout unless you pass `--remote-sibling-repo`.
 
 Local development limits:
 
 - untracked files in the active content repo are ignored
+- untracked files in `workspace/theme` are ignored
+- new theme files must be staged with `git add` before local Zola commands see
+  them
 - tracked deletions are mirrored into the materialized repo, but served route
   invalidation under Zola fast serve remains best-effort
-- `--clean` ignores tracked active-repo edits for one command
+- tracked theme deletions are mirrored into the mounted theme directory, but
+  served route invalidation under Zola fast serve remains best-effort
+- `--clean` ignores tracked active-repo edits for one command and still uses the
+  tracked state from `workspace/theme`
 
 ## Editorial Commands
 
@@ -213,6 +221,13 @@ Local serving keeps two distinct modes:
 
 - `build-eips serve` for the runtime dev loop
 - `build-eips preview` for serving already-built static output
+
+`build-eips serve` watches tracked active-repo edits and tracked edits under
+`workspace/theme`. During `serve`, staging a new theme file with `git add`
+triggers a theme rescan; no extra file edit or restart should be needed.
+`serve --clean` ignores active-repo dirty edits but still watches the local
+theme. `--remote-theme`, explicit environment commands, and `parity serve` use
+the configured remote theme instead of `workspace/theme`.
 
 `build-eips preview` serves the resolved output directory for the active repo
 without invoking Zola, preprocessing markdown, or rebuilding anything.
