@@ -136,16 +136,26 @@ pub(crate) fn resolve_execution_settings(
         (false, false, SelectedSource::Remote)
     };
 
+    let missing_theme = operation_requires_theme(&args.operation) && workspace_config.is_none();
     let missing_sibling = sibling_override.is_none()
         && default_sibling == SelectedSource::WorkspaceLocal
         && !sibling_ids.is_empty()
         && workspace_config.is_none();
 
-    if missing_sibling {
-        snafu::whatever!(
-            "the selected command requires workspace-local sibling sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips workspace init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-sibling-repo` for remote sibling source overrides\n3. use `parity <command>`, `--staging <command>`, or `--production <command>` for remote clean environment behavior",
-            config::LOCAL_CONFIG_FILE
-        );
+    match (missing_theme, missing_sibling) {
+        (true, true) => {
+            snafu::whatever!(
+                "the selected command requires workspace-local theme and sibling sources, but no `{}` was found.\n\nRun:\n  build-eips workspace init <workspace-root>\n\nThen retry from that workspace. Remote theme support has been removed; local theme is required for Zola commands. Use `--remote-sibling-repo` only if you intentionally want remote sibling proposal sources.",
+                config::LOCAL_CONFIG_FILE
+            );
+        }
+        (false, true) => {
+            snafu::whatever!(
+                "the selected command requires workspace-local sibling sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips workspace init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-sibling-repo` for remote sibling source overrides\n3. use `parity <command>`, `--staging <command>`, or `--production <command>` for remote clean environment behavior",
+                config::LOCAL_CONFIG_FILE
+            );
+        }
+        _ => {}
     }
 
     let sibling = sibling_override.unwrap_or(default_sibling);
@@ -409,6 +419,42 @@ mod tests {
             settings_for(arguments, sibling_ids, workspace_config),
             expected
         );
+    }
+
+    fn assert_theme_only_missing_workspace_error(arguments: &[&str]) {
+        let args = parse_args(arguments);
+        let error = resolve_theme_path(None, &args.operation).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains(
+            "the selected command requires a workspace-local theme, but no `.build-eips.toml` was found"
+        ));
+        assert!(message.contains("Remote theme support has been removed"));
+        assert!(message.contains("build-eips workspace init <workspace-root>"));
+        assert!(!message.contains("theme and sibling"));
+        assert!(!message.contains(concat!("--remote", "-theme")));
+    }
+
+    fn assert_combined_missing_workspace_error(arguments: &[&str]) {
+        let args = parse_args(arguments);
+        let sibling_ids = vec!["ERCs".to_owned()];
+        let error = resolve_execution_settings(&args, &sibling_ids, None).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message
+            .contains("the selected command requires workspace-local theme and sibling sources"));
+        assert!(message.contains("no `.build-eips.toml` was found"));
+        assert!(message.contains("build-eips workspace init <workspace-root>"));
+        assert!(message.contains("Remote theme support has been removed"));
+        assert!(message.contains("local theme is required for Zola commands"));
+        assert!(message.contains(
+            "Use `--remote-sibling-repo` only if you intentionally want remote sibling proposal sources"
+        ));
+        assert!(!message.contains(concat!("--remote", "-theme")));
+        assert!(!message.contains("--profile"));
+        assert!(!message.contains("--allow-dirty"));
+        assert!(!message.contains("--theme <path>"));
+        assert!(!message.contains("--sibling-repo <path>"));
     }
 
     #[test]
@@ -907,22 +953,15 @@ base_url = "http://localhost:4000"
     }
 
     #[test]
-    fn local_first_without_workspace_config_requires_explicit_sibling_resolution() {
-        let args = parse_args(&["build-eips", "build"]);
-        let sibling_ids = vec!["ERCs".to_owned()];
-        let error = resolve_execution_settings(&args, &sibling_ids, None).unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains("selected command requires workspace-local sibling sources"));
-        assert!(message.contains("build-eips workspace init <workspace-root>"));
-        assert!(message.contains("--remote-sibling-repo"));
-        assert!(message.contains(
-            "use `parity <command>`, `--staging <command>`, or `--production <command>`"
-        ));
-        assert!(!message.contains("--profile"));
-        assert!(!message.contains("--allow-dirty"));
-        assert!(!message.contains("--theme <path>"));
-        assert!(!message.contains("--sibling-repo <path>"));
+    fn local_first_theme_commands_without_workspace_config_report_combined_setup_error() {
+        for arguments in [
+            &["build-eips", "build"][..],
+            &["build-eips", "serve"][..],
+            &["build-eips", "check"][..],
+            &["build-eips", "editorial", "build", "content/0001.md"][..],
+        ] {
+            assert_combined_missing_workspace_error(arguments);
+        }
     }
 
     #[test]
@@ -965,15 +1004,40 @@ base_url = "http://localhost:4000"
     #[test]
     fn zero_sibling_local_first_without_workspace_config_only_requires_theme_resolution() {
         let args = parse_args(&["build-eips", "build"]);
-        let error = resolve_theme_path(None, &args.operation).unwrap_err();
-        let message = error.to_string();
+        let settings = resolve_execution_settings(&args, &[], None).unwrap();
 
-        assert!(message.contains(
-            "the selected command requires a workspace-local theme, but no `.build-eips.toml` was found"
-        ));
-        assert!(message.contains("Remote theme support has been removed"));
-        assert!(message.contains("build-eips workspace init <workspace-root>"));
-        assert!(!message.contains("--theme <path>"));
+        assert_eq!(settings.sibling, SelectedSource::WorkspaceLocal);
+        assert_theme_only_missing_workspace_error(&["build-eips", "build"]);
+    }
+
+    #[test]
+    fn remote_sibling_override_without_workspace_config_only_requires_theme_resolution() {
+        let args = parse_args(&["build-eips", "--remote-sibling-repo", "build"]);
+        let sibling_ids = vec!["ERCs".to_owned()];
+        let settings = resolve_execution_settings(&args, &sibling_ids, None).unwrap();
+
+        assert_eq!(settings.sibling, SelectedSource::Remote);
+        assert_theme_only_missing_workspace_error(&[
+            "build-eips",
+            "--remote-sibling-repo",
+            "build",
+        ]);
+    }
+
+    #[test]
+    fn environment_and_parity_zola_commands_without_workspace_config_only_require_theme() {
+        for arguments in [
+            &["build-eips", "--staging", "build"][..],
+            &["build-eips", "--production", "serve"][..],
+            &["build-eips", "parity", "check"][..],
+        ] {
+            let args = parse_args(arguments);
+            let sibling_ids = vec!["ERCs".to_owned()];
+            let settings = resolve_execution_settings(&args, &sibling_ids, None).unwrap();
+
+            assert_eq!(settings.sibling, SelectedSource::Remote);
+            assert_theme_only_missing_workspace_error(arguments);
+        }
     }
 
     #[test]
