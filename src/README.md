@@ -7,8 +7,6 @@ review rubric for module boundaries, not user-facing command documentation.
 
 - `main.rs` owns CLI entry, top-level dispatch, build locking, and runtime
   orchestration.
-- `cache.rs` owns local cache directory discovery, locking, and cache path
-  creation.
 - `cli.rs` owns the clap command surface and command helper methods.
 - `config.rs` owns built-in repository metadata, workspace config schema, repo
   manifest schema, parsing, defaults, and config discovery.
@@ -32,7 +30,6 @@ review rubric for module boundaries, not user-facing command documentation.
 - `proposal.rs` owns proposal path classification and future proposal-number
   helpers.
 - `serve.rs` owns dirty active-repo and local-theme serve synchronization.
-- `theme.rs` owns shared theme source identity.
 - `workspace.rs` owns local workspace initialization and diagnostics.
 - `zola.rs` owns Zola discovery, theme mounting, and Zola command invocation.
 
@@ -71,7 +68,7 @@ Imports should generally point from higher-level orchestration toward
 lower-level or shared modules:
 
 ```text
-main -> editorial/workspace/serve/pipeline -> context/identity/execution -> cli/layout/theme/proposal
+main -> editorial/workspace/serve/pipeline -> context/identity/execution -> cli/layout/proposal
 ```
 
 Lower-level or shared modules should not import higher-level orchestration

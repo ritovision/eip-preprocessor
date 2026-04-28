@@ -17,12 +17,13 @@ use url::Url;
 
 use crate::{
     cli::Args,
-    config::{self, Config, LoadedRepoManifest, LoadedWorkspaceConfig},
+    config::{self, LoadedRepoManifest, LoadedWorkspaceConfig},
     context::{load_workspace_command_context, resolve_input_path, root},
     git,
     identity::ActiveRepoIdentity,
 };
 
+const WORKSPACE_THEME_URL: &str = "https://github.com/eips-wg/theme.git";
 const PROPOSAL_TEMPLATE_URL: &str = "https://github.com/eips-wg/template.git";
 const PLATFORM_PREPROCESSOR_URL: &str = "https://github.com/eips-wg/preprocessor.git";
 const PLATFORM_EIPW_URL: &str = "https://github.com/ethereum/eipw.git";
@@ -430,7 +431,8 @@ pub(crate) fn init_workspace(
     include_template: bool,
     platform_dev: bool,
 ) -> Result<(), Whatever> {
-    let theme_repository = Config::staging().theme.repository;
+    let theme_repository = Url::parse(WORKSPACE_THEME_URL)
+        .whatever_context("invalid workspace theme repository URL")?;
     let template_repository = Url::parse(PROPOSAL_TEMPLATE_URL)
         .whatever_context("invalid proposal template repository URL")?;
     let preprocessor_repository = Url::parse(PLATFORM_PREPROCESSOR_URL)
@@ -539,6 +541,7 @@ mod tests {
 
     use super::{
         collect_doctor_report, init_workspace_with_repositories, WorkspaceInitRepositories,
+        WORKSPACE_THEME_URL,
     };
 
     fn parse_args(arguments: &[&str]) -> Args {
@@ -667,6 +670,14 @@ base_url = "https://staging.example.test/{sibling_id}/"
             init_workspace_source_repo(remotes_root, "preprocessor"),
             init_workspace_source_repo(remotes_root, "eipw"),
         )
+    }
+
+    #[test]
+    fn workspace_theme_url_is_bootstrap_metadata() {
+        assert_eq!(
+            Url::parse(WORKSPACE_THEME_URL).unwrap().as_str(),
+            "https://github.com/eips-wg/theme.git"
+        );
     }
 
     fn assert_workspace_init_optional_repos(

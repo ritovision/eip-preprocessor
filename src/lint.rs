@@ -11,7 +11,7 @@ use clap::ValueEnum;
 use log::debug;
 use semver::{Comparator, Op, VersionReq};
 
-use crate::{cache::Cache, progress::ProgressIteratorExt, theme::ThemeSource};
+use crate::progress::ProgressIteratorExt;
 
 use eipw_lint::reporters::{AdditionalHelp, Count, Json, Reporter, Text};
 use eipw_lint::Linter;
@@ -48,11 +48,6 @@ pub enum Error {
         path: PathBuf,
         backtrace: Backtrace,
         source: std::io::Error,
-    },
-    #[snafu(transparent)]
-    Git {
-        #[snafu(backtrace)]
-        source: crate::git::Error,
     },
     #[snafu(transparent)]
     SchemaVersion {
@@ -248,19 +243,14 @@ fn version_cmp(
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn eipw(
-    theme: &ThemeSource,
-    cache: &Cache,
+    theme_path: &Path,
     repo_dir: &Path,
     sources: Vec<PathBuf>,
     opts: CmdArgs,
 ) -> Result<(), Error> {
     let mut stdout = std::io::stdout();
 
-    let mut config_path = match theme {
-        ThemeSource::Remote { repository, commit } => cache.repo(repository, commit)?,
-        ThemeSource::Local { path } => path.to_path_buf(),
-    };
-
+    let mut config_path = theme_path.to_path_buf();
     config_path.push("config");
     config_path.push("eipw.toml");
 

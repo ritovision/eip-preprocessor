@@ -22,7 +22,6 @@ use crate::{
         ExecutionSettings, SelectedSource,
     },
     layout::{BUILD_DIR, REPO_DIR},
-    theme::ThemeSource,
 };
 
 fn parse_args(arguments: &[&str]) -> Args {
@@ -201,34 +200,9 @@ fn command_groups_route_separately_from_parity() {
 }
 
 #[test]
-fn remote_and_environment_serve_paths_do_not_enable_local_theme_sync() {
-    for arguments in [
-        &["build-eips", "--remote-theme", "serve"][..],
-        &["build-eips", "--staging", "serve"][..],
-        &["build-eips", "--production", "serve"][..],
-        &["build-eips", "parity", "serve"][..],
-    ] {
-        let settings = settings_for(arguments, &[], None);
-        assert_eq!(settings.theme, SelectedSource::Remote);
-    }
-}
-
-#[test]
-fn downstream_ci_environment_forms_do_not_need_workspace_config() {
+fn downstream_ci_changed_forms_do_not_need_workspace_config() {
     for (arguments, expected_staging) in [
-        (&["build-eips", "--staging", "build"][..], true),
         (&["build-eips", "--staging", "changed"][..], true),
-        (
-            &[
-                "build-eips",
-                "--staging",
-                "editorial",
-                "build",
-                "--against-upstream",
-            ][..],
-            true,
-        ),
-        (&["build-eips", "--production", "build"][..], false),
         (&["build-eips", "--production", "changed"][..], false),
     ] {
         assert_settings(
@@ -239,10 +213,39 @@ fn downstream_ci_environment_forms_do_not_need_workspace_config() {
                 build_root: None,
                 staging: expected_staging,
                 allow_dirty: false,
-                theme: SelectedSource::Remote,
                 sibling: SelectedSource::Remote,
             },
         );
+    }
+}
+
+#[test]
+fn downstream_ci_zola_forms_require_workspace_local_theme_config() {
+    let workspace = TempDir::new().unwrap();
+    let active_path = workspace.path().join("Core");
+    let active_url = file_url(&active_path);
+    write_manifest_repo(&active_path, "Core", &active_url, &[]);
+    let active_path = active_path.to_string_lossy().to_string();
+
+    for arguments in [
+        &["build-eips", "--staging", "build"][..],
+        &["build-eips", "--production", "build"][..],
+        &[
+            "build-eips",
+            "--staging",
+            "editorial",
+            "build",
+            "--against-upstream",
+        ][..],
+        &["build-eips", "parity", "check"][..],
+    ] {
+        let mut cli_arguments = vec!["build-eips", "-C", active_path.as_str()];
+        cli_arguments.extend_from_slice(&arguments[1..]);
+        let args = parse_args(&cli_arguments);
+        let message = resolve_execution(&args).unwrap_err().to_string();
+
+        assert!(message.contains("requires a workspace-local theme"));
+        assert!(message.contains("Remote theme support has been removed"));
     }
 }
 
@@ -252,6 +255,12 @@ fn manifest_identity_drives_runtime_resolution() {
     let active_path = workspace.path().join("Core");
     let active_url = file_url(&active_path);
     write_manifest_repo(&active_path, "Core", &active_url, &[]);
+    std::fs::create_dir(workspace.path().join(config::DEFAULT_THEME_DIR)).unwrap();
+    write_file(
+        workspace.path(),
+        config::LOCAL_CONFIG_FILE,
+        &config::default_workspace_config_text(),
+    );
     let build_root = workspace.path().join("build-root");
     let args = parse_args(&[
         "build-eips",
@@ -329,22 +338,32 @@ fn build_root_override_wins_with_workspace_config() {
 }
 
 #[test]
-fn non_workspace_build_path_falls_back_to_active_repo_build_dir() {
+fn non_workspace_runtime_path_falls_back_to_active_repo_build_dir() {
     let workspace = TempDir::new().unwrap();
     let active_path = workspace.path().join("Core");
     let active_url = file_url(&active_path);
     write_manifest_repo(&active_path, "Core", &active_url, &[]);
-    let args = parse_args(&[
-        "build-eips",
-        "-C",
-        active_path.to_str().unwrap(),
-        "parity",
-        "build",
-    ]);
+    let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "changed"]);
 
     let resolved = resolve_execution(&args).unwrap();
 
     assert_eq!(resolved.build_path, active_path.join(BUILD_DIR));
+}
+
+#[test]
+fn non_theme_runtime_commands_resolve_without_workspace_config() {
+    let workspace = TempDir::new().unwrap();
+    let active_path = workspace.path().join("Core");
+    let active_url = file_url(&active_path);
+    write_manifest_repo(&active_path, "Core", &active_url, &[]);
+    let active_path = active_path.to_string_lossy().to_string();
+
+    for command in ["changed", "clean", "preview"] {
+        let args = parse_args(&["build-eips", "-C", active_path.as_str(), command]);
+        let resolved = resolve_execution(&args).unwrap();
+
+        assert!(resolved.theme_path.is_none());
+    }
 }
 
 #[test]
@@ -399,6 +418,7 @@ fn workspace_local_sibling_mode_is_all_or_nothing() {
     ];
     let active_url = file_url(&active_path);
     write_manifest_repo(&active_path, "Core", &active_url, &siblings);
+    std::fs::create_dir(workspace.path().join(config::DEFAULT_THEME_DIR)).unwrap();
     std::fs::write(
         workspace.path().join(config::LOCAL_CONFIG_FILE),
         config::default_workspace_config_text(),
@@ -437,12 +457,10 @@ fn workspace_local_sources_resolve_from_standard_layout() {
 
     let resolved = resolve_execution(&args).unwrap();
 
-    match resolved.theme {
-        ThemeSource::Local { path } => {
-            assert_eq!(path, workspace.path().join(config::DEFAULT_THEME_DIR));
-        }
-        ThemeSource::Remote { .. } => panic!("expected workspace-local theme"),
-    }
+    assert_eq!(
+        resolved.theme_path.as_deref(),
+        Some(workspace.path().join(config::DEFAULT_THEME_DIR).as_path())
+    );
     assert_eq!(
         resolved.repository_use.other_repos["EIPs"],
         file_url(&eips_path)
@@ -465,6 +483,12 @@ fn manifest_driven_multi_repo_build_and_editorial_flows_resolve_siblings() {
 
     let active_path = temp.path().join("workspace/Core");
     std::fs::create_dir_all(active_path.parent().unwrap()).unwrap();
+    std::fs::create_dir(temp.path().join("workspace/theme")).unwrap();
+    write_file(
+        active_path.parent().unwrap(),
+        config::LOCAL_CONFIG_FILE,
+        &config::default_workspace_config_text(),
+    );
     git2::build::RepoBuilder::new()
         .clone(upstream_url.as_str(), &active_path)
         .unwrap();

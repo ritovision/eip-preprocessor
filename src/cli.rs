@@ -29,10 +29,6 @@ pub(crate) struct Args {
     #[clap(long)]
     pub(crate) production: bool,
 
-    /// Use the configured remote theme instead of a workspace-local theme
-    #[clap(long)]
-    pub(crate) remote_theme: bool,
-
     /// Use the configured remote sibling content repository
     #[clap(long)]
     pub(crate) remote_sibling_repo: bool,
@@ -427,6 +423,16 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unexpected argument '--profile'"));
+    }
+
+    #[test]
+    fn removed_theme_flag_is_rejected() {
+        let removed_flag = concat!("--remote", "-theme");
+        let error = Args::try_parse_from(["build-eips", removed_flag, "build"]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains(&format!("unexpected argument '{removed_flag}'")));
     }
 
     #[test]

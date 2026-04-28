@@ -180,14 +180,14 @@ Use these flags to override the built-in source and output-location choices
 directly:
 
 - `--staging` / `--production`
-- `--remote-theme`
 - `--remote-sibling-repo`
 - `--build-root <path>`
 
 Workspace-local sources come from the standard workspace layout. The local theme
 is `workspace/theme`, and local sibling repos are `workspace/<sibling_repo_id>`
-from the active repo manifest. Use `--remote-theme` or `--remote-sibling-repo`
-when you need to force remote sources for a single command.
+from the active repo manifest. Use `--remote-sibling-repo` when you need to
+force remote sibling proposal sources for a single command. Runtime Zola
+commands always use the workspace-local `theme/`.
 
 Example:
 
@@ -195,7 +195,6 @@ Example:
 build-eips \
   -C /work/EIPs-project/EIPs \
   --staging \
-  --remote-theme \
   --remote-sibling-repo \
   --build-root /work/EIPs-project/.local-build/EIPs \
   check
@@ -206,8 +205,8 @@ build-eips \
 This compatibility heading now describes the default local development path.
 Plain `check`, `build`, and `serve` include tracked active-repo edits by default.
 Local `check`, `build`, and `serve` also use a materialized tracked state from
-`workspace/theme`. Pass `--remote-theme` to use the configured remote theme.
-Sibling repos come from the workspace layout unless you pass `--remote-sibling-repo`.
+`workspace/theme`. Sibling repos come from the workspace layout unless you pass
+`--remote-sibling-repo`.
 
 Local development limits:
 
@@ -255,8 +254,8 @@ Local serving keeps two distinct modes:
 `workspace/theme`. During `serve`, staging a new theme file with `git add`
 triggers a theme rescan; no extra file edit or restart should be needed.
 `serve --clean` ignores active-repo dirty edits but still watches the local
-theme. `--remote-theme`, explicit environment commands, and `parity serve` use
-the configured remote theme instead of `workspace/theme`.
+theme. Explicit environment commands and `parity serve` still use remote
+proposal sources, but they require and use the workspace-local `theme/`.
 
 `build-eips preview` serves the resolved output directory for the active repo
 without invoking Zola, preprocessing markdown, or rebuilding anything.
@@ -267,6 +266,9 @@ The workspace config `[server]` table controls the local bind address for both
 `serve` and `preview`; the default is `127.0.0.1:1111`. Per-command `--host`
 and `--port` flags override that config for one run. These settings do not
 change build base URLs.
+
+CI and production runners should ensure `theme/` is checked out at the desired
+commit or branch before invoking runtime Zola commands.
 
 The workspace config `[site].base_url` value is a local rendered-site URL
 default. Starter configs set it to `http://127.0.0.1:1111`; if you change

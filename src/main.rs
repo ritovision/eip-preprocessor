@@ -4,7 +4,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-mod cache;
 mod cli;
 mod config;
 mod context;
@@ -23,7 +22,6 @@ mod print;
 mod progress;
 mod proposal;
 mod serve;
-mod theme;
 mod workspace;
 mod zola;
 

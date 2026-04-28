@@ -15,8 +15,8 @@ use log::info;
 use snafu::{ResultExt, Whatever};
 
 use crate::{
-    cache, cli::EditorialSelectorArgs, context::resolve_input_path, execution::ResolvedExecution,
-    git, layout::REPO_DIR, lint, proposal::is_proposal_path,
+    cli::EditorialSelectorArgs, context::resolve_input_path, execution::ResolvedExecution, git,
+    layout::REPO_DIR, lint, proposal::is_proposal_path,
 };
 
 fn repo_relative_path(root_path: &Path, path: &Path) -> Result<PathBuf, Whatever> {
@@ -158,9 +158,7 @@ pub(crate) fn run_editorial_lint(
         return Ok(false);
     }
 
-    let cache = cache::Cache::open().whatever_context("unable to open cache")?;
-
-    lint::eipw(&resolved.theme, &cache, &resolved.root_path, targets, eipw)
+    lint::eipw(resolved.theme_path()?, &resolved.root_path, targets, eipw)
         .whatever_context("editorial lint failed")?;
 
     Ok(true)
@@ -184,7 +182,6 @@ mod tests {
         cli::EditorialSelectorArgs,
         config::{self, ServerBinding},
         execution::ResolvedExecution,
-        theme::ThemeSource,
     };
 
     use super::editorial_runtime_execution;
@@ -202,10 +199,7 @@ mod tests {
                 },
                 other_repos: Default::default(),
             },
-            theme: ThemeSource::Remote {
-                repository: "https://example.test/theme.git".to_owned(),
-                commit: "HEAD".to_owned(),
-            },
+            theme_path: Some(PathBuf::from("/workspace/theme")),
             source_materialization: crate::git::SourceMaterialization::Clean,
             server_binding: ServerBinding::default(),
             base_url_override: None,

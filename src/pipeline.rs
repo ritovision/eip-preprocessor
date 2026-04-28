@@ -8,55 +8,45 @@
 
 use std::path::{Path, PathBuf};
 
-use snafu::{ResultExt, Whatever};
+use snafu::{OptionExt, ResultExt, Whatever};
 use url::Url;
 
 use crate::{
-    cache,
     config::ServerBinding,
     execution::ResolvedExecution,
     git,
     layout::{mounted_theme_path, output_path, CONTENT_DIR, REPO_DIR},
     markdown,
     serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
-    theme::ThemeSource,
     zola,
 };
 
 fn prepare_theme_for_zola(
-    theme: ThemeSource,
+    theme_path: PathBuf,
     repo_path: &Path,
-) -> Result<(ThemeSource, Option<LocalThemeServeSync>), Whatever> {
-    match theme {
-        ThemeSource::Local { path } => {
-            let mounted_theme_dir = mounted_theme_path(repo_path);
-            git::materialize_working_tree(&path, &mounted_theme_dir)
-                .whatever_context("unable to materialize workspace-local theme")?;
-            let theme_index_path = git::index_path(&path)
-                .whatever_context("unable to resolve workspace-local theme Git index path")?;
+) -> Result<(PathBuf, LocalThemeServeSync), Whatever> {
+    let mounted_theme_dir = mounted_theme_path(repo_path);
+    git::materialize_working_tree(&theme_path, &mounted_theme_dir)
+        .whatever_context("unable to materialize workspace-local theme")?;
+    let theme_index_path = git::index_path(&theme_path)
+        .whatever_context("unable to resolve workspace-local theme Git index path")?;
 
-            Ok((
-                ThemeSource::Local {
-                    path: mounted_theme_dir.clone(),
-                },
-                Some(LocalThemeServeSync {
-                    theme_source_root: path,
-                    mounted_theme_dir,
-                    theme_index_path,
-                }),
-            ))
-        }
-        ThemeSource::Remote { .. } => Ok((theme, None)),
-    }
+    Ok((
+        mounted_theme_dir.clone(),
+        LocalThemeServeSync {
+            theme_source_root: theme_path,
+            mounted_theme_dir,
+            theme_index_path,
+        },
+    ))
 }
 
 #[derive(Debug)]
 pub(crate) struct Prepared {
-    cache: cache::Cache,
     repo_path: PathBuf,
     output_path: PathBuf,
     repository_use: git::RepositoryUse,
-    theme: ThemeSource,
+    theme_path: PathBuf,
     local_theme_sync: Option<LocalThemeServeSync>,
     source_root: PathBuf,
     source_materialization: git::SourceMaterialization,
@@ -72,11 +62,13 @@ impl Prepared {
             root_path,
             build_path,
             repository_use,
-            theme,
+            theme_path,
             source_materialization,
             server_binding,
             base_url_override,
         } = resolved;
+        let theme_path =
+            theme_path.whatever_context("Zola runtime requires a workspace-local theme path")?;
 
         let repo_path = build_path.join(REPO_DIR);
         let content_path = repo_path.join(CONTENT_DIR);
@@ -97,16 +89,13 @@ impl Prepared {
         both.merge()
             .whatever_context("unable to merge ERC/EIP repositories")?;
 
-        let cache = cache::Cache::open().whatever_context("unable to open cache")?;
-
         markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
-        let (theme, local_theme_sync) = prepare_theme_for_zola(theme, &repo_path)?;
+        let (theme_path, local_theme_sync) = prepare_theme_for_zola(theme_path, &repo_path)?;
 
         Ok(Prepared {
             repository_use,
-            theme,
-            local_theme_sync,
-            cache,
+            theme_path,
+            local_theme_sync: Some(local_theme_sync),
             repo_path,
             output_path,
             source_root: root_path,
@@ -122,8 +111,7 @@ impl Prepared {
             .as_ref()
             .unwrap_or(&self.repository_use.location.base_url);
         zola::build(
-            &self.theme,
-            &self.cache,
+            &self.theme_path,
             &self.repo_path,
             &self.output_path,
             base_url.as_str(),
@@ -149,8 +137,7 @@ impl Prepared {
         };
 
         let result = zola::serve(
-            &self.theme,
-            &self.cache,
+            &self.theme_path,
             &self.repo_path,
             &self.output_path,
             &self.server_binding,
@@ -166,8 +153,7 @@ impl Prepared {
     }
 
     pub(crate) fn check(self) -> Result<(), Whatever> {
-        zola::check(&self.theme, &self.cache, &self.repo_path)
-            .whatever_context("zola check failed")?;
+        zola::check(&self.theme_path, &self.repo_path).whatever_context("zola check failed")?;
         Ok(())
     }
 }
@@ -179,10 +165,7 @@ mod tests {
     use git2::{IndexAddOption, Repository, Signature};
     use tempfile::TempDir;
 
-    use crate::{
-        layout::{mounted_theme_path, theme_config_path},
-        theme::ThemeSource,
-    };
+    use crate::layout::{mounted_theme_path, theme_config_path};
 
     use super::prepare_theme_for_zola;
 
@@ -235,20 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_theme_for_zola_does_not_enable_serve_sync() {
-        let (_theme, sync) = prepare_theme_for_zola(
-            ThemeSource::Remote {
-                repository: "https://example.test/theme.git".to_owned(),
-                commit: "HEAD".to_owned(),
-            },
-            Path::new("/tmp/build/repo"),
-        )
-        .unwrap();
-
-        assert!(sync.is_none());
-    }
-
-    #[test]
     fn workspace_local_theme_is_materialized_as_mounted_theme_for_zola() {
         let temp = TempDir::new().unwrap();
         let theme_root = temp.path().join("workspace/theme");
@@ -261,16 +230,10 @@ mod tests {
         );
         let repo_path = temp.path().join("workspace/.local-build/Core/repo");
 
-        let (theme, sync) = prepare_theme_for_zola(
-            ThemeSource::Local {
-                path: theme_root.clone(),
-            },
-            &repo_path,
-        )
-        .unwrap();
+        let (theme_path, sync) = prepare_theme_for_zola(theme_root.clone(), &repo_path).unwrap();
 
         let mounted_theme_dir = mounted_theme_path(&repo_path);
-        assert!(matches!(theme, ThemeSource::Local { path } if path == mounted_theme_dir));
+        assert_eq!(theme_path, mounted_theme_dir);
         assert_eq!(
             theme_config_path(&mounted_theme_dir),
             repo_path.join("themes/eips-theme/config/zola.toml")
@@ -279,7 +242,6 @@ mod tests {
             std::fs::read_to_string(mounted_theme_dir.join("templates/index.html")).unwrap(),
             "local theme\n"
         );
-        let sync = sync.expect("local theme should enable serve sync");
         assert_eq!(sync.theme_source_root, theme_root);
         assert_eq!(sync.mounted_theme_dir, mounted_theme_dir);
         assert!(sync.theme_index_path.ends_with(".git/index"));

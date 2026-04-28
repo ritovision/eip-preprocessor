@@ -16,11 +16,8 @@ use snafu::{ensure, Backtrace, IntoError, Report, ResultExt, Snafu};
 use url::Url;
 
 use crate::{
-    cache::Cache,
     config::ServerBinding,
-    git,
     layout::{mounted_theme_path, theme_config_path},
-    theme::ThemeSource,
 };
 
 const MINIMUM_VERSION: Version = Version::new(0, 22, 1);
@@ -93,11 +90,6 @@ pub enum Error {
         backtrace: Backtrace,
         source: std::io::Error,
     },
-    #[snafu(context(false))]
-    Git {
-        #[snafu(backtrace)]
-        source: git::Error,
-    },
 }
 
 pub fn find_zola() -> Result<(), Error> {
@@ -118,15 +110,14 @@ pub fn find_zola() -> Result<(), Error> {
     Ok(())
 }
 
-pub fn check(theme: &ThemeSource, cache: &Cache, project_path: &Path) -> Result<(), Error> {
+pub fn check(theme_dir: &Path, project_path: &Path) -> Result<(), Error> {
     let args = ["check", "--drafts", "--skip-external-links"];
-    spawn_log(theme, cache, project_path, args)?;
+    spawn_log(theme_dir, project_path, args)?;
     Ok(())
 }
 
 pub fn build(
-    theme: &ThemeSource,
-    cache: &Cache,
+    theme_dir: &Path,
     project_path: &Path,
     output_path: &Path,
     base_url: &str,
@@ -136,7 +127,7 @@ pub fn build(
         .map(OsString::from)
         .into_iter()
         .chain(std::iter::once(output_path.into()));
-    spawn_log(theme, cache, project_path, args)?;
+    spawn_log(theme_dir, project_path, args)?;
     if let Ok(url) = Url::from_file_path(output_path) {
         info!("HTML output to: {}", url);
     }
@@ -144,8 +135,7 @@ pub fn build(
 }
 
 pub fn serve(
-    theme: &ThemeSource,
-    cache: &Cache,
+    theme_dir: &Path,
     project_path: &Path,
     output_path: &Path,
     server_binding: &ServerBinding,
@@ -154,7 +144,7 @@ pub fn serve(
     // TODO: Properly kill the child process when we receive ctrl-c.
     remove_output(output_path);
     let args = serve_args(server_binding, output_path, base_url_override);
-    spawn_log(theme, cache, project_path, args)?;
+    spawn_log(theme_dir, project_path, args)?;
     Ok(())
 }
 
@@ -198,12 +188,7 @@ fn remove_output(output_path: &Path) {
     }
 }
 
-fn spawn_log<U, I>(
-    theme: &ThemeSource,
-    cache: &Cache,
-    project_path: &Path,
-    args: U,
-) -> Result<(), Error>
+fn spawn_log<U, I>(theme_dir: &Path, project_path: &Path, args: U) -> Result<(), Error>
 where
     U: IntoIterator<Item = I>,
     I: Into<OsString>,
@@ -216,13 +201,8 @@ where
 
     find_zola()?;
 
-    let theme_dir = match theme {
-        ThemeSource::Remote { repository, commit } => cache.repo(repository, commit)?,
-        ThemeSource::Local { path } => path.to_path_buf(),
-    };
-
     let mounted_theme_path =
-        mount_theme(&theme_dir, project_path).context(FsSnafu { path: &theme_dir })?;
+        mount_theme(theme_dir, project_path).context(FsSnafu { path: theme_dir })?;
     let config_path = theme_config_path(&mounted_theme_path);
 
     let prefix = [OsString::from("-c"), config_path.into()].into_iter();
@@ -368,18 +348,18 @@ mod tests {
 
     #[cfg(target_family = "unix")]
     #[test]
-    fn remote_theme_mount_replaces_prior_real_mounted_theme_directory() {
+    fn theme_mount_replaces_prior_real_mounted_theme_directory() {
         let temp = TempDir::new().unwrap();
         let project_path = temp.path().join("repo");
-        let remote_theme = temp.path().join("remote-theme");
-        fs::create_dir_all(remote_theme.join("config")).unwrap();
-        fs::write(remote_theme.join("config/zola.toml"), "title = 'remote'\n").unwrap();
+        let source_theme = temp.path().join("source-theme");
+        fs::create_dir_all(source_theme.join("config")).unwrap();
+        fs::write(source_theme.join("config/zola.toml"), "title = 'source'\n").unwrap();
 
         let mounted_theme = mounted_theme_path(&project_path);
         fs::create_dir_all(&mounted_theme).unwrap();
         fs::write(mounted_theme.join("stale.txt"), "stale").unwrap();
 
-        let result = mount_theme(&remote_theme, &project_path).unwrap();
+        let result = mount_theme(&source_theme, &project_path).unwrap();
 
         assert_eq!(result, mounted_theme);
         assert!(fs::symlink_metadata(&mounted_theme)
@@ -388,7 +368,7 @@ mod tests {
             .is_symlink());
         assert_eq!(
             fs::read_to_string(theme_config_path(&mounted_theme)).unwrap(),
-            "title = 'remote'\n"
+            "title = 'source'\n"
         );
     }
 }

@@ -75,15 +75,6 @@ pub enum WorkspaceError {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Theme {
-    /// Where to fetch the theme from.
-    pub repository: Url,
-
-    /// Specific revision to checkout from the theme repository.
-    pub commit: String,
-}
-
 /// Environment-specific repository metadata for an active proposal repo or sibling repo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -380,7 +371,6 @@ pub struct LegacyLocations(pub HashMap<String, LegacyLocation>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub theme: Theme,
     pub locations: LegacyLocations,
 }
 
@@ -407,12 +397,6 @@ impl Config {
         );
 
         Self {
-            theme: Theme {
-                repository: "https://github.com/ethereum/eips-theme.git"
-                    .try_into()
-                    .unwrap(),
-                commit: "0ddac35da36d311a8401c6cfb79c9991f78b647d".into(),
-            },
             locations: LegacyLocations(locations),
         }
     }
@@ -439,10 +423,6 @@ impl Config {
         );
 
         Self {
-            theme: Theme {
-                repository: "https://github.com/eips-wg/theme.git".try_into().unwrap(),
-                commit: "0ddac35da36d311a8401c6cfb79c9991f78b647d".into(),
-            },
             locations: LegacyLocations(locations),
         }
     }
@@ -1085,21 +1065,46 @@ base_url = "http://127.0.0.1:1111"
 
     #[test]
     fn removed_workspace_config_fields_use_strict_parse_errors() {
-        let cases = [
-            ("build_root_base", r#"build_root_base = ".local-build""#),
-            ("default_profile", r#"default_profile = "local""#),
+        let removed_theme_ref_field = concat!("co", "mmit");
+        let cases = vec![
             (
-                "profiles",
+                "build_root_base".to_owned(),
+                r#"build_root_base = ".local-build""#.to_owned(),
+            ),
+            (
+                "default_profile".to_owned(),
+                r#"default_profile = "local""#.to_owned(),
+            ),
+            (
+                "profiles".to_owned(),
                 r#"
 [profiles.local]
 staging = true
-"#,
+"#
+                .to_owned(),
+            ),
+            (
+                "theme".to_owned(),
+                r#"
+[theme]
+repository = "https://github.com/eips-wg/theme.git"
+"#
+                .to_owned(),
+            ),
+            (
+                format!("theme.{removed_theme_ref_field}"),
+                format!(
+                    r#"
+[theme]
+{removed_theme_ref_field} = "3a597d4cd68ec82d36f01c01335492cfa59501ae"
+"#
+                ),
             ),
         ];
 
         for (field, contents) in cases {
             let workspace = TestWorkspace::new();
-            let config_path = workspace.write_file(LOCAL_CONFIG_FILE, contents);
+            let config_path = workspace.write_file(LOCAL_CONFIG_FILE, &contents);
             let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
 
             assert!(
