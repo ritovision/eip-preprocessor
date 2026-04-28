@@ -40,8 +40,10 @@ review rubric for module boundaries, not user-facing command documentation.
 
 New tests should generally live in the module that owns the behavior. Use
 `super::` from module-local tests where natural, or sibling module paths from the
-owning module. Existing module-local tests in `config.rs`, `git.rs`, and
-`zola.rs` should stay with those modules.
+owning module. Module-local tests now cover `cli.rs`, `execution.rs`,
+`serve.rs`, `workspace.rs`, `editorial.rs`, `pipeline.rs`, and the existing
+`config.rs`, `git.rs`, and `zola.rs` tests; `src/tests.rs` intentionally holds
+the remaining cross-domain behavior tests.
 
 Use `src/tests.rs` for cross-domain behavior tests, especially tests covering:
 
