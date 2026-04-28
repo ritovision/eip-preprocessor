@@ -716,7 +716,7 @@ pub struct Fresh {
 impl Fresh {
     pub fn new(
         root_path: &Path,
-        build_path: &Path,
+        repo_path: &Path,
         src_repo_use: RepositoryUse,
         source_materialization: SourceMaterialization,
     ) -> Result<Self, Error> {
@@ -732,7 +732,7 @@ impl Fresh {
 
         debug!("source repository at `{src_repo_url}`");
 
-        let working_repo = open_or_init(build_path)?;
+        let working_repo = open_or_init(repo_path)?;
 
         Ok(Self {
             working_repo,
