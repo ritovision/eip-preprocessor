@@ -8,6 +8,7 @@
 
 use std::{
     fmt,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -27,6 +28,8 @@ const WORKSPACE_THEME_URL: &str = "https://github.com/eips-wg/theme.git";
 const PROPOSAL_TEMPLATE_URL: &str = "https://github.com/eips-wg/template.git";
 const PLATFORM_PREPROCESSOR_URL: &str = "https://github.com/eips-wg/preprocessor.git";
 const PLATFORM_EIPW_URL: &str = "https://github.com/ethereum/eipw.git";
+const WORKSPACE_README_FILE: &str = "README.md";
+const WORKSPACE_README_FALLBACK_FILE: &str = "WORKSPACE-README.md";
 
 #[derive(Debug, Clone, Copy)]
 enum DoctorStatus {
@@ -522,6 +525,112 @@ fn init_workspace_with_repositories(
             .whatever_context("unable to write workspace config")?;
     }
 
+    write_workspace_readme(&workspace_root)?;
+
+    Ok(())
+}
+
+fn workspace_readme_text() -> &'static str {
+    r#"# build-eips Workspace
+
+This directory is a local multi-repo workspace for `build-eips`.
+
+## Layout
+
+- `EIPs/` and `ERCs/`: proposal source repositories.
+- `theme/`: workspace-local Zola theme required by build, serve, and check commands.
+- `template/`: optional proposal template repository.
+- `preprocessor/`: optional local build-eips development checkout.
+- `eipw/`: optional local eipw development checkout.
+- `.build-eips.toml`: workspace configuration.
+- `.local-build/`: generated build output and materialized repositories.
+
+## Commands
+
+Run site commands from `EIPs/` or `ERCs/`. From the workspace root, use `-C`:
+
+```sh
+build-eips -C EIPs build
+build-eips -C ERCs serve
+```
+
+Runtime rendering commands use the workspace-local `theme/`; run
+`build-eips workspace init <workspace-root>` to bootstrap it.
+
+Common commands:
+
+```sh
+build-eips build
+build-eips serve
+build-eips check
+build-eips workspace doctor
+```
+
+`build-eips serve` listens at `http://127.0.0.1:1111` by default. Use
+`--host`, `--port`, and `--base-url` when a different local address or public
+URL is needed.
+
+## Targeted Local Renders
+
+Targeted renders apply only to local dirty `build` and `serve` commands:
+
+```sh
+build-eips build --only 555
+build-eips serve --only 555
+build-eips build --only 555 678
+```
+
+Workspace defaults can be set in `.build-eips.toml`:
+
+```toml
+[render]
+only = [555, 678]
+```
+
+CLI `--only` replaces `[render].only` for that command. Clean, staging,
+production, parity, check, changed, preview, and editorial commands do not use
+render filtering.
+
+New proposal numbers added while `serve --only` is running require restarting
+serve.
+"#
+}
+
+fn write_workspace_readme(workspace_root: &Path) -> Result<(), Whatever> {
+    let readme_path = workspace_root.join(WORKSPACE_README_FILE);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&readme_path)
+    {
+        Ok(mut file) => {
+            file.write_all(workspace_readme_text().as_bytes())
+                .with_whatever_context(|_| {
+                    format!(
+                        "unable to write workspace README `{}`",
+                        readme_path.to_string_lossy()
+                    )
+                })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let fallback_path = workspace_root.join(WORKSPACE_README_FALLBACK_FILE);
+            std::fs::write(&fallback_path, workspace_readme_text()).with_whatever_context(
+                |_| {
+                    format!(
+                        "unable to write workspace README `{}`",
+                        fallback_path.to_string_lossy()
+                    )
+                },
+            )?;
+        }
+        Err(error) => {
+            snafu::whatever!(
+                "unable to create workspace README `{}`: {error}",
+                readme_path.to_string_lossy()
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -540,7 +649,8 @@ mod tests {
     };
 
     use super::{
-        collect_doctor_report, init_workspace_with_repositories, WorkspaceInitRepositories,
+        collect_doctor_report, init_workspace_with_repositories, workspace_readme_text,
+        WorkspaceInitRepositories, WORKSPACE_README_FALLBACK_FILE, WORKSPACE_README_FILE,
         WORKSPACE_THEME_URL,
     };
 
@@ -672,11 +782,118 @@ base_url = "https://staging.example.test/{sibling_id}/"
         )
     }
 
+    fn run_workspace_init_for_docs(
+        existing_readme: Option<&str>,
+        existing_config: Option<&str>,
+    ) -> (TempDir, std::path::PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitRepositories {
+            theme: &theme_url,
+            template: &template_url,
+            preprocessor: &preprocessor_url,
+            eipw: &eipw_url,
+        };
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+
+        if let Some(contents) = existing_readme {
+            write_file(&workspace_root, WORKSPACE_README_FILE, contents);
+        }
+        if let Some(contents) = existing_config {
+            write_file(&workspace_root, config::LOCAL_CONFIG_FILE, contents);
+        }
+
+        let init_args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "init",
+            workspace_root.to_str().unwrap(),
+        ]);
+
+        init_workspace_with_repositories(
+            &init_args,
+            workspace_root.clone(),
+            false,
+            false,
+            &repositories,
+        )
+        .unwrap();
+
+        (temp, workspace_root)
+    }
+
     #[test]
     fn workspace_theme_url_is_bootstrap_metadata() {
         assert_eq!(
             Url::parse(WORKSPACE_THEME_URL).unwrap().as_str(),
             "https://github.com/eips-wg/theme.git"
+        );
+    }
+
+    #[test]
+    fn workspace_readme_text_documents_layout_commands_and_only_settings() {
+        let text = workspace_readme_text();
+
+        for expected in [
+            "EIPs",
+            "ERCs",
+            "theme",
+            ".build-eips.toml",
+            ".local-build",
+            "build-eips serve",
+            "--only",
+            "[render]",
+            "only = [",
+            "1111",
+            "--base-url",
+        ] {
+            assert!(
+                text.contains(expected),
+                "workspace README text should contain `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_init_creates_workspace_readme_when_absent() {
+        let (_temp, workspace_root) = run_workspace_init_for_docs(None, None);
+
+        let readme = std::fs::read_to_string(workspace_root.join(WORKSPACE_README_FILE)).unwrap();
+        assert!(readme.contains("build-eips Workspace"));
+        assert!(readme.contains("build-eips serve"));
+        assert!(!workspace_root.join(WORKSPACE_README_FALLBACK_FILE).exists());
+    }
+
+    #[test]
+    fn workspace_init_preserves_existing_readme_and_writes_fallback_docs() {
+        let existing_readme = "Project README\n";
+        let (_temp, workspace_root) = run_workspace_init_for_docs(Some(existing_readme), None);
+
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join(WORKSPACE_README_FILE)).unwrap(),
+            existing_readme
+        );
+        let fallback =
+            std::fs::read_to_string(workspace_root.join(WORKSPACE_README_FALLBACK_FILE)).unwrap();
+        assert!(fallback.contains("build-eips Workspace"));
+        assert!(fallback.contains("--only"));
+    }
+
+    #[test]
+    fn workspace_init_leaves_existing_config_without_render_unchanged() {
+        let existing_config = "[server]\nhost = \"127.0.0.1\"\nport = 1111\n";
+        let (_temp, workspace_root) = run_workspace_init_for_docs(None, Some(existing_config));
+
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join(config::LOCAL_CONFIG_FILE)).unwrap(),
+            existing_config
         );
     }
 

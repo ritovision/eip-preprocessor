@@ -452,7 +452,7 @@ pub struct WorkspaceConfig {
     pub site: SiteSettings,
 
     /// Local render filtering defaults.
-    #[serde(default, skip_serializing_if = "RenderSettings::is_empty")]
+    #[serde(default)]
     pub render: RenderSettings,
 }
 
@@ -470,15 +470,9 @@ impl WorkspaceConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RenderSettings {
-    /// Proposal numbers to render for applicable local build commands.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Proposal numbers to render for applicable local build and serve commands.
+    #[serde(default)]
     pub only: Vec<ProposalNumber>,
-}
-
-impl RenderSettings {
-    fn is_empty(&self) -> bool {
-        self.only.is_empty()
-    }
 }
 
 /// Workspace-local bind address defaults for local server commands.
@@ -956,7 +950,8 @@ base_url = "https://staging.example.test/ERCs/"
         assert!(original.contains("port = 1111"));
         assert!(original.contains("[site]"));
         assert!(original.contains(&format!("base_url = \"{DEFAULT_SITE_BASE_URL}\"")));
-        assert!(!original.contains("[render]"));
+        assert!(original.contains("[render]"));
+        assert!(original.contains("only = []"));
         assert!(!original.contains("default_profile"));
         assert!(!original.contains("[profiles"));
     }
@@ -1113,6 +1108,26 @@ only = [555, 678, 555]
                 ProposalNumber::from_u32(555).unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn missing_render_missing_only_and_empty_only_disable_filtering() {
+        let cases = [
+            ("missing render", ""),
+            ("missing only", "[render]\n"),
+            ("empty only", "[render]\nonly = []\n"),
+        ];
+
+        for (name, contents) in cases {
+            let workspace = TestWorkspace::new();
+            let config_path = workspace.write_file(LOCAL_CONFIG_FILE, contents);
+            let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+            assert!(
+                config.render_settings().only.is_empty(),
+                "expected `{name}` to disable render filtering"
+            );
+        }
     }
 
     #[test]
