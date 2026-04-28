@@ -32,7 +32,7 @@ pub(crate) struct DirtyServeWatcher {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ActiveRepoServeSync {
+struct ActiveRepoServeSync {
     source_root: PathBuf,
     build_repo_path: PathBuf,
 }
@@ -46,8 +46,8 @@ pub(crate) struct LocalThemeServeSync {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ServeSyncConfig {
-    pub(crate) active_repo: Option<ActiveRepoServeSync>,
-    pub(crate) local_theme: Option<LocalThemeServeSync>,
+    active_repo: Option<ActiveRepoServeSync>,
+    local_theme: Option<LocalThemeServeSync>,
 }
 
 impl ServeSyncConfig {
@@ -107,7 +107,7 @@ fn index_lock_path(index_path: &Path) -> Option<PathBuf> {
     Some(index_path.with_file_name(format!("{file_name}.lock")))
 }
 
-pub(crate) fn event_has_theme_index_path(index_path: &Path, event: &Event) -> bool {
+fn event_has_theme_index_path(index_path: &Path, event: &Event) -> bool {
     let lock_path = index_lock_path(index_path);
     event.paths.iter().any(|path| {
         path == index_path

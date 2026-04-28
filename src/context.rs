@@ -40,7 +40,7 @@ pub(crate) fn root(args: &Args) -> Result<PathBuf, Whatever> {
     Ok(dir)
 }
 
-pub(crate) fn workspace_search_start(args: &Args) -> Result<PathBuf, Whatever> {
+fn workspace_search_start(args: &Args) -> Result<PathBuf, Whatever> {
     match &args.root {
         Some(path) => {
             let path = resolve_input_path(path)?;

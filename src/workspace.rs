@@ -35,16 +35,16 @@ enum DoctorStatus {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DoctorReport {
-    pub(crate) warnings: usize,
-    pub(crate) failures: usize,
+struct DoctorReport {
+    warnings: usize,
+    failures: usize,
 }
 
-pub(crate) struct WorkspaceInitRepositories<'a> {
-    pub(crate) theme: &'a Url,
-    pub(crate) template: &'a Url,
-    pub(crate) preprocessor: &'a Url,
-    pub(crate) eipw: &'a Url,
+struct WorkspaceInitRepositories<'a> {
+    theme: &'a Url,
+    template: &'a Url,
+    preprocessor: &'a Url,
+    eipw: &'a Url,
 }
 
 impl fmt::Display for DoctorStatus {
@@ -224,10 +224,7 @@ fn check_optional_download_tool(report: &mut DoctorReport) {
     }
 }
 
-pub(crate) fn collect_doctor_report(
-    args: &Args,
-    check_tools: bool,
-) -> Result<DoctorReport, Whatever> {
+fn collect_doctor_report(args: &Args, check_tools: bool) -> Result<DoctorReport, Whatever> {
     let context = load_workspace_command_context(args)?;
     let mut report = DoctorReport::default();
     let (root_path, active_repo) = match root(args) {
@@ -450,7 +447,7 @@ pub(crate) fn init_workspace(
     init_workspace_with_repositories(args, path, include_template, platform_dev, &repositories)
 }
 
-pub(crate) fn init_workspace_with_repositories(
+fn init_workspace_with_repositories(
     args: &Args,
     path: PathBuf,
     include_template: bool,

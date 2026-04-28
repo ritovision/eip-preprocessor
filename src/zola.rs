@@ -290,7 +290,7 @@ pub fn serve(
     Ok(())
 }
 
-pub(crate) fn serve_args(
+fn serve_args(
     server_binding: &ServerBinding,
     output_path: &Path,
     base_url_override: Option<&Url>,

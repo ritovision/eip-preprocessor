@@ -96,7 +96,7 @@ fn resolve_environment_override(args: &Args) -> Result<Option<bool>, Whatever> {
     resolve_bool_override(args.staging, args.production, "--staging", "--production")
 }
 
-pub(crate) fn explicit_environment_or_parity(args: &Args) -> Result<Option<bool>, Whatever> {
+fn explicit_environment_or_parity(args: &Args) -> Result<Option<bool>, Whatever> {
     if let Some(staging) = resolve_environment_override(args)? {
         return Ok(Some(staging));
     }
@@ -266,7 +266,7 @@ fn theme_source(
     }
 }
 
-pub(crate) fn resolve_server_binding(
+fn resolve_server_binding(
     workspace_config: Option<&LoadedWorkspaceConfig>,
     server_cli: &ServerCliArgs,
 ) -> ServerBinding {
@@ -285,7 +285,7 @@ pub(crate) fn resolve_server_binding(
     binding
 }
 
-pub(crate) fn resolve_base_url_override(
+fn resolve_base_url_override(
     args: &Args,
     workspace_config: Option<&LoadedWorkspaceConfig>,
 ) -> Result<Option<Url>, Whatever> {
