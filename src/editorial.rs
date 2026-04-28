@@ -28,17 +28,21 @@ fn repo_relative_path(root_path: &Path, path: &Path) -> Result<PathBuf, Whatever
     }
 
     let full_path = root_path.join(path);
-    let canonical = full_path.canonicalize().whatever_context(format!(
-        "unable to resolve editorial target `{}`",
-        full_path.to_string_lossy()
-    ))?;
+    let canonical = full_path.canonicalize().with_whatever_context(|_| {
+        format!(
+            "unable to resolve editorial target `{}`",
+            full_path.to_string_lossy()
+        )
+    })?;
 
     let relative = canonical
         .strip_prefix(root_path)
-        .whatever_context(format!(
-            "editorial target `{}` escapes the active repository root",
-            path.to_string_lossy()
-        ))?
+        .with_whatever_context(|_| {
+            format!(
+                "editorial target `{}` escapes the active repository root",
+                path.to_string_lossy()
+            )
+        })?
         .to_path_buf();
 
     Ok(relative)
@@ -163,14 +167,13 @@ pub(crate) fn run_editorial_lint(
 }
 
 pub(crate) fn editorial_runtime_execution(
-    resolved: &ResolvedExecution,
+    mut resolved: ResolvedExecution,
     selectors: &EditorialSelectorArgs,
 ) -> ResolvedExecution {
-    let mut runtime = resolved.clone();
     if selectors.working_tree {
-        runtime.source_materialization = git::SourceMaterialization::Dirty;
+        resolved.source_materialization = git::SourceMaterialization::Dirty;
     }
-    runtime
+    resolved
 }
 
 #[cfg(test)]
@@ -215,7 +218,7 @@ mod tests {
         };
 
         assert_eq!(
-            editorial_runtime_execution(&resolved, &selectors).source_materialization,
+            editorial_runtime_execution(resolved, &selectors).source_materialization,
             crate::git::SourceMaterialization::Dirty
         );
     }

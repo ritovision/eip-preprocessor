@@ -161,7 +161,7 @@ fn run() -> Result<(), Whatever> {
             }
             EditorialCommand::Build { selectors, eipw } => {
                 run_editorial_lint(&resolved, &selectors, eipw)?;
-                Prepared::prepare(editorial_runtime_execution(&resolved, &selectors))?.check()?;
+                Prepared::prepare(editorial_runtime_execution(resolved, &selectors))?.check()?;
             }
         },
     }
