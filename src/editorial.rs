@@ -172,3 +172,51 @@ pub(crate) fn editorial_runtime_execution(
     }
     runtime
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::{
+        cli::EditorialSelectorArgs,
+        config::{self, ServerBinding},
+        execution::ResolvedExecution,
+        theme::ThemeSource,
+    };
+
+    use super::editorial_runtime_execution;
+
+    #[test]
+    fn editorial_working_tree_build_still_forces_dirty_runtime_materialization() {
+        let resolved = ResolvedExecution {
+            root_path: PathBuf::from("/workspace/Core"),
+            build_path: PathBuf::from("/workspace/build/Core"),
+            repository_use: crate::git::RepositoryUse {
+                title: "Core".to_owned(),
+                location: config::RepositoryEndpoint {
+                    repository: "https://example.test/Core.git".parse().unwrap(),
+                    base_url: "https://example.test/Core/".parse().unwrap(),
+                },
+                other_repos: Default::default(),
+            },
+            theme: ThemeSource::Remote {
+                repository: "https://example.test/theme.git".to_owned(),
+                commit: "HEAD".to_owned(),
+            },
+            source_materialization: crate::git::SourceMaterialization::Clean,
+            server_binding: ServerBinding::default(),
+            base_url_override: None,
+        };
+        let selectors = EditorialSelectorArgs {
+            paths: Vec::new(),
+            batch: None,
+            working_tree: true,
+            against_upstream: false,
+        };
+
+        assert_eq!(
+            editorial_runtime_execution(&resolved, &selectors).source_materialization,
+            crate::git::SourceMaterialization::Dirty
+        );
+    }
+}

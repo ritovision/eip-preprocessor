@@ -171,3 +171,103 @@ impl Prepared {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use git2::{IndexAddOption, Repository, Signature};
+    use tempfile::TempDir;
+
+    use crate::{
+        layout::{mounted_theme_path, theme_config_path},
+        theme::ThemeSource,
+    };
+
+    use super::prepare_theme_for_zola;
+
+    fn write_file(root: &Path, relative: impl AsRef<Path>, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn commit_all(repo: &Repository, message: &str) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
+    fn init_repo(path: &Path, files: &[(&str, &str)]) -> Repository {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = Repository::init(path).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        for (relative, contents) in files {
+            write_file(path, relative, contents);
+        }
+        commit_all(&repo, "initial");
+        repo
+    }
+
+    #[test]
+    fn workspace_local_theme_is_materialized_as_mounted_theme_for_zola() {
+        let temp = TempDir::new().unwrap();
+        let theme_root = temp.path().join("workspace/theme");
+        init_repo(
+            &theme_root,
+            &[
+                ("config/zola.toml", "title = 'theme'\n"),
+                ("templates/index.html", "local theme\n"),
+            ],
+        );
+        let repo_path = temp.path().join("workspace/.local-build/Core/repo");
+
+        let (theme, sync) = prepare_theme_for_zola(
+            ThemeSource::Local {
+                path: theme_root.clone(),
+            },
+            &repo_path,
+        )
+        .unwrap();
+
+        let mounted_theme_dir = mounted_theme_path(&repo_path);
+        assert!(matches!(theme, ThemeSource::Local { path } if path == mounted_theme_dir));
+        assert_eq!(
+            theme_config_path(&mounted_theme_dir),
+            repo_path.join("themes/eips-theme/config/zola.toml")
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted_theme_dir.join("templates/index.html")).unwrap(),
+            "local theme\n"
+        );
+        let sync = sync.expect("local theme should enable serve sync");
+        assert_eq!(sync.theme_source_root, theme_root);
+        assert_eq!(sync.mounted_theme_dir, mounted_theme_dir);
+        assert!(sync.theme_index_path.ends_with(".git/index"));
+    }
+}

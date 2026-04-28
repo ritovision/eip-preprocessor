@@ -424,11 +424,52 @@ pub(crate) fn serve_sync_config(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
+    use clap::Parser;
     use notify::{Event, EventKind};
+    use tempfile::TempDir;
 
-    use super::event_has_theme_index_path;
+    use crate::{
+        cli::Args,
+        config::{self, LoadedWorkspaceConfig},
+        execution::{resolve_execution_settings, ExecutionSettings},
+    };
+
+    use super::{event_has_theme_index_path, serve_sync_config, LocalThemeServeSync};
+
+    fn parse_args(arguments: &[&str]) -> Args {
+        Args::try_parse_from(arguments).unwrap()
+    }
+
+    fn load_workspace_config(contents: &str) -> LoadedWorkspaceConfig {
+        let workspace = TempDir::new().unwrap();
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(&config_path, contents).unwrap();
+        LoadedWorkspaceConfig::from_path(&config_path).unwrap()
+    }
+
+    fn settings_for(
+        arguments: &[&str],
+        sibling_ids: &[&str],
+        workspace_config: Option<&LoadedWorkspaceConfig>,
+    ) -> ExecutionSettings {
+        let args = parse_args(arguments);
+        let sibling_ids = sibling_ids
+            .iter()
+            .map(|sibling_id| (*sibling_id).to_owned())
+            .collect::<Vec<_>>();
+
+        resolve_execution_settings(&args, &sibling_ids, workspace_config).unwrap()
+    }
+
+    fn fake_theme_sync(root: &Path) -> LocalThemeServeSync {
+        LocalThemeServeSync {
+            theme_source_root: root.join("theme"),
+            mounted_theme_dir: root.join("repo/themes/eips-theme"),
+            theme_index_path: root.join("theme/.git/index"),
+        }
+    }
 
     #[test]
     fn local_theme_index_events_trigger_rescan() {
@@ -442,5 +483,53 @@ mod tests {
         assert!(event_has_theme_index_path(&index_path, &index_event));
         assert!(event_has_theme_index_path(&index_path, &lock_event));
         assert!(!event_has_theme_index_path(&index_path, &unrelated_event));
+    }
+
+    #[test]
+    fn local_serve_syncs_theme_and_dirty_active_repo() {
+        let temp = TempDir::new().unwrap();
+        let workspace_config = load_workspace_config("");
+        let settings = settings_for(&["build-eips", "serve"], &["ERCs"], Some(&workspace_config));
+        let source_materialization = if settings.allow_dirty {
+            crate::git::SourceMaterialization::Dirty
+        } else {
+            crate::git::SourceMaterialization::Clean
+        };
+
+        let sync_config = serve_sync_config(
+            source_materialization,
+            &temp.path().join("Core"),
+            &temp.path().join(".local-build/Core/repo"),
+            Some(fake_theme_sync(temp.path())),
+        );
+
+        assert!(sync_config.active_repo.is_some());
+        assert!(sync_config.local_theme.is_some());
+    }
+
+    #[test]
+    fn clean_local_serve_keeps_theme_sync_but_disables_active_repo_dirty_sync() {
+        let temp = TempDir::new().unwrap();
+        let workspace_config = load_workspace_config("");
+        let settings = settings_for(
+            &["build-eips", "serve", "--clean"],
+            &["ERCs"],
+            Some(&workspace_config),
+        );
+        let source_materialization = if settings.allow_dirty {
+            crate::git::SourceMaterialization::Dirty
+        } else {
+            crate::git::SourceMaterialization::Clean
+        };
+
+        let sync_config = serve_sync_config(
+            source_materialization,
+            &temp.path().join("Core"),
+            &temp.path().join(".local-build/Core/repo"),
+            Some(fake_theme_sync(temp.path())),
+        );
+
+        assert!(sync_config.active_repo.is_none());
+        assert!(sync_config.local_theme.is_some());
     }
 }
