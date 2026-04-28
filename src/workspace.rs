@@ -525,3 +525,394 @@ pub(crate) fn init_workspace_with_repositories(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::Parser;
+    use git2::{IndexAddOption, Repository, Signature};
+    use tempfile::TempDir;
+    use url::Url;
+
+    use crate::{
+        cli::{Args, Operation, WorkspaceCommand},
+        config::{self, LoadedWorkspaceConfig},
+    };
+
+    use super::{
+        collect_doctor_report, init_workspace_with_repositories, WorkspaceInitRepositories,
+    };
+
+    fn parse_args(arguments: &[&str]) -> Args {
+        Args::try_parse_from(arguments).unwrap()
+    }
+
+    fn file_url(path: &Path) -> Url {
+        Url::from_directory_path(path).unwrap()
+    }
+
+    fn write_file(root: &Path, relative: impl AsRef<Path>, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn commit_all(repo: &Repository, message: &str) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let signature = Signature::now("build-eips test", "build-eips@example.test").unwrap();
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
+    fn init_repo(path: &Path, files: &[(&str, &str)]) -> Repository {
+        std::fs::create_dir_all(path).unwrap();
+        let repo = Repository::init(path).unwrap();
+        repo.set_head("refs/heads/master").unwrap();
+        for (relative, contents) in files {
+            write_file(path, relative, contents);
+        }
+        commit_all(&repo, "initial");
+        repo
+    }
+
+    fn repo_manifest_text(repo_id: &str, repository: &Url, siblings: &[(&str, Url)]) -> String {
+        let mut manifest = format!(
+            r#"
+repo_id = "{repo_id}"
+
+[production]
+repository = "{repository}"
+base_url = "https://example.test/{repo_id}/"
+
+[staging]
+repository = "{repository}"
+base_url = "https://staging.example.test/{repo_id}/"
+"#
+        );
+
+        for (sibling_id, sibling_repository) in siblings {
+            manifest.push_str(&format!(
+                r#"
+[siblings.{sibling_id}.production]
+repository = "{sibling_repository}"
+base_url = "https://example.test/{sibling_id}/"
+
+[siblings.{sibling_id}.staging]
+repository = "{sibling_repository}"
+base_url = "https://staging.example.test/{sibling_id}/"
+"#
+            ));
+        }
+
+        manifest
+    }
+
+    fn write_repo_manifest_file(
+        path: &Path,
+        repo_id: &str,
+        upstream: &Url,
+        siblings: &[(&str, Url)],
+    ) {
+        write_file(
+            path,
+            config::REPO_MANIFEST_FILE,
+            &repo_manifest_text(repo_id, upstream, siblings),
+        );
+    }
+
+    fn write_manifest_repo(
+        path: &Path,
+        repo_id: &str,
+        upstream: &Url,
+        siblings: &[(&str, Url)],
+    ) -> Repository {
+        let repo = init_repo(path, &[("content/0001.md", "# Proposal\n")]);
+        write_repo_manifest_file(path, repo_id, upstream, siblings);
+        commit_all(&repo, "add repo manifest");
+        repo
+    }
+
+    fn init_workspace_source_repo(remotes_root: &Path, name: &str) -> Url {
+        let path = remotes_root.join(name);
+        init_repo(&path, &[("README.md", "workspace init test repo\n")]);
+        file_url(&path)
+    }
+
+    fn workspace_init_test_repository_urls(remotes_root: &Path) -> (Url, Url, Url, Url) {
+        (
+            init_workspace_source_repo(remotes_root, "theme"),
+            init_workspace_source_repo(remotes_root, "template"),
+            init_workspace_source_repo(remotes_root, "preprocessor"),
+            init_workspace_source_repo(remotes_root, "eipw"),
+        )
+    }
+
+    fn assert_workspace_init_optional_repos(
+        workspace_root: &Path,
+        expect_template: bool,
+        expect_platform_dev: bool,
+    ) {
+        assert!(Repository::open(workspace_root.join(config::DEFAULT_THEME_DIR)).is_ok());
+        assert_eq!(
+            Repository::open(workspace_root.join("template")).is_ok(),
+            expect_template
+        );
+        assert_eq!(
+            Repository::open(workspace_root.join("preprocessor")).is_ok(),
+            expect_platform_dev
+        );
+        assert_eq!(
+            Repository::open(workspace_root.join("eipw")).is_ok(),
+            expect_platform_dev
+        );
+    }
+
+    fn assert_workspace_init_and_doctor_for_siblings(sibling_ids: &[&str]) {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitRepositories {
+            theme: &theme_url,
+            template: &template_url,
+            preprocessor: &preprocessor_url,
+            eipw: &eipw_url,
+        };
+
+        let sibling_repositories = sibling_ids
+            .iter()
+            .map(|sibling_id| {
+                let sibling_id = *sibling_id;
+                let sibling_path = remotes_root.join(sibling_id);
+                let sibling_url = file_url(&sibling_path);
+                write_manifest_repo(&sibling_path, sibling_id, &sibling_url, &[]);
+                (sibling_id.to_owned(), sibling_url)
+            })
+            .collect::<Vec<_>>();
+        let sibling_manifest_entries = sibling_repositories
+            .iter()
+            .map(|(repo_id, url)| (repo_id.as_str(), url.clone()))
+            .collect::<Vec<_>>();
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &sibling_manifest_entries);
+        let init_args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "init",
+            workspace_root.to_str().unwrap(),
+        ]);
+
+        init_workspace_with_repositories(
+            &init_args,
+            workspace_root.clone(),
+            false,
+            false,
+            &repositories,
+        )
+        .unwrap();
+
+        assert!(workspace_root.join(config::LOCAL_CONFIG_FILE).is_file());
+        assert_workspace_init_optional_repos(&workspace_root, false, false);
+        for sibling_id in sibling_ids {
+            assert!(Repository::open(workspace_root.join(sibling_id)).is_ok());
+        }
+
+        let doctor_args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "doctor",
+        ]);
+        let report = collect_doctor_report(&doctor_args, false).unwrap();
+
+        assert_eq!(report.failures, 0);
+    }
+
+    fn assert_workspace_init_optional_clone_behavior(
+        flags: &[&str],
+        expect_template: bool,
+        expect_platform_dev: bool,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        let remotes_root = temp.path().join("remotes");
+        let (theme_url, template_url, preprocessor_url, eipw_url) =
+            workspace_init_test_repository_urls(&remotes_root);
+        let repositories = WorkspaceInitRepositories {
+            theme: &theme_url,
+            template: &template_url,
+            preprocessor: &preprocessor_url,
+            eipw: &eipw_url,
+        };
+        let active_path = workspace_root.join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let active_path = active_path.to_string_lossy();
+        let workspace_root_arg = workspace_root.to_string_lossy();
+        let mut arguments = vec![
+            "build-eips",
+            "-C",
+            active_path.as_ref(),
+            "workspace",
+            "init",
+            workspace_root_arg.as_ref(),
+        ];
+        arguments.extend_from_slice(flags);
+        let init_args = parse_args(&arguments);
+        let Operation::Workspace {
+            command:
+                WorkspaceCommand::Init {
+                    path,
+                    template,
+                    platform_dev,
+                },
+        } = init_args.operation.clone()
+        else {
+            panic!("expected workspace init command");
+        };
+
+        assert_eq!(template, expect_template);
+        assert_eq!(platform_dev, expect_platform_dev);
+
+        init_workspace_with_repositories(&init_args, path, template, platform_dev, &repositories)
+            .unwrap();
+
+        assert_workspace_init_optional_repos(&workspace_root, expect_template, expect_platform_dev);
+    }
+
+    #[test]
+    fn workspace_init_and_doctor_cover_zero_one_and_many_siblings() {
+        assert_workspace_init_and_doctor_for_siblings(&[]);
+        assert_workspace_init_and_doctor_for_siblings(&["ERCs"]);
+        assert_workspace_init_and_doctor_for_siblings(&["EIPs", "ERCs"]);
+    }
+
+    #[test]
+    fn default_workspace_init_clones_required_repos_only() {
+        assert_workspace_init_optional_clone_behavior(&[], false, false);
+    }
+
+    #[test]
+    fn workspace_init_template_clones_template_only_as_optional_repo() {
+        assert_workspace_init_optional_clone_behavior(&["--template"], true, false);
+    }
+
+    #[test]
+    fn workspace_init_platform_dev_clones_platform_repos_only_as_optional_repos() {
+        assert_workspace_init_optional_clone_behavior(&["--platform-dev"], false, true);
+    }
+
+    #[test]
+    fn workspace_init_template_and_platform_dev_clone_all_optional_repos() {
+        assert_workspace_init_optional_clone_behavior(
+            &["--template", "--platform-dev"],
+            true,
+            true,
+        );
+    }
+
+    #[test]
+    fn workspace_doctor_missing_config_reports_one_failure_without_skip_warning() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "doctor",
+        ]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_parse_failed_config_reports_one_failure_without_skip_warning() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        std::fs::write(workspace.path().join(config::LOCAL_CONFIG_FILE), "[").unwrap();
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "doctor",
+        ]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn workspace_doctor_removed_config_fields_report_parse_failure_check() {
+        let workspace = TempDir::new().unwrap();
+        let active_path = workspace.path().join("Core");
+        let active_url = file_url(&active_path);
+        write_manifest_repo(&active_path, "Core", &active_url, &[]);
+        let config_path = workspace.path().join(config::LOCAL_CONFIG_FILE);
+        std::fs::write(
+            &config_path,
+            r#"
+build_root_base = ".local-build"
+default_profile = "local"
+
+[profiles.local]
+staging = true
+"#,
+        )
+        .unwrap();
+        let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+        assert!(matches!(error, config::WorkspaceError::Parse { .. }));
+        let args = parse_args(&[
+            "build-eips",
+            "-C",
+            active_path.to_str().unwrap(),
+            "workspace",
+            "doctor",
+        ]);
+
+        let report = collect_doctor_report(&args, false).unwrap();
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.warnings, 0);
+    }
+}
