@@ -293,6 +293,20 @@ impl OnlyRenderPlan {
             .map(String::as_str)
     }
 
+    pub(crate) fn external_url_for_content_target(
+        &self,
+        content_relative_path: &Path,
+    ) -> Option<&str> {
+        let proposal_number = proposal_number_from_content_markdown_path(content_relative_path)?;
+        if self.selected_numbers.contains(&proposal_number) {
+            return None;
+        }
+
+        self.public_urls_by_number
+            .get(&proposal_number)
+            .map(String::as_str)
+    }
+
     pub(crate) fn reference_for_required_number(
         &self,
         proposal_number: ProposalNumber,
@@ -336,6 +350,52 @@ impl OnlyRenderPlan {
 
     pub(crate) fn should_process_proposal_dir(&self, content_relative_path: &Path) -> bool {
         path_component_proposal_number(content_relative_path.file_name())
+            .map(|proposal_number| self.selected_numbers.contains(&proposal_number))
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn should_sync_dirty_path(&self, repo_relative_path: &Path) -> bool {
+        let Ok(content_relative_path) = repo_relative_path.strip_prefix(CONTENT_DIR) else {
+            return true;
+        };
+
+        self.should_sync_content_dirty_path(content_relative_path)
+    }
+
+    pub(crate) fn is_selected_proposal_markdown_path(&self, repo_relative_path: &Path) -> bool {
+        let Ok(content_relative_path) = repo_relative_path.strip_prefix(CONTENT_DIR) else {
+            return false;
+        };
+
+        self.is_selected_content_proposal_markdown_path(content_relative_path)
+    }
+
+    fn is_selected_content_proposal_markdown_path(&self, content_relative_path: &Path) -> bool {
+        let Some(proposal_number) =
+            proposal_number_from_content_markdown_path(content_relative_path)
+        else {
+            return false;
+        };
+
+        self.selected_numbers.contains(&proposal_number)
+            && self
+                .markdown_paths_by_number
+                .get(&proposal_number)
+                .map(|paths| paths.contains(content_relative_path))
+                .unwrap_or(false)
+    }
+
+    fn should_sync_content_dirty_path(&self, content_relative_path: &Path) -> bool {
+        if proposal_number_from_content_markdown_path(content_relative_path).is_some() {
+            return self.is_selected_content_proposal_markdown_path(content_relative_path);
+        }
+
+        let mut components = content_relative_path.components();
+        let Some(first) = components.next() else {
+            return true;
+        };
+
+        path_component_proposal_number(Some(first.as_os_str()))
             .map(|proposal_number| self.selected_numbers.contains(&proposal_number))
             .unwrap_or(true)
     }
@@ -688,5 +748,29 @@ mod tests {
         assert!(!content.join("00678.md").exists());
         assert!(!content.join("00777").exists());
         assert!(content.join("_index.md").is_file());
+    }
+
+    #[test]
+    fn only_render_plan_filters_dirty_paths_without_filesystem_state() {
+        let temp = TempDir::new().unwrap();
+        let content = temp.path();
+        write_file(content, "00555.md", &proposal_markdown(555, None));
+        write_file(content, "00678.md", &proposal_markdown(678, None));
+        let plan = OnlyRenderPlan::build(content, [number(555)].into_iter().collect()).unwrap();
+
+        assert!(plan.should_sync_dirty_path(Path::new("content/00555.md")));
+        assert!(plan.should_sync_dirty_path(Path::new("content/00555/assets/diagram.png")));
+        assert!(plan.should_sync_dirty_path(Path::new("content/_index.md")));
+        assert!(plan.should_sync_dirty_path(Path::new(".build-eips.repo.toml")));
+        assert!(!plan.should_sync_dirty_path(Path::new("content/00678.md")));
+        assert!(!plan.should_sync_dirty_path(Path::new("content/00678/assets/diagram.png")));
+        assert!(!plan.should_sync_dirty_path(Path::new("content/00999.md")));
+
+        assert!(plan.is_selected_proposal_markdown_path(Path::new("content/00555.md")));
+        assert!(
+            !plan.is_selected_proposal_markdown_path(Path::new("content/00555/assets/diagram.png"))
+        );
+        assert!(!plan.is_selected_proposal_markdown_path(Path::new("content/_index.md")));
+        assert!(!plan.is_selected_proposal_markdown_path(Path::new("content/00678.md")));
     }
 }

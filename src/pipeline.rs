@@ -49,6 +49,7 @@ pub(crate) struct Prepared {
     repository_use: git::RepositoryUse,
     theme_path: PathBuf,
     local_theme_sync: Option<LocalThemeServeSync>,
+    only_plan: Option<OnlyRenderPlan>,
     source_root: PathBuf,
     source_materialization: git::SourceMaterialization,
     server_binding: ServerBinding,
@@ -110,6 +111,7 @@ impl Prepared {
             local_theme_sync: Some(local_theme_sync),
             repo_path,
             output_path,
+            only_plan,
             source_root: root_path,
             source_materialization,
             server_binding,
@@ -137,6 +139,7 @@ impl Prepared {
             self.source_materialization,
             &self.source_root,
             &self.repo_path,
+            self.only_plan.clone(),
             self.local_theme_sync.clone(),
         );
         let dirty_watcher = if sync_config.has_targets() {

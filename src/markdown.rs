@@ -342,6 +342,7 @@ pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Resul
 pub fn preprocess_paths(
     root_path: &Path,
     relative_paths: &BTreeSet<PathBuf>,
+    only_plan: Option<&OnlyRenderPlan>,
 ) -> Result<(), Whatever> {
     let mut eips = BTreeSet::new();
     let mut asset_dirs = BTreeSet::new();
@@ -356,6 +357,13 @@ pub fn preprocess_paths(
         }
 
         if content_relative_path.extension().and_then(OsStr::to_str) != Some("md") {
+            continue;
+        }
+
+        if only_plan
+            .map(|plan| !plan.should_sync_dirty_path(relative_path))
+            .unwrap_or(false)
+        {
             continue;
         }
 
@@ -382,11 +390,11 @@ pub fn preprocess_paths(
     }
 
     for path in eips {
-        process_eip(root_path, &path, None)?;
+        process_eip(root_path, &path, only_plan)?;
     }
 
     for path in asset_dirs {
-        process_assets(root_path, &path, None)?;
+        process_assets(root_path, &path, only_plan)?;
     }
 
     Ok(())
@@ -447,6 +455,20 @@ fn canonicalize_md(path: &Path) -> Result<PathBuf, Whatever> {
     })
 }
 
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn fix_links<'a, 'b>(
     root: &'a Path,
     parent: &'a Path,
@@ -477,6 +499,26 @@ fn fix_links<'a, 'b>(
             } else {
                 parent.join(Path::new(iri_path))
             };
+            let normalized_root = normalize_path_lexically(root);
+            let normalized_child = normalize_path_lexically(&child);
+            if let Some(public_url) = only_plan.and_then(|plan| {
+                normalized_child
+                    .strip_prefix(&normalized_root)
+                    .ok()
+                    .and_then(|relative_path| plan.external_url_for_content_target(relative_path))
+            }) {
+                let mut external_url = public_url.to_owned();
+                if let Some(query) = iri_ref.query() {
+                    external_url.push('?');
+                    external_url.push_str(query.as_str());
+                }
+                if let Some(fragment) = iri_ref.fragment() {
+                    external_url.push('#');
+                    external_url.push_str(fragment.as_str());
+                }
+                *dest_url = CowStr::from(external_url);
+                return Ok(e);
+            }
             let canonicalized = canonicalize_md(&child)?;
             if let Some(public_url) =
                 only_plan.and_then(|plan| plan.external_url_for_canonical_target(&canonicalized))
@@ -854,7 +896,7 @@ mod tests {
     use tempfile::TempDir;
     use toml::Value as TomlValue;
 
-    use super::preprocess;
+    use super::{preprocess, preprocess_paths};
     use crate::proposal::{OnlyRenderPlan, ProposalNumber};
 
     fn number(value: u32) -> ProposalNumber {
@@ -922,6 +964,10 @@ mod tests {
         OnlyRenderPlan::build(content_root, selected).unwrap()
     }
 
+    fn repo_paths(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
     fn rendered_body(path: &Path) -> String {
         let contents = std::fs::read_to_string(path).unwrap();
         contents.split_once("\n+++\n").unwrap().1.to_owned()
@@ -960,6 +1006,34 @@ mod tests {
     }
 
     #[test]
+    fn targeted_preprocess_paths_rewrites_selected_dirty_markdown_with_plan() {
+        let (_temp, content) = content_repo(&[
+            (
+                "00555.md",
+                proposal_markdown(
+                    555,
+                    None,
+                    "requires: 155\n",
+                    "See [EIP-155](./00155.md#list-of-chain-id-s).",
+                ),
+            ),
+            ("00155.md", proposal_markdown(155, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess_paths(&content, &repo_paths(&["content/00555.md"]), Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("00555.md"));
+        let front_matter = rendered_front_matter(&content.join("00555.md"));
+        let requires = front_matter["extra"]["requires"].as_array().unwrap();
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-155#list-of-chain-id-s"));
+        assert_eq!(
+            requires[0].as_str().unwrap(),
+            "https://eips.ethereum.org/EIPS/eip-155"
+        );
+    }
+
+    #[test]
     fn targeted_preprocess_rewrites_retained_non_proposal_links_to_public_urls() {
         let (_temp, content) = content_repo(&[
             (
@@ -976,6 +1050,56 @@ mod tests {
         let body = rendered_body(&content.join("_index.md"));
         assert!(body.contains("https://eips.ethereum.org/EIPS/eip-678"));
         assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_rewrites_retained_non_proposal_markdown_with_plan() {
+        let (_temp, content) = content_repo(&[
+            (
+                "_index.md",
+                "---\ntitle: Home\n---\nSee [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess_paths(&content, &repo_paths(&["content/_index.md"]), Some(&plan)).unwrap();
+
+        let body = rendered_body(&content.join("_index.md"));
+        assert!(body.contains("https://eips.ethereum.org/EIPS/eip-678"));
+        assert!(!body.contains("@/00678.md"));
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_rewrites_selected_asset_markdown_with_plan() {
+        let (_temp, content) = content_repo(&[
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            (
+                "00555/assets/guide.md",
+                "See [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00555/assets/diagram.png", "image\n".to_owned()),
+            (
+                "00678.md",
+                proposal_markdown(678, Some("ERC"), "", "Unselected."),
+            ),
+        ]);
+        let plan = only_plan(&content, &[555]);
+
+        preprocess_paths(
+            &content,
+            &repo_paths(&["content/00555/assets/guide.md"]),
+            Some(&plan),
+        )
+        .unwrap();
+
+        let body = rendered_body(&content.join("00555/assets/guide.md"));
+        assert!(body.contains("https://ercs.ethereum.org/ERCS/erc-678"));
+        assert_eq!(
+            std::fs::read_to_string(content.join("00555/assets/diagram.png")).unwrap(),
+            "image\n"
+        );
     }
 
     #[test]

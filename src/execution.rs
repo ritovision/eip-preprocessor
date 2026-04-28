@@ -123,9 +123,11 @@ fn cli_only_requested(args: &Args) -> bool {
         .unwrap_or(false)
 }
 
-fn build_only_cli_is_applicable(args: &Args, explicit_environment: Option<bool>) -> bool {
-    matches!(args.operation, Operation::Build { .. })
-        && explicit_environment.is_none()
+fn only_cli_is_applicable(args: &Args, explicit_environment: Option<bool>) -> bool {
+    matches!(
+        args.operation,
+        Operation::Build { .. } | Operation::Serve { .. }
+    ) && explicit_environment.is_none()
         && !args.operation.clean_cli_args().clean
         && !args.remote_sibling_repo
 }
@@ -144,8 +146,8 @@ pub(crate) fn resolve_execution_settings(
     let sibling_override = remote_source_override(args.remote_sibling_repo);
     let clean = args.operation.clean_cli_args().clean;
 
-    if cli_only_requested(args) && !build_only_cli_is_applicable(args, explicit_environment) {
-        snafu::whatever!("--only is supported only for local dirty build commands");
+    if cli_only_requested(args) && !only_cli_is_applicable(args, explicit_environment) {
+        snafu::whatever!("--only is supported only for local dirty build and serve commands");
     }
 
     let (staging, allow_dirty, default_sibling) = if let Some(staging) = explicit_environment {
@@ -200,15 +202,19 @@ fn resolve_only_selection(
     workspace_config: Option<&LoadedWorkspaceConfig>,
 ) -> Result<Option<BTreeSet<ProposalNumber>>, Whatever> {
     let explicit_environment = explicit_environment_or_parity(args)?;
-    let applicable = matches!(args.operation, Operation::Build { .. })
-        && explicit_environment.is_none()
+    let applicable = matches!(
+        args.operation,
+        Operation::Build { .. } | Operation::Serve { .. }
+    ) && explicit_environment.is_none()
         && settings.allow_dirty
         && settings.sibling == SelectedSource::WorkspaceLocal;
 
     if let Some(only) = args.operation.only_cli_args() {
         if let Some(numbers) = dedupe_only_numbers(&only.only) {
             if !applicable {
-                snafu::whatever!("--only is supported only for local dirty build commands");
+                snafu::whatever!(
+                    "--only is supported only for local dirty build and serve commands"
+                );
             }
             return Ok(Some(numbers));
         }
@@ -906,10 +912,22 @@ only = [678, 555, 678]
             .unwrap(),
             vec![555, 897]
         );
+        assert_eq!(
+            only_selection_for(&["build-eips", "serve"], Some(&workspace_config)).unwrap(),
+            vec![555, 678]
+        );
+        assert_eq!(
+            only_selection_for(
+                &["build-eips", "serve", "--only", "00555", "555", "897"],
+                Some(&workspace_config)
+            )
+            .unwrap(),
+            vec![555, 897]
+        );
     }
 
     #[test]
-    fn only_cli_rejects_parsed_non_applicable_build_modes() {
+    fn only_cli_rejects_parsed_non_applicable_build_and_serve_modes() {
         for arguments in [
             &["build-eips", "--staging", "build", "--only", "555"][..],
             &["build-eips", "--production", "build", "--only", "555"][..],
@@ -921,13 +939,23 @@ only = [678, 555, 678]
                 "--only",
                 "555",
             ][..],
+            &["build-eips", "--staging", "serve", "--only", "555"][..],
+            &["build-eips", "--production", "serve", "--only", "555"][..],
+            &["build-eips", "serve", "--clean", "--only", "555"][..],
+            &[
+                "build-eips",
+                "--remote-sibling-repo",
+                "serve",
+                "--only",
+                "555",
+            ][..],
         ] {
             let args = parse_args(arguments);
             let error = resolve_execution_settings(&args, &[], None).unwrap_err();
 
             assert!(error
                 .to_string()
-                .contains("--only is supported only for local dirty build commands"));
+                .contains("--only is supported only for local dirty build and serve commands"));
         }
     }
 
@@ -941,11 +969,13 @@ only = [999999]
         );
 
         for arguments in [
-            &["build-eips", "serve"][..],
             &["build-eips", "check"][..],
             &["build-eips", "build", "--clean"][..],
+            &["build-eips", "serve", "--clean"][..],
             &["build-eips", "--staging", "build"][..],
+            &["build-eips", "--staging", "serve"][..],
             &["build-eips", "parity", "build"][..],
+            &["build-eips", "parity", "serve"][..],
         ] {
             assert!(only_selection_for(arguments, Some(&workspace_config)).is_none());
         }
@@ -965,6 +995,9 @@ only = []
         assert!(only_selection_for(&["build-eips", "build"], Some(&missing_render)).is_none());
         assert!(only_selection_for(&["build-eips", "build"], Some(&missing_only)).is_none());
         assert!(only_selection_for(&["build-eips", "build"], Some(&empty_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_render)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&missing_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "serve"], Some(&empty_only)).is_none());
     }
 
     #[test]

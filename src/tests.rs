@@ -694,7 +694,7 @@ fn normal_build_after_only_restores_full_materialized_content_tree() {
 }
 
 #[test]
-fn serve_ignores_render_only_config_and_does_not_validate_selected_proposals() {
+fn serve_applies_render_only_config_in_phase_two() {
     let workspace = TempDir::new().unwrap();
     let workspace_root = workspace.path().join("workspace");
     let active_path = workspace_root.join("Core");
@@ -709,12 +709,119 @@ fn serve_ignores_render_only_config_and_does_not_validate_selected_proposals() {
         config::LOCAL_CONFIG_FILE,
         r#"
 [render]
-only = [999999]
+only = [555]
 "#,
     );
 
     let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "serve"]);
     let resolved = resolve_execution(&args).unwrap();
 
-    assert!(resolved.only.is_none());
+    assert_eq!(
+        resolved
+            .only
+            .unwrap()
+            .into_iter()
+            .map(|number| number.get())
+            .collect::<Vec<_>>(),
+        vec![555]
+    );
+}
+
+#[test]
+fn only_serve_startup_uses_build_filtering() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("workspace");
+    let active_path = workspace_root.join("Core");
+    let active_url = file_url(&active_path);
+    let selected_555 = proposal_markdown(555, None, "Selected proposal.");
+    let unselected_678 = proposal_markdown(678, Some("ERC"), "Unselected proposal.");
+    let active_repo = init_repo(
+        &active_path,
+        &[
+            ("content/00555.md", selected_555.as_str()),
+            ("content/00678.md", unselected_678.as_str()),
+        ],
+    );
+    write_repo_manifest_file(&active_path, "Core", &active_url, &[]);
+    commit_all(&active_repo, "add manifest");
+    std::fs::create_dir(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+    write_file(
+        &workspace_root,
+        config::LOCAL_CONFIG_FILE,
+        &config::default_workspace_config_text(),
+    );
+
+    let args = parse_args(&[
+        "build-eips",
+        "-C",
+        active_path.to_str().unwrap(),
+        "serve",
+        "--only",
+        "555",
+    ]);
+    let resolved = resolve_execution(&args).unwrap();
+    let repo_path = materialize_resolved_repo(&resolved);
+    preprocess_and_prune_only(&repo_path, resolved.only.clone().unwrap());
+
+    assert!(repo_path.join("content/00555.md").is_file());
+    assert!(!repo_path.join("content/00678.md").exists());
+}
+
+#[test]
+fn normal_serve_after_only_restores_full_materialized_content_tree() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("workspace");
+    let active_path = workspace_root.join("Core");
+    let active_url = file_url(&active_path);
+    let selected_555 = proposal_markdown(555, None, "Selected proposal.");
+    let unselected_678 = proposal_markdown(678, Some("ERC"), "Unselected proposal.");
+    let active_repo = init_repo(
+        &active_path,
+        &[
+            ("content/00555.md", selected_555.as_str()),
+            ("content/00678.md", unselected_678.as_str()),
+        ],
+    );
+    write_repo_manifest_file(&active_path, "Core", &active_url, &[]);
+    commit_all(&active_repo, "add manifest");
+    std::fs::create_dir(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+    write_file(
+        &workspace_root,
+        config::LOCAL_CONFIG_FILE,
+        &config::default_workspace_config_text(),
+    );
+    let build_root = temp.path().join("build-root");
+
+    let only_args = parse_args(&[
+        "build-eips",
+        "-C",
+        active_path.to_str().unwrap(),
+        "--build-root",
+        build_root.to_str().unwrap(),
+        "serve",
+        "--only",
+        "555",
+    ]);
+    let only_resolved = resolve_execution(&only_args).unwrap();
+    let repo_path = materialize_resolved_repo(&only_resolved);
+    preprocess_and_prune_only(&repo_path, only_resolved.only.clone().unwrap());
+
+    assert!(repo_path.join("content/00555.md").is_file());
+    assert!(!repo_path.join("content/00678.md").exists());
+
+    let normal_args = parse_args(&[
+        "build-eips",
+        "-C",
+        active_path.to_str().unwrap(),
+        "--build-root",
+        build_root.to_str().unwrap(),
+        "serve",
+    ]);
+    let normal_resolved = resolve_execution(&normal_args).unwrap();
+    assert!(normal_resolved.only.is_none());
+    let restored_repo_path = materialize_resolved_repo(&normal_resolved);
+    markdown::preprocess(&restored_repo_path.join(CONTENT_DIR), None).unwrap();
+
+    assert!(restored_repo_path.join("content/00555.md").is_file());
+    assert!(restored_repo_path.join("content/00678.md").is_file());
 }
