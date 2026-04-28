@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+// Cross-domain behavior tests live here; see src/README.md for module test ownership.
+
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
