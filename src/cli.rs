@@ -173,6 +173,10 @@ pub(crate) enum WorkspaceCommand {
         /// Also clone template for proposal-family scaffold work
         #[arg(long)]
         template: bool,
+
+        /// Also clone preprocessor and eipw for platform development
+        #[arg(long)]
+        platform_dev: bool,
     },
 
     /// Check whether the local workspace bootstrap is ready for direct build-eips commands
@@ -621,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_init_template_flag_parses() {
+    fn workspace_init_optional_flags_parse() {
         let template = parse_args(&[
             "build-eips",
             "workspace",
@@ -629,11 +633,33 @@ mod tests {
             "/tmp/workspace",
             "--template",
         ]);
+        let combined = parse_args(&[
+            "build-eips",
+            "workspace",
+            "init",
+            "/tmp/workspace",
+            "--template",
+            "--platform-dev",
+        ]);
 
         assert!(matches!(
             template.operation,
             Operation::Workspace {
-                command: WorkspaceCommand::Init { template: true, .. }
+                command: WorkspaceCommand::Init {
+                    template: true,
+                    platform_dev: false,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            combined.operation,
+            Operation::Workspace {
+                command: WorkspaceCommand::Init {
+                    template: true,
+                    platform_dev: true,
+                    ..
+                }
             }
         ));
     }

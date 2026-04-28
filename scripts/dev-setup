@@ -22,6 +22,24 @@ absolute_path() {
     esac
 }
 
+INCLUDE_TEMPLATE=false
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --template)
+            INCLUDE_TEMPLATE=true
+            ;;
+        -h|--help)
+            say "usage: $0 [--template]"
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+    shift
+done
+
 command -v cargo >/dev/null 2>&1 || die "need cargo to build local build-eips"
 
 INVOCATION_DIR=$(pwd)
@@ -57,7 +75,11 @@ say "Building local build-eips"
 [ -x "$BUILD_EIPS" ] || die "local build-eips was not built at $BUILD_EIPS"
 
 say "Bootstrapping local contributor workspace"
-"$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace init "$WORKSPACE_ROOT" --template
+if [ "$INCLUDE_TEMPLATE" = true ]; then
+    "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace init "$WORKSPACE_ROOT" --platform-dev --template
+else
+    "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace init "$WORKSPACE_ROOT" --platform-dev
+fi
 
 say "Running workspace doctor"
 if ! "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace doctor; then
@@ -71,4 +93,6 @@ say "  cargo test"
 say "  $BUILD_EIPS -C $ACTIVE_REPO_ROOT check"
 say "  $BUILD_EIPS -C $ACTIVE_REPO_ROOT build"
 say "  $BUILD_EIPS -C $ACTIVE_REPO_ROOT serve"
-say "  $BUILD_EIPS -C $WORKSPACE_ROOT/template check"
+if [ "$INCLUDE_TEMPLATE" = true ]; then
+    say "  $BUILD_EIPS -C $WORKSPACE_ROOT/template check"
+fi
