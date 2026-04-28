@@ -23,7 +23,7 @@ use crate::{
     zola,
 };
 
-pub(crate) fn prepare_theme_for_zola(
+fn prepare_theme_for_zola(
     theme: ThemeSource,
     repo_path: &Path,
 ) -> Result<(ThemeSource, Option<LocalThemeServeSync>), Whatever> {
@@ -232,6 +232,20 @@ mod tests {
         }
         commit_all(&repo, "initial");
         repo
+    }
+
+    #[test]
+    fn remote_theme_for_zola_does_not_enable_serve_sync() {
+        let (_theme, sync) = prepare_theme_for_zola(
+            ThemeSource::Remote {
+                repository: "https://example.test/theme.git".to_owned(),
+                commit: "HEAD".to_owned(),
+            },
+            Path::new("/tmp/build/repo"),
+        )
+        .unwrap();
+
+        assert!(sync.is_none());
     }
 
     #[test]

@@ -22,7 +22,6 @@ use crate::{
         ExecutionSettings, SelectedSource,
     },
     layout::{BUILD_DIR, REPO_DIR},
-    pipeline::prepare_theme_for_zola,
     theme::ThemeSource,
 };
 
@@ -211,17 +210,6 @@ fn remote_and_environment_serve_paths_do_not_enable_local_theme_sync() {
     ] {
         let settings = settings_for(arguments, &[], None);
         assert_eq!(settings.theme, SelectedSource::Remote);
-
-        let (_theme, sync) = prepare_theme_for_zola(
-            ThemeSource::Remote {
-                repository: "https://example.test/theme.git".to_owned(),
-                commit: "HEAD".to_owned(),
-            },
-            Path::new("/tmp/build/repo"),
-        )
-        .unwrap();
-
-        assert!(sync.is_none());
     }
 }
 
