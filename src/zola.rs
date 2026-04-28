@@ -247,6 +247,7 @@ mod tests {
         ffi::OsString,
         fs,
         path::{Path, PathBuf},
+        process::{Command, ExitStatus},
     };
 
     use crate::{
@@ -255,7 +256,59 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::{mount_theme, serve_args};
+    use super::{find_zola, mount_theme, serve_args};
+
+    fn write_file(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    fn zola_build_status(project_root: &Path) -> ExitStatus {
+        Command::new("zola")
+            .arg("build")
+            .arg("--drafts")
+            .current_dir(project_root)
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    fn zola_rejects_missing_internal_links_but_accepts_external_links() {
+        if find_zola().is_err() {
+            eprintln!("skipping zola link behavior fixture because zola is not installed");
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let internal = temp.path().join("internal");
+        write_file(
+            &internal,
+            "config.toml",
+            "base_url = \"https://example.test\"\n",
+        );
+        write_file(
+            &internal,
+            "content/_index.md",
+            "+++\ntitle = \"Internal\"\n+++\n[Missing](@/missing.md)\n",
+        );
+        let external = temp.path().join("external");
+        write_file(
+            &external,
+            "config.toml",
+            "base_url = \"https://example.test\"\n",
+        );
+        write_file(
+            &external,
+            "content/_index.md",
+            "+++\ntitle = \"External\"\n+++\n[External](https://eips.ethereum.org/EIPS/eip-1)\n",
+        );
+
+        assert!(!zola_build_status(&internal).success());
+        assert!(zola_build_status(&external).success());
+    }
 
     #[test]
     fn serve_args_include_configured_interface_and_port() {

@@ -17,6 +17,7 @@ use crate::{
     git,
     layout::{mounted_theme_path, output_path, CONTENT_DIR, REPO_DIR},
     markdown,
+    proposal::OnlyRenderPlan,
     serve::{serve_sync_config, DirtyServeWatcher, LocalThemeServeSync},
     zola,
 };
@@ -63,6 +64,7 @@ impl Prepared {
             build_path,
             repository_use,
             theme_path,
+            only,
             source_materialization,
             server_binding,
             base_url_override,
@@ -89,7 +91,17 @@ impl Prepared {
         both.merge()
             .whatever_context("unable to merge ERC/EIP repositories")?;
 
-        markdown::preprocess(&content_path).whatever_context("unable to preprocess markdown")?;
+        let only_plan = only
+            .map(|selected_numbers| OnlyRenderPlan::build(&content_path, selected_numbers))
+            .transpose()
+            .whatever_context("unable to build targeted render plan")?;
+        markdown::preprocess(&content_path, only_plan.as_ref())
+            .whatever_context("unable to preprocess markdown")?;
+        if let Some(only_plan) = &only_plan {
+            only_plan
+                .prune_content(&content_path)
+                .whatever_context("unable to prune unselected proposals")?;
+        }
         let (theme_path, local_theme_sync) = prepare_theme_for_zola(theme_path, &repo_path)?;
 
         Ok(Prepared {

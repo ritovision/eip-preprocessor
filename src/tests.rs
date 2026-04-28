@@ -2,7 +2,10 @@
 
 // Cross-domain behavior tests live here; see src/README.md for module test ownership.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use clap::Parser;
 use git2::{IndexAddOption, Repository, Signature};
@@ -19,9 +22,11 @@ use crate::{
     editorial::editorial_targets,
     execution::{
         resolve_execution, resolve_execution_settings, validate_non_execution_command_flags,
-        ExecutionSettings, SelectedSource,
+        ExecutionSettings, ResolvedExecution, SelectedSource,
     },
-    layout::{BUILD_DIR, REPO_DIR},
+    layout::{BUILD_DIR, CONTENT_DIR, REPO_DIR},
+    markdown,
+    proposal::{OnlyRenderPlan, ProposalNumber},
 };
 
 fn parse_args(arguments: &[&str]) -> Args {
@@ -111,6 +116,39 @@ fn append_and_commit(repo: &Repository, root: &Path, files: &[(&str, &str)], mes
         write_file(root, relative, contents);
     }
     commit_all(repo, message);
+}
+
+fn proposal_markdown(number: u32, category: Option<&str>, body: &str) -> String {
+    let category = category
+        .map(|category| format!("category: {category}\n"))
+        .unwrap_or_default();
+    format!("---\neip: {number}\ntitle: Proposal {number}\n{category}---\n{body}\n")
+}
+
+fn materialize_resolved_repo(resolved: &ResolvedExecution) -> PathBuf {
+    let repo_path = resolved.build_path.join(REPO_DIR);
+    crate::git::Fresh::new(
+        &resolved.root_path,
+        &repo_path,
+        resolved.repository_use.clone(),
+        resolved.source_materialization,
+    )
+    .unwrap()
+    .clone_src()
+    .unwrap()
+    .fetch_upstream()
+    .unwrap()
+    .merge()
+    .unwrap();
+
+    repo_path
+}
+
+fn preprocess_and_prune_only(repo_path: &Path, selected: BTreeSet<ProposalNumber>) {
+    let content_path = repo_path.join(CONTENT_DIR);
+    let plan = OnlyRenderPlan::build(&content_path, selected).unwrap();
+    markdown::preprocess(&content_path, Some(&plan)).unwrap();
+    plan.prune_content(&content_path).unwrap();
 }
 
 fn repo_manifest_text(repo_id: &str, repository: &Url, siblings: &[(&str, Url)]) -> String {
@@ -550,4 +588,133 @@ fn manifest_driven_multi_repo_build_and_editorial_flows_resolve_siblings() {
     let targets = editorial_targets(&selectors, &resolved).unwrap();
 
     assert_eq!(targets, vec![PathBuf::from("content/0001.md")]);
+}
+
+#[test]
+fn only_build_selection_can_come_from_workspace_local_sibling_after_merge() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("workspace");
+    let active_path = workspace_root.join("Core");
+    let sibling_path = workspace_root.join("ERCs");
+    let active_url = file_url(&active_path);
+
+    let active_555 = proposal_markdown(555, None, "Active proposal.");
+    let active_repo = init_repo(&active_path, &[("content/00555.md", active_555.as_str())]);
+    let sibling_678 = proposal_markdown(678, Some("ERC"), "Sibling proposal.");
+    init_repo(&sibling_path, &[("content/00678.md", sibling_678.as_str())]);
+    write_repo_manifest_file(
+        &active_path,
+        "Core",
+        &active_url,
+        &[("ERCs", file_url(&sibling_path))],
+    );
+    commit_all(&active_repo, "add manifest");
+    std::fs::create_dir(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+    write_file(
+        &workspace_root,
+        config::LOCAL_CONFIG_FILE,
+        &config::default_workspace_config_text(),
+    );
+
+    let args = parse_args(&[
+        "build-eips",
+        "-C",
+        active_path.to_str().unwrap(),
+        "build",
+        "--only",
+        "678",
+    ]);
+    let resolved = resolve_execution(&args).unwrap();
+    let repo_path = materialize_resolved_repo(&resolved);
+    let selected = resolved.only.clone().unwrap();
+
+    preprocess_and_prune_only(&repo_path, selected);
+
+    assert!(repo_path.join("content/00678.md").is_file());
+    assert!(!repo_path.join("content/00555.md").exists());
+}
+
+#[test]
+fn normal_build_after_only_restores_full_materialized_content_tree() {
+    let temp = TempDir::new().unwrap();
+    let workspace_root = temp.path().join("workspace");
+    let active_path = workspace_root.join("Core");
+    let active_url = file_url(&active_path);
+    let selected_555 = proposal_markdown(555, None, "Selected proposal.");
+    let unselected_678 = proposal_markdown(678, Some("ERC"), "Unselected proposal.");
+    let active_repo = init_repo(
+        &active_path,
+        &[
+            ("content/00555.md", selected_555.as_str()),
+            ("content/00678.md", unselected_678.as_str()),
+        ],
+    );
+    write_repo_manifest_file(&active_path, "Core", &active_url, &[]);
+    commit_all(&active_repo, "add manifest");
+    std::fs::create_dir(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+    write_file(
+        &workspace_root,
+        config::LOCAL_CONFIG_FILE,
+        &config::default_workspace_config_text(),
+    );
+    let build_root = temp.path().join("build-root");
+
+    let only_args = parse_args(&[
+        "build-eips",
+        "-C",
+        active_path.to_str().unwrap(),
+        "--build-root",
+        build_root.to_str().unwrap(),
+        "build",
+        "--only",
+        "555",
+    ]);
+    let only_resolved = resolve_execution(&only_args).unwrap();
+    let repo_path = materialize_resolved_repo(&only_resolved);
+    preprocess_and_prune_only(&repo_path, only_resolved.only.clone().unwrap());
+
+    assert!(repo_path.join("content/00555.md").is_file());
+    assert!(!repo_path.join("content/00678.md").exists());
+
+    let normal_args = parse_args(&[
+        "build-eips",
+        "-C",
+        active_path.to_str().unwrap(),
+        "--build-root",
+        build_root.to_str().unwrap(),
+        "build",
+    ]);
+    let normal_resolved = resolve_execution(&normal_args).unwrap();
+    assert!(normal_resolved.only.is_none());
+    let restored_repo_path = materialize_resolved_repo(&normal_resolved);
+    markdown::preprocess(&restored_repo_path.join(CONTENT_DIR), None).unwrap();
+
+    assert!(restored_repo_path.join("content/00555.md").is_file());
+    assert!(restored_repo_path.join("content/00678.md").is_file());
+}
+
+#[test]
+fn serve_ignores_render_only_config_and_does_not_validate_selected_proposals() {
+    let workspace = TempDir::new().unwrap();
+    let workspace_root = workspace.path().join("workspace");
+    let active_path = workspace_root.join("Core");
+    let active_url = file_url(&active_path);
+    let active_555 = proposal_markdown(555, None, "Active proposal.");
+    let active_repo = init_repo(&active_path, &[("content/00555.md", active_555.as_str())]);
+    write_repo_manifest_file(&active_path, "Core", &active_url, &[]);
+    commit_all(&active_repo, "add manifest");
+    std::fs::create_dir(workspace_root.join(config::DEFAULT_THEME_DIR)).unwrap();
+    write_file(
+        &workspace_root,
+        config::LOCAL_CONFIG_FILE,
+        r#"
+[render]
+only = [999999]
+"#,
+    );
+
+    let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "serve"]);
+    let resolved = resolve_execution(&args).unwrap();
+
+    assert!(resolved.only.is_none());
 }

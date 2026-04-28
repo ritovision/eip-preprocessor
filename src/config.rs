@@ -14,6 +14,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use snafu::{Backtrace, IntoError, OptionExt, ResultExt, Snafu};
 use url::{Position, Url};
 
+use crate::proposal::ProposalNumber;
+
 pub const LOCAL_CONFIG_FILE: &str = ".build-eips.toml";
 pub const REPO_MANIFEST_FILE: &str = ".build-eips.repo.toml";
 pub const DEFAULT_BUILD_ROOT_BASE: &str = ".local-build";
@@ -448,6 +450,10 @@ pub struct WorkspaceConfig {
     /// Local rendered-site URL defaults for build and serve commands.
     #[serde(default)]
     pub site: SiteSettings,
+
+    /// Local render filtering defaults.
+    #[serde(default, skip_serializing_if = "RenderSettings::is_empty")]
+    pub render: RenderSettings,
 }
 
 impl WorkspaceConfig {
@@ -455,7 +461,23 @@ impl WorkspaceConfig {
         Self {
             server: ServerSettings::default(),
             site: SiteSettings::starter(),
+            render: RenderSettings::default(),
         }
+    }
+}
+
+/// Local render filtering settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RenderSettings {
+    /// Proposal numbers to render for applicable local build commands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub only: Vec<ProposalNumber>,
+}
+
+impl RenderSettings {
+    fn is_empty(&self) -> bool {
+        self.only.is_empty()
     }
 }
 
@@ -622,6 +644,10 @@ impl LoadedWorkspaceConfig {
         &self.config.site
     }
 
+    pub fn render_settings(&self) -> &RenderSettings {
+        &self.config.render
+    }
+
     pub fn local_theme_path(&self) -> PathBuf {
         self.workspace_root.join(DEFAULT_THEME_DIR)
     }
@@ -669,6 +695,7 @@ mod tests {
         RepoManifestError, ServerBinding, ServerSettings, WorkspaceError, DEFAULT_SERVER_HOST,
         DEFAULT_SERVER_PORT, DEFAULT_SITE_BASE_URL, LOCAL_CONFIG_FILE, REPO_MANIFEST_FILE,
     };
+    use crate::proposal::ProposalNumber;
 
     struct TestWorkspace {
         tempdir: TempDir,
@@ -929,6 +956,7 @@ base_url = "https://staging.example.test/ERCs/"
         assert!(original.contains("port = 1111"));
         assert!(original.contains("[site]"));
         assert!(original.contains(&format!("base_url = \"{DEFAULT_SITE_BASE_URL}\"")));
+        assert!(!original.contains("[render]"));
         assert!(!original.contains("default_profile"));
         assert!(!original.contains("[profiles"));
     }
@@ -1061,6 +1089,52 @@ base_url = "http://127.0.0.1:1111"
 
         assert_eq!(config.server_settings(), &ServerSettings::default());
         assert!(config.site_settings().base_url.is_none());
+        assert!(config.render_settings().only.is_empty());
+    }
+
+    #[test]
+    fn parses_workspace_config_render_only_settings() {
+        let workspace = TestWorkspace::new();
+        let config_path = workspace.write_file(
+            LOCAL_CONFIG_FILE,
+            r#"
+[render]
+only = [555, 678, 555]
+"#,
+        );
+
+        let config = LoadedWorkspaceConfig::from_path(&config_path).unwrap();
+
+        assert_eq!(
+            config.render_settings().only,
+            vec![
+                ProposalNumber::from_u32(555).unwrap(),
+                ProposalNumber::from_u32(678).unwrap(),
+                ProposalNumber::from_u32(555).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_config_render_only_rejects_non_positive_and_non_integer_values() {
+        let cases = [
+            ("zero", "only = [0]"),
+            ("negative", "only = [-555]"),
+            ("quoted", "only = [\"555\"]"),
+            ("overflow", "only = [4294967296]"),
+        ];
+
+        for (name, contents) in cases {
+            let workspace = TestWorkspace::new();
+            let config_path =
+                workspace.write_file(LOCAL_CONFIG_FILE, &format!("[render]\n{contents}\n"));
+            let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
+
+            assert!(
+                matches!(error, WorkspaceError::Parse { .. }),
+                "expected `{name}` render only config to fail, got {error:?}"
+            );
+        }
     }
 
     #[test]

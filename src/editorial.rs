@@ -200,6 +200,7 @@ mod tests {
                 other_repos: Default::default(),
             },
             theme_path: Some(PathBuf::from("/workspace/theme")),
+            only: None,
             source_materialization: crate::git::SourceMaterialization::Clean,
             server_binding: ServerBinding::default(),
             base_url_override: None,

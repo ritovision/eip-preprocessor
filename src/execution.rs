@@ -7,6 +7,7 @@
 //! Execution source and path resolution.
 
 use std::{
+    collections::BTreeSet,
     io::ErrorKind,
     path::{Path, PathBuf},
 };
@@ -22,6 +23,7 @@ use crate::{
     git,
     identity::ActiveRepoIdentity,
     layout::BUILD_DIR,
+    proposal::ProposalNumber,
 };
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,7 @@ pub(crate) struct ResolvedExecution {
     pub(crate) build_path: PathBuf,
     pub(crate) repository_use: git::RepositoryUse,
     pub(crate) theme_path: Option<PathBuf>,
+    pub(crate) only: Option<BTreeSet<ProposalNumber>>,
     pub(crate) source_materialization: git::SourceMaterialization,
     pub(crate) server_binding: ServerBinding,
     pub(crate) base_url_override: Option<Url>,
@@ -113,6 +116,20 @@ fn explicit_environment_or_parity(args: &Args) -> Result<Option<bool>, Whatever>
     Ok(None)
 }
 
+fn cli_only_requested(args: &Args) -> bool {
+    args.operation
+        .only_cli_args()
+        .map(|only| !only.only.is_empty())
+        .unwrap_or(false)
+}
+
+fn build_only_cli_is_applicable(args: &Args, explicit_environment: Option<bool>) -> bool {
+    matches!(args.operation, Operation::Build { .. })
+        && explicit_environment.is_none()
+        && !args.operation.clean_cli_args().clean
+        && !args.remote_sibling_repo
+}
+
 pub(crate) fn resolve_execution_settings(
     args: &Args,
     sibling_ids: &[String],
@@ -126,6 +143,10 @@ pub(crate) fn resolve_execution_settings(
     let explicit_environment = explicit_environment_or_parity(args)?;
     let sibling_override = remote_source_override(args.remote_sibling_repo);
     let clean = args.operation.clean_cli_args().clean;
+
+    if cli_only_requested(args) && !build_only_cli_is_applicable(args, explicit_environment) {
+        snafu::whatever!("--only is supported only for local dirty build commands");
+    }
 
     let (staging, allow_dirty, default_sibling) = if let Some(staging) = explicit_environment {
         (staging, false, SelectedSource::Remote)
@@ -166,6 +187,39 @@ pub(crate) fn resolve_execution_settings(
         allow_dirty,
         sibling,
     })
+}
+
+fn dedupe_only_numbers(numbers: &[ProposalNumber]) -> Option<BTreeSet<ProposalNumber>> {
+    let numbers = numbers.iter().copied().collect::<BTreeSet<_>>();
+    (!numbers.is_empty()).then_some(numbers)
+}
+
+fn resolve_only_selection(
+    args: &Args,
+    settings: &ExecutionSettings,
+    workspace_config: Option<&LoadedWorkspaceConfig>,
+) -> Result<Option<BTreeSet<ProposalNumber>>, Whatever> {
+    let explicit_environment = explicit_environment_or_parity(args)?;
+    let applicable = matches!(args.operation, Operation::Build { .. })
+        && explicit_environment.is_none()
+        && settings.allow_dirty
+        && settings.sibling == SelectedSource::WorkspaceLocal;
+
+    if let Some(only) = args.operation.only_cli_args() {
+        if let Some(numbers) = dedupe_only_numbers(&only.only) {
+            if !applicable {
+                snafu::whatever!("--only is supported only for local dirty build commands");
+            }
+            return Ok(Some(numbers));
+        }
+    }
+
+    if !applicable {
+        return Ok(None);
+    }
+
+    Ok(workspace_config
+        .and_then(|workspace_config| dedupe_only_numbers(&workspace_config.render_settings().only)))
 }
 
 fn local_repo_url(path: &Path) -> Result<Url, Whatever> {
@@ -329,6 +383,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
     }
 
     let settings = resolve_execution_settings(args, &sibling_ids, workspace_config.as_ref())?;
+    let only = resolve_only_selection(args, &settings, workspace_config.as_ref())?;
     let theme_path = resolve_theme_path(workspace_config.as_ref(), &args.operation)?;
 
     let mut repository_use = active_repo.repository_use(settings.staging)?;
@@ -360,6 +415,7 @@ pub(crate) fn resolve_execution(args: &Args) -> Result<ResolvedExecution, Whatev
         build_path,
         repository_use,
         theme_path,
+        only,
         source_materialization,
         server_binding: resolve_server_binding(
             workspace_config.as_ref(),
@@ -381,7 +437,8 @@ mod tests {
 
     use super::{
         explicit_environment_or_parity, resolve_base_url_override, resolve_execution_settings,
-        resolve_server_binding, resolve_theme_path, ExecutionSettings, SelectedSource,
+        resolve_only_selection, resolve_server_binding, resolve_theme_path, ExecutionSettings,
+        SelectedSource,
     };
 
     fn parse_args(arguments: &[&str]) -> Args {
@@ -455,6 +512,17 @@ mod tests {
         assert!(!message.contains("--allow-dirty"));
         assert!(!message.contains("--theme <path>"));
         assert!(!message.contains("--sibling-repo <path>"));
+    }
+
+    fn only_selection_for(
+        arguments: &[&str],
+        workspace_config: Option<&LoadedWorkspaceConfig>,
+    ) -> Option<Vec<u32>> {
+        let args = parse_args(arguments);
+        let settings = resolve_execution_settings(&args, &[], workspace_config).unwrap();
+        resolve_only_selection(&args, &settings, workspace_config)
+            .unwrap()
+            .map(|numbers| numbers.into_iter().map(|number| number.get()).collect())
     }
 
     #[test]
@@ -815,6 +883,88 @@ base_url = "http://localhost:4000"
                 },
             );
         }
+    }
+
+    #[test]
+    fn only_selection_dedupes_and_cli_replaces_config() {
+        let workspace_config = load_workspace_config(
+            r#"
+[render]
+only = [678, 555, 678]
+"#,
+        );
+
+        assert_eq!(
+            only_selection_for(&["build-eips", "build"], Some(&workspace_config)).unwrap(),
+            vec![555, 678]
+        );
+        assert_eq!(
+            only_selection_for(
+                &["build-eips", "build", "--only", "00555", "555", "897"],
+                Some(&workspace_config)
+            )
+            .unwrap(),
+            vec![555, 897]
+        );
+    }
+
+    #[test]
+    fn only_cli_rejects_parsed_non_applicable_build_modes() {
+        for arguments in [
+            &["build-eips", "--staging", "build", "--only", "555"][..],
+            &["build-eips", "--production", "build", "--only", "555"][..],
+            &["build-eips", "build", "--clean", "--only", "555"][..],
+            &[
+                "build-eips",
+                "--remote-sibling-repo",
+                "build",
+                "--only",
+                "555",
+            ][..],
+        ] {
+            let args = parse_args(arguments);
+            let error = resolve_execution_settings(&args, &[], None).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("--only is supported only for local dirty build commands"));
+        }
+    }
+
+    #[test]
+    fn render_only_config_is_ignored_outside_applicable_build_commands() {
+        let workspace_config = load_workspace_config(
+            r#"
+[render]
+only = [999999]
+"#,
+        );
+
+        for arguments in [
+            &["build-eips", "serve"][..],
+            &["build-eips", "check"][..],
+            &["build-eips", "build", "--clean"][..],
+            &["build-eips", "--staging", "build"][..],
+            &["build-eips", "parity", "build"][..],
+        ] {
+            assert!(only_selection_for(arguments, Some(&workspace_config)).is_none());
+        }
+    }
+
+    #[test]
+    fn missing_render_config_and_empty_only_disable_filtering() {
+        let missing_render = load_workspace_config("");
+        let missing_only = load_workspace_config("[render]\n");
+        let empty_only = load_workspace_config(
+            r#"
+[render]
+only = []
+"#,
+        );
+
+        assert!(only_selection_for(&["build-eips", "build"], Some(&missing_render)).is_none());
+        assert!(only_selection_for(&["build-eips", "build"], Some(&missing_only)).is_none());
+        assert!(only_selection_for(&["build-eips", "build"], Some(&empty_only)).is_none());
     }
 
     #[test]
