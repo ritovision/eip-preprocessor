@@ -421,3 +421,26 @@ pub(crate) fn serve_sync_config(
         local_theme: local_theme_sync,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use notify::{Event, EventKind};
+
+    use super::event_has_theme_index_path;
+
+    #[test]
+    fn local_theme_index_events_trigger_rescan() {
+        let index_path = PathBuf::from("/workspace/theme/.git/index");
+        let index_event = Event::new(EventKind::Any).add_path(index_path.clone());
+        let lock_event =
+            Event::new(EventKind::Any).add_path(PathBuf::from("/workspace/theme/.git/index.lock"));
+        let unrelated_event =
+            Event::new(EventKind::Any).add_path(PathBuf::from("/workspace/theme/.git/config"));
+
+        assert!(event_has_theme_index_path(&index_path, &index_event));
+        assert!(event_has_theme_index_path(&index_path, &lock_event));
+        assert!(!event_has_theme_index_path(&index_path, &unrelated_event));
+    }
+}

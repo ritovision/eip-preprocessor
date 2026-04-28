@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use git2::{IndexAddOption, Repository, Signature};
-use notify::{Event, EventKind};
 use snafu::Report;
 use tempfile::TempDir;
 use url::Url;
@@ -23,7 +22,7 @@ use crate::{
     },
     layout::{mounted_theme_path, theme_config_path, BUILD_DIR, REPO_DIR},
     pipeline::prepare_theme_for_zola,
-    serve::{event_has_theme_index_path, serve_sync_config, LocalThemeServeSync},
+    serve::{serve_sync_config, LocalThemeServeSync},
     theme::ThemeSource,
     workspace::{
         collect_doctor_report, init_workspace_with_repositories, WorkspaceInitRepositories,
@@ -427,20 +426,6 @@ fn fake_theme_sync(root: &Path) -> LocalThemeServeSync {
         mounted_theme_dir: root.join("repo/themes/eips-theme"),
         theme_index_path: root.join("theme/.git/index"),
     }
-}
-
-#[test]
-fn local_theme_index_events_trigger_rescan() {
-    let index_path = PathBuf::from("/workspace/theme/.git/index");
-    let index_event = Event::new(EventKind::Any).add_path(index_path.clone());
-    let lock_event =
-        Event::new(EventKind::Any).add_path(PathBuf::from("/workspace/theme/.git/index.lock"));
-    let unrelated_event =
-        Event::new(EventKind::Any).add_path(PathBuf::from("/workspace/theme/.git/config"));
-
-    assert!(event_has_theme_index_path(&index_path, &index_event));
-    assert!(event_has_theme_index_path(&index_path, &lock_event));
-    assert!(!event_has_theme_index_path(&index_path, &unrelated_event));
 }
 
 #[test]
