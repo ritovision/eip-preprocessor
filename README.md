@@ -39,6 +39,29 @@ cargo install --git https://github.com/ethereum/build-eips.git
 [EIPs]: https://github.com/ethereum/EIPs/
 [ERCs]: https://github.com/ethereum/ERCs/
 
+## Preprocessor Development Setup
+
+When working on `build-eips` itself, use the local contributor setup script
+instead of the public proposal-repo bootstrap scripts:
+
+```bash
+./scripts/dev-setup
+```
+
+The script runs `cargo build` and uses `preprocessor/target/debug/build-eips`
+for workspace setup, so local branch changes are what get exercised. It expects
+a sibling active proposal repo checkout, defaulting to `../EIPs`; override
+`WORKSPACE_ROOT` or `ACTIVE_REPO_ROOT` when your checkout layout differs.
+Run it from the preprocessor checkout; relative overrides are resolved from the
+invocation directory.
+
+This setup mutates the local workspace root through `workspace init`, including
+creating `.build-eips.toml`, `.local-build/`, and cloning missing repositories.
+It also includes `template`, `preprocessor`, and `eipw` for platform work.
+Public proposal-repo setup scripts are different: they use an installed or
+released `build-eips`. Template public bootstrap remains gated on a
+manifest-aware release.
+
 ## Usage
 
 1. Clone either [`ethereum/EIPs`] or [`ethereum/ERCs`], and change directory

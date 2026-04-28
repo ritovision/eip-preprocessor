@@ -1,0 +1,74 @@
+#!/bin/sh
+
+set -eu
+
+say() {
+    printf '%s\n' "$*"
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+absolute_path() {
+    case "$1" in
+        /*)
+            printf '%s\n' "$1"
+            ;;
+        *)
+            printf '%s/%s\n' "$INVOCATION_DIR" "$1"
+            ;;
+    esac
+}
+
+command -v cargo >/dev/null 2>&1 || die "need cargo to build local build-eips"
+
+INVOCATION_DIR=$(pwd)
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PREPROCESSOR_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+
+if [ -n "${WORKSPACE_ROOT:-}" ]; then
+    WORKSPACE_ROOT=$(absolute_path "$WORKSPACE_ROOT")
+else
+    WORKSPACE_ROOT=$(CDPATH= cd -- "$PREPROCESSOR_ROOT/.." && pwd)
+fi
+
+if [ -n "${ACTIVE_REPO_ROOT:-}" ]; then
+    ACTIVE_REPO_ROOT=$(absolute_path "$ACTIVE_REPO_ROOT")
+else
+    ACTIVE_REPO_ROOT=$WORKSPACE_ROOT/EIPs
+fi
+
+if [ ! -d "$ACTIVE_REPO_ROOT" ]; then
+    die "preprocessor local setup needs an active proposal repo checkout such as EIPs at $ACTIVE_REPO_ROOT"
+fi
+
+ACTIVE_REPO_ROOT=$(CDPATH= cd -- "$ACTIVE_REPO_ROOT" && pwd)
+BUILD_EIPS=$PREPROCESSOR_ROOT/target/debug/build-eips
+
+say "Workspace root: $WORKSPACE_ROOT"
+say "Active proposal repo: $ACTIVE_REPO_ROOT"
+say "Local build-eips: $BUILD_EIPS"
+
+say "Building local build-eips"
+(CDPATH= cd -- "$PREPROCESSOR_ROOT" && cargo build)
+
+[ -x "$BUILD_EIPS" ] || die "local build-eips was not built at $BUILD_EIPS"
+
+say "Bootstrapping local contributor workspace"
+"$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace init "$WORKSPACE_ROOT" --template --platform-dev
+
+say "Running workspace doctor"
+if ! "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace doctor; then
+    say "Workspace doctor reported issues above. Fix them before relying on local build-eips commands."
+fi
+
+say ""
+say "Next commands:"
+say "  cd $PREPROCESSOR_ROOT"
+say "  cargo test"
+say "  $BUILD_EIPS -C $ACTIVE_REPO_ROOT check"
+say "  $BUILD_EIPS -C $ACTIVE_REPO_ROOT build"
+say "  $BUILD_EIPS -C $ACTIVE_REPO_ROOT serve"
+say "  $BUILD_EIPS -C $WORKSPACE_ROOT/template check"
