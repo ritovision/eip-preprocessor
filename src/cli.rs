@@ -396,3 +396,279 @@ impl EditorialSelectorArgs {
             + usize::from(self.against_upstream)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Args, Operation, ProfiledOperation, RuntimeOperation, WorkspaceCommand};
+
+    fn parse_args(arguments: &[&str]) -> Args {
+        Args::try_parse_from(arguments).unwrap()
+    }
+
+    #[test]
+    fn parity_command_parses_as_command_prefix() {
+        let args = parse_args(&["build-eips", "parity", "build"]);
+
+        assert!(matches!(
+            args.operation,
+            Operation::Parity {
+                command: ProfiledOperation::Build { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn profile_flag_is_rejected() {
+        let error =
+            Args::try_parse_from(["build-eips", "--profile", "local", "build"]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unexpected argument '--profile'"));
+    }
+
+    #[test]
+    fn server_flags_parse_on_serve_and_preview_forms() {
+        let cases: &[(&[&str], bool)] = &[
+            (
+                &["build-eips", "serve", "--host", "0.0.0.0", "--port", "8080"],
+                true,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "preview",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "serve",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8080",
+                ],
+                true,
+            ),
+        ];
+
+        for (arguments, expect_serve) in cases {
+            let args = parse_args(arguments);
+            let runtime_operation = args.operation.runtime_operation().unwrap();
+            match runtime_operation {
+                RuntimeOperation::Serve if *expect_serve => {}
+                RuntimeOperation::Preview if !*expect_serve => {}
+                other => panic!("unexpected runtime operation: {other:?}"),
+            }
+            let server = args.operation.server_cli_args();
+
+            assert_eq!(server.host.as_deref(), Some("0.0.0.0"));
+            assert_eq!(server.port, Some(8080));
+        }
+    }
+
+    #[test]
+    fn base_url_flags_parse_on_build_and_serve_forms() {
+        let cases: &[(&[&str], RuntimeOperation)] = &[
+            (
+                &["build-eips", "build", "--base-url", "http://localhost:4000"],
+                RuntimeOperation::Build,
+            ),
+            (
+                &["build-eips", "serve", "--base-url", "http://localhost:4000"],
+                RuntimeOperation::Serve,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "build",
+                    "--base-url",
+                    "http://localhost:4000",
+                ],
+                RuntimeOperation::Build,
+            ),
+            (
+                &[
+                    "build-eips",
+                    "parity",
+                    "serve",
+                    "--base-url",
+                    "http://localhost:4000",
+                ],
+                RuntimeOperation::Serve,
+            ),
+        ];
+
+        for (arguments, expected_runtime_operation) in cases {
+            let args = parse_args(arguments);
+
+            assert!(matches!(
+                (
+                    args.operation.runtime_operation().unwrap(),
+                    (*expected_runtime_operation).clone()
+                ),
+                (RuntimeOperation::Build, RuntimeOperation::Build)
+                    | (RuntimeOperation::Serve, RuntimeOperation::Serve)
+            ));
+            assert_eq!(
+                args.operation
+                    .base_url_cli_args()
+                    .base_url
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                "http://localhost:4000/"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_flags_parse_only_on_plain_site_commands() {
+        for arguments in [
+            &["build-eips", "build", "--clean"][..],
+            &["build-eips", "serve", "--clean"][..],
+            &["build-eips", "check", "--clean"][..],
+        ] {
+            let args = parse_args(arguments);
+            assert!(args.operation.clean_cli_args().clean);
+        }
+
+        for arguments in [
+            &["build-eips", "parity", "build", "--clean"][..],
+            &["build-eips", "parity", "serve", "--clean"][..],
+            &["build-eips", "parity", "check", "--clean"][..],
+            &["build-eips", "preview", "--clean"][..],
+            &["build-eips", "changed", "--clean"][..],
+            &["build-eips", "clean", "--clean"][..],
+        ] {
+            assert!(Args::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn removed_dirty_command_surface_is_rejected() {
+        for arguments in [
+            &["build-eips", "dirty", "build"][..],
+            &["build-eips", "--allow-dirty", "build"][..],
+            &["build-eips", "--no-allow-dirty", "build"][..],
+            &["build-eips", "--no-staging", "build"][..],
+            &["build-eips", "parity", "preview"][..],
+            &["build-eips", "parity", "clean"][..],
+            &["build-eips", "parity", "changed"][..],
+        ] {
+            assert!(Args::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn base_url_flag_is_rejected_on_non_rendering_forms() {
+        let cases: &[&[&str]] = &[
+            &[
+                "build-eips",
+                "preview",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "parity",
+                "preview",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &["build-eips", "check", "--base-url", "http://localhost:4000"],
+            &[
+                "build-eips",
+                "changed",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "workspace",
+                "doctor",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "workspace",
+                "init",
+                "/tmp/workspace",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &[
+                "build-eips",
+                "editorial",
+                "lint",
+                "--working-tree",
+                "--base-url",
+                "http://localhost:4000",
+            ],
+            &["build-eips", "print", "--base-url", "http://localhost:4000"],
+        ];
+
+        for arguments in cases {
+            assert!(Args::try_parse_from(*arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_init_optional_flags_parse() {
+        let template = parse_args(&[
+            "build-eips",
+            "workspace",
+            "init",
+            "/tmp/workspace",
+            "--template",
+        ]);
+        let combined = parse_args(&[
+            "build-eips",
+            "workspace",
+            "init",
+            "/tmp/workspace",
+            "--template",
+            "--platform-dev",
+        ]);
+
+        assert!(matches!(
+            template.operation,
+            Operation::Workspace {
+                command: WorkspaceCommand::Init {
+                    template: true,
+                    platform_dev: false,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            combined.operation,
+            Operation::Workspace {
+                command: WorkspaceCommand::Init {
+                    template: true,
+                    platform_dev: true,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn explicit_workspace_config_path_is_not_accepted() {
+        let error = Args::try_parse_from(["build-eips", "--config", "/tmp/config.toml", "build"])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unexpected argument '--config'"));
+    }
+}
