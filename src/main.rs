@@ -84,11 +84,7 @@ fn run() -> Result<(), Whatever> {
 
     if let Operation::Workspace { command } = &args.operation {
         match command.clone() {
-            WorkspaceCommand::Init {
-                path,
-                template,
-                platform_dev,
-            } => init_workspace(&args, path, template, platform_dev)?,
+            WorkspaceCommand::Init { path, template } => init_workspace(&args, path, template)?,
             WorkspaceCommand::Doctor => doctor_workspace(&args)?,
         }
         return Ok(());

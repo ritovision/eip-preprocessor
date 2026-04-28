@@ -57,7 +57,7 @@ say "Building local build-eips"
 [ -x "$BUILD_EIPS" ] || die "local build-eips was not built at $BUILD_EIPS"
 
 say "Bootstrapping local contributor workspace"
-"$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace init "$WORKSPACE_ROOT" --template --platform-dev
+"$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace init "$WORKSPACE_ROOT" --template
 
 say "Running workspace doctor"
 if ! "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace doctor; then
