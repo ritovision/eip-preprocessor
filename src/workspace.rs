@@ -8,7 +8,6 @@
 
 use std::{
     fmt,
-    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -28,8 +27,7 @@ const WORKSPACE_THEME_URL: &str = "https://github.com/eips-wg/theme.git";
 const PROPOSAL_TEMPLATE_URL: &str = "https://github.com/eips-wg/template.git";
 const PLATFORM_PREPROCESSOR_URL: &str = "https://github.com/eips-wg/preprocessor.git";
 const PLATFORM_EIPW_URL: &str = "https://github.com/ethereum/eipw.git";
-const WORKSPACE_README_FILE: &str = "README.md";
-const WORKSPACE_README_FALLBACK_FILE: &str = "WORKSPACE-README.md";
+const WORKSPACE_DOC_FILE: &str = "WORKSPACE.md";
 
 #[derive(Debug, Clone, Copy)]
 enum DoctorStatus {
@@ -525,12 +523,12 @@ fn init_workspace_with_repositories(
             .whatever_context("unable to write workspace config")?;
     }
 
-    write_workspace_readme(&workspace_root)?;
+    write_workspace_doc(&workspace_root)?;
 
     Ok(())
 }
 
-fn workspace_readme_text() -> &'static str {
+fn workspace_doc_text() -> &'static str {
     r#"# build-eips Workspace
 
 This directory is a local multi-repo workspace for `build-eips`.
@@ -596,40 +594,14 @@ serve.
 "#
 }
 
-fn write_workspace_readme(workspace_root: &Path) -> Result<(), Whatever> {
-    let readme_path = workspace_root.join(WORKSPACE_README_FILE);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&readme_path)
-    {
-        Ok(mut file) => {
-            file.write_all(workspace_readme_text().as_bytes())
-                .with_whatever_context(|_| {
-                    format!(
-                        "unable to write workspace README `{}`",
-                        readme_path.to_string_lossy()
-                    )
-                })?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let fallback_path = workspace_root.join(WORKSPACE_README_FALLBACK_FILE);
-            std::fs::write(&fallback_path, workspace_readme_text()).with_whatever_context(
-                |_| {
-                    format!(
-                        "unable to write workspace README `{}`",
-                        fallback_path.to_string_lossy()
-                    )
-                },
-            )?;
-        }
-        Err(error) => {
-            snafu::whatever!(
-                "unable to create workspace README `{}`: {error}",
-                readme_path.to_string_lossy()
-            );
-        }
-    }
+fn write_workspace_doc(workspace_root: &Path) -> Result<(), Whatever> {
+    let doc_path = workspace_root.join(WORKSPACE_DOC_FILE);
+    std::fs::write(&doc_path, workspace_doc_text()).with_whatever_context(|_| {
+        format!(
+            "unable to write workspace document `{}`",
+            doc_path.to_string_lossy()
+        )
+    })?;
 
     Ok(())
 }
@@ -649,9 +621,8 @@ mod tests {
     };
 
     use super::{
-        collect_doctor_report, init_workspace_with_repositories, workspace_readme_text,
-        WorkspaceInitRepositories, WORKSPACE_README_FALLBACK_FILE, WORKSPACE_README_FILE,
-        WORKSPACE_THEME_URL,
+        collect_doctor_report, init_workspace_with_repositories, workspace_doc_text,
+        WorkspaceInitRepositories, WORKSPACE_DOC_FILE, WORKSPACE_THEME_URL,
     };
 
     fn parse_args(arguments: &[&str]) -> Args {
@@ -783,7 +754,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     fn run_workspace_init_for_docs(
-        existing_readme: Option<&str>,
+        existing_doc: Option<&str>,
         existing_config: Option<&str>,
     ) -> (TempDir, std::path::PathBuf) {
         let temp = TempDir::new().unwrap();
@@ -801,8 +772,8 @@ base_url = "https://staging.example.test/{sibling_id}/"
         let active_url = file_url(&active_path);
         write_manifest_repo(&active_path, "Core", &active_url, &[]);
 
-        if let Some(contents) = existing_readme {
-            write_file(&workspace_root, WORKSPACE_README_FILE, contents);
+        if let Some(contents) = existing_doc {
+            write_file(&workspace_root, WORKSPACE_DOC_FILE, contents);
         }
         if let Some(contents) = existing_config {
             write_file(&workspace_root, config::LOCAL_CONFIG_FILE, contents);
@@ -838,8 +809,8 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
-    fn workspace_readme_text_documents_layout_commands_and_only_settings() {
-        let text = workspace_readme_text();
+    fn workspace_doc_text_documents_layout_commands_and_only_settings() {
+        let text = workspace_doc_text();
 
         for expected in [
             "EIPs",
@@ -856,34 +827,29 @@ base_url = "https://staging.example.test/{sibling_id}/"
         ] {
             assert!(
                 text.contains(expected),
-                "workspace README text should contain `{expected}`"
+                "workspace document text should contain `{expected}`"
             );
         }
     }
 
     #[test]
-    fn workspace_init_creates_workspace_readme_when_absent() {
+    fn workspace_init_writes_workspace_doc() {
         let (_temp, workspace_root) = run_workspace_init_for_docs(None, None);
 
-        let readme = std::fs::read_to_string(workspace_root.join(WORKSPACE_README_FILE)).unwrap();
-        assert!(readme.contains("build-eips Workspace"));
-        assert!(readme.contains("build-eips serve"));
-        assert!(!workspace_root.join(WORKSPACE_README_FALLBACK_FILE).exists());
+        let doc = std::fs::read_to_string(workspace_root.join(WORKSPACE_DOC_FILE)).unwrap();
+        assert!(doc.contains("build-eips Workspace"));
+        assert!(doc.contains("build-eips serve"));
     }
 
     #[test]
-    fn workspace_init_preserves_existing_readme_and_writes_fallback_docs() {
-        let existing_readme = "Project README\n";
-        let (_temp, workspace_root) = run_workspace_init_for_docs(Some(existing_readme), None);
+    fn workspace_init_overwrites_existing_workspace_doc() {
+        let existing_doc = "Old workspace docs\n";
+        let (_temp, workspace_root) = run_workspace_init_for_docs(Some(existing_doc), None);
 
-        assert_eq!(
-            std::fs::read_to_string(workspace_root.join(WORKSPACE_README_FILE)).unwrap(),
-            existing_readme
-        );
-        let fallback =
-            std::fs::read_to_string(workspace_root.join(WORKSPACE_README_FALLBACK_FILE)).unwrap();
-        assert!(fallback.contains("build-eips Workspace"));
-        assert!(fallback.contains("--only"));
+        let doc = std::fs::read_to_string(workspace_root.join(WORKSPACE_DOC_FILE)).unwrap();
+        assert_ne!(doc, existing_doc);
+        assert!(doc.contains("build-eips Workspace"));
+        assert!(doc.contains("--only"));
     }
 
     #[test]
