@@ -1,25 +1,20 @@
 # Preprocessor Module And Test Ownership
 
-This note records module and test ownership for the preprocessor crate. It is a
-review rubric for module boundaries, not user-facing command documentation.
+This file documents how the preprocessor crate is organized: which module owns each behavior, where tests should live, and how to keep module boundaries reviewable. It is for contributors and maintainers, not end-user documentation.
+
 
 ## Module Ownership
 
-- `main.rs` owns CLI entry, top-level dispatch, build locking, and runtime
-  orchestration.
+- `main.rs` owns CLI entry, top-level dispatch, build locking, and runtime orchestration.
 - `cli.rs` owns the clap command surface and command helper methods.
-- `config.rs` owns built-in repository metadata, workspace config schema, repo
-  manifest schema, parsing, defaults, and config discovery.
+- `config.rs` owns built-in repository metadata, workspace config schema, repo manifest schema, parsing, defaults, and config discovery.
 - `context.rs` owns command input path resolution and workspace command context.
 - `editorial.rs` owns editorial target selection and editorial runtime helpers.
-- `execution.rs` owns source mode, environment, base URL, server binding, build
-  path, workspace source, and runtime execution resolution.
+- `execution.rs` owns source mode, environment, base URL, server binding, build path, workspace source, and runtime execution resolution.
 - `find_root.rs` owns active proposal-repo root detection.
-- `git.rs` owns git repository identification, clone/fetch/merge behavior,
-  source materialization, and tracked path synchronization.
+- `git.rs` owns git repository identification, clone/fetch/merge behavior, source materialization, and tracked path synchronization.
 - `github.rs` owns GitHub annotation reporting support for lint output.
-- `identity.rs` owns active repository identity selection from repo manifests or
-  legacy metadata.
+- `identity.rs` owns active repository identity selection from repo manifests or legacy metadata.
 - `layout.rs` owns shared build layout names and path helpers.
 - `lint.rs` owns eipw lint configuration and invocation.
 - `markdown.rs` owns proposal markdown preprocessing.
@@ -27,20 +22,14 @@ review rubric for module boundaries, not user-facing command documentation.
 - `preview.rs` owns static preview serving for already-built output.
 - `print.rs` owns diagnostic print subcommands.
 - `progress.rs` owns progress/log rendering helpers.
-- `proposal.rs` owns proposal path classification and future proposal-number
-  helpers.
+- `proposal.rs` owns proposal path classification, proposal-number parsing, and targeted-rendering selection policy.
 - `serve.rs` owns dirty active-repo and local-theme serve synchronization.
 - `workspace.rs` owns local workspace initialization and diagnostics.
 - `zola.rs` owns Zola discovery, theme mounting, and Zola command invocation.
 
 ## Test Ownership
 
-New tests should generally live in the module that owns the behavior. Use
-`super::` from module-local tests where natural, or sibling module paths from the
-owning module. Module-local tests now cover `cli.rs`, `execution.rs`,
-`serve.rs`, `workspace.rs`, `editorial.rs`, `pipeline.rs`, and the existing
-`config.rs`, `git.rs`, and `zola.rs` tests; `src/tests.rs` intentionally holds
-the remaining cross-domain behavior tests.
+New tests should generally live in the module that owns the behavior. Use `super::` from module-local tests where natural, or sibling module paths from the owning module. Module-local tests cover behavior in modules such as `cli.rs`, `config.rs`, `execution.rs`, `git.rs`, `markdown.rs`, `pipeline.rs`, `proposal.rs`, `serve.rs`, `workspace.rs`, and `zola.rs`; `src/tests.rs` intentionally holds the remaining cross-domain behavior tests.
 
 Use `src/tests.rs` for cross-domain behavior tests, especially tests covering:
 
@@ -52,31 +41,19 @@ Use `src/tests.rs` for cross-domain behavior tests, especially tests covering:
 - source materialization behavior spanning git, execution, pipeline, or serve
 - tests that would require exposing more internals just to move them
 
-Move tests to module-local `#[cfg(test)]` modules only when the behavior is
-owned by one module and the test remains clearer there. Examples include pure
-clap parsing in `cli.rs`, execution policy helpers in `execution.rs`, serve
-event filtering in `serve.rs`, direct theme preparation in `pipeline.rs`,
-editorial helper behavior in `editorial.rs`, workspace init/doctor behavior in
-`workspace.rs`, and active repo identity behavior in `identity.rs` when it does
-not require the full execution path. `proposal.rs` owns proposal path
-classification and future proposal-number tests; the Phase 0 inventory found no
-current proposal-only tests in `src/tests.rs`.
+Move tests to module-local `#[cfg(test)]` modules only when the behavior is owned by one module and the test remains clearer there. Examples include pure clap parsing in `cli.rs`, execution policy helpers in `execution.rs`, serve event filtering in `serve.rs`, workspace-local theme materialization in `pipeline.rs`, editorial helper behavior in `editorial.rs`, workspace init/doctor behavior in `workspace.rs`, active repo identity behavior in `identity.rs` when it does not require the full execution path, and proposal path or proposal-number behavior in `proposal.rs`.
 
 ## Dependency Direction
 
-Imports should generally point from higher-level orchestration toward
-lower-level or shared modules:
+Imports should generally flow from orchestration modules toward domain and shared modules. `main.rs` should call into command/runtime modules, while lower-level modules should avoid depending on high-level orchestration.
 
-```text
-main -> editorial/workspace/serve/pipeline -> context/identity/execution -> cli/layout/proposal
-```
+`execution.rs` is the runtime resolution layer between command/config inputs and runtime execution: it combines CLI flags, workspace config, active repo identity, source mode, build path, server binding, and base URL decisions before `main.rs` hands work to `pipeline.rs`, `serve.rs`, `preview.rs`, or editorial helpers.
 
-Lower-level or shared modules should not import higher-level orchestration
-modules such as `workspace`, `pipeline`, or `main`.
+Examples of high-level orchestration modules include `main.rs`, `workspace.rs`, `pipeline.rs`, and `serve.rs`. Shared or lower-level modules include `cli.rs`, `layout.rs`, `proposal.rs`, and focused domain modules such as `git.rs`, `markdown.rs`, and `zola.rs`.
+
+Lower-level or shared modules should not import higher-level orchestration modules just to reuse behavior. Move shared behavior into the owning domain module instead.
+
 
 ## Visibility
 
-Do not widen visibility just to move a test. If moving a test needs broad
-visibility, a crate-root re-export, or a path through an unrelated higher-level
-module, the test likely belongs in `src/tests.rs`. Visibility tightening should
-follow test moves and call-site audits rather than drive them.
+Do not make private helpers `pub` or `pub(crate)` just to move a test. If a test needs direct access to private module behavior, it probably belongs in that module's `#[cfg(test)]` block. Use `src/tests.rs` for cross-module behavior tests that exercise crate-visible paths.
