@@ -234,10 +234,6 @@ fn local_repo_url(path: &Path) -> Result<Url, Whatever> {
         .whatever_context("unable to convert local sibling repository path into a file URL")
 }
 
-fn local_repo_available(path: &Path) -> bool {
-    git2::Repository::open(path).is_ok()
-}
-
 fn apply_sibling_sources(
     repository_use: &mut git::RepositoryUse,
     sibling_ids: &[String],
@@ -259,7 +255,7 @@ fn apply_sibling_sources(
 
             for repo_id in sibling_ids {
                 let path = workspace_config.local_repo_path(repo_id);
-                if local_repo_available(&path) {
+                if git::repository_available(&path) {
                     local_repositories.push((repo_id.clone(), local_repo_url(&path)?));
                 } else {
                     missing.push(repo_id.clone());

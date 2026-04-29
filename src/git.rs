@@ -81,6 +81,10 @@ pub struct RepositoryUse {
     pub other_repos: BTreeMap<String, Url>,
 }
 
+pub fn repository_available(path: &Path) -> bool {
+    git2::Repository::open(path).is_ok()
+}
+
 impl LegacyLocations {
     pub fn identify_repository_title(&self, path: &Path) -> Result<String, Error> {
         let repo =
