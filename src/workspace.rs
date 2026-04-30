@@ -183,27 +183,67 @@ fn check_sibling_manifest_id(
     }
 }
 
-fn check_tool(report: &mut DoctorReport, command: &str, why: &str) {
+fn check_tool(report: &mut DoctorReport, command: &str, why: &str) -> bool {
     match command_path(command) {
-        Some(path) => report.record(
-            DoctorStatus::Ok,
-            format!(
-                "found required tool `{}` at `{}`",
-                command,
-                path.to_string_lossy()
-            ),
-        ),
-        None => report.record(
-            DoctorStatus::Fail,
-            format!("missing required tool `{}`: {}", command, why),
-        ),
+        Some(path) => {
+            report.record(
+                DoctorStatus::Ok,
+                format!(
+                    "found required tool `{}` at `{}`",
+                    command,
+                    path.to_string_lossy()
+                ),
+            );
+            true
+        }
+        None => {
+            report.record(
+                DoctorStatus::Fail,
+                format!("missing required tool `{}`: {}", command, why),
+            );
+            false
+        }
     }
 }
 
+#[cfg(windows)]
+fn check_default_windows_build_eips_path(report: &mut DoctorReport) {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+
+    let install_dir = PathBuf::from(local_app_data).join("build-eips").join("bin");
+    let build_eips_path = install_dir.join("build-eips.exe");
+
+    if build_eips_path.is_file() {
+        report.record(
+            DoctorStatus::Warn,
+            format!(
+                "found build-eips at the default user-local install path `{}`, but `{}` is not on PATH",
+                build_eips_path.to_string_lossy(),
+                install_dir.to_string_lossy()
+            ),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn check_default_windows_build_eips_path(_report: &mut DoctorReport) {}
+
+#[cfg(not(windows))]
 fn check_optional_download_tool(report: &mut DoctorReport) {
     let curl = command_path("curl");
     let wget = command_path("wget");
 
+    record_optional_download_tool(report, curl.as_deref(), wget.as_deref());
+}
+
+#[cfg(not(windows))]
+fn record_optional_download_tool(
+    report: &mut DoctorReport,
+    curl: Option<&Path>,
+    wget: Option<&Path>,
+) {
     match (curl, wget) {
         (Some(path), _) => report.record(
             DoctorStatus::Ok,
@@ -225,6 +265,38 @@ fn check_optional_download_tool(report: &mut DoctorReport) {
         ),
     }
 }
+
+#[cfg(not(windows))]
+fn check_front_door_archive_tool(report: &mut DoctorReport) {
+    let tar = command_path("tar");
+    record_front_door_archive_tool(report, tar.as_deref());
+}
+
+#[cfg(not(windows))]
+fn record_front_door_archive_tool(report: &mut DoctorReport, tar: Option<&Path>) {
+    match tar {
+        Some(path) => report.record(
+            DoctorStatus::Ok,
+            format!(
+                "found front-door archive tool `tar` at `{}`",
+                path.to_string_lossy()
+            ),
+        ),
+        None => report.record(
+            DoctorStatus::Warn,
+            "missing `tar`; `scripts/dev-setup` will not be able to unpack the release binary",
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+fn check_front_door_setup_tools(report: &mut DoctorReport) {
+    check_optional_download_tool(report);
+    check_front_door_archive_tool(report);
+}
+
+#[cfg(windows)]
+fn check_front_door_setup_tools(_report: &mut DoctorReport) {}
 
 fn collect_doctor_report(args: &Args, check_tools: bool) -> Result<DoctorReport, Whatever> {
     let context = load_workspace_command_context(args)?;
@@ -378,11 +450,13 @@ fn collect_doctor_report(args: &Args, check_tools: bool) -> Result<DoctorReport,
     }
 
     if check_tools {
-        check_tool(
+        if !check_tool(
             &mut report,
             "build-eips",
             "workspace bootstrap and build-eips commands expect `build-eips` on PATH",
-        );
+        ) {
+            check_default_windows_build_eips_path(&mut report);
+        }
         check_tool(
             &mut report,
             "git",
@@ -393,21 +467,7 @@ fn collect_doctor_report(args: &Args, check_tools: bool) -> Result<DoctorReport,
             "zola",
             "build, check, and serve commands need a working zola binary",
         );
-        check_optional_download_tool(&mut report);
-
-        match command_path("tar") {
-            Some(path) => report.record(
-                DoctorStatus::Ok,
-                format!(
-                    "found front-door archive tool `tar` at `{}`",
-                    path.to_string_lossy()
-                ),
-            ),
-            None => report.record(
-                DoctorStatus::Warn,
-                "missing `tar`; `scripts/dev-setup` will not be able to unpack the release binary",
-            ),
-        }
+        check_front_door_setup_tools(&mut report);
     }
 
     Ok(report)
@@ -806,6 +866,42 @@ base_url = "https://staging.example.test/{sibling_id}/"
             Url::parse(WORKSPACE_THEME_URL).unwrap().as_str(),
             "https://github.com/eips-wg/theme.git"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn front_door_setup_tool_records_posix_helper_warnings() {
+        let mut report = super::DoctorReport::default();
+
+        super::record_optional_download_tool(&mut report, None, None);
+        super::record_front_door_archive_tool(&mut report, None);
+
+        assert_eq!(report.warnings, 2);
+        assert_eq!(report.failures, 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn front_door_setup_tool_accepts_posix_helpers() {
+        let mut report = super::DoctorReport::default();
+        let tool_path = Path::new("/usr/bin/tool");
+
+        super::record_optional_download_tool(&mut report, Some(tool_path), None);
+        super::record_front_door_archive_tool(&mut report, Some(tool_path));
+
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.failures, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn front_door_setup_tools_skip_posix_helpers_on_windows() {
+        let mut report = super::DoctorReport::default();
+
+        super::check_front_door_setup_tools(&mut report);
+
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.failures, 0);
     }
 
     #[test]
