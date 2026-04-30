@@ -589,69 +589,7 @@ fn init_workspace_with_repositories(
 }
 
 fn workspace_doc_text() -> &'static str {
-    r#"# build-eips Workspace
-
-This directory is a local multi-repo workspace for `build-eips`.
-
-## Layout
-
-- `EIPs/` and `ERCs/`: proposal source repositories.
-- `theme/`: workspace-local Zola theme required by build, serve, and check commands.
-- `template/`: optional proposal template repository.
-- `preprocessor/`: optional local build-eips development checkout.
-- `eipw/`: optional local eipw development checkout.
-- `.build-eips.toml`: workspace configuration.
-- `.local-build/`: generated build output and materialized repositories.
-
-## Commands
-
-Run site commands from `EIPs/` or `ERCs/`. From the workspace root, use `-C`:
-
-```sh
-build-eips -C EIPs build
-build-eips -C ERCs serve
-```
-
-Runtime rendering commands use the workspace-local `theme/`; run
-`build-eips workspace init <workspace-root>` to bootstrap it.
-
-Common commands:
-
-```sh
-build-eips build
-build-eips serve
-build-eips check
-build-eips workspace doctor
-```
-
-`build-eips serve` listens at `http://127.0.0.1:1111` by default. Use
-`--host`, `--port`, and `--base-url` when a different local address or public
-URL is needed.
-
-## Targeted Local Renders
-
-Targeted renders apply only to local dirty `build` and `serve` commands:
-
-```sh
-build-eips build --only 555
-build-eips serve --only 555
-build-eips build --only 555 678
-```
-
-Workspace defaults can be set in `.build-eips.toml`:
-
-```toml
-[render]
-only = [555, 678]
-```
-
-CLI `--only` replaces `[render].only` for that command. Clean, staging,
-production, parity, check, changed, preview, and editorial commands do not use
-render filtering.
-
-New proposal numbers added while `serve --only` is running require restarting
-serve.
-"#
+    include_str!("workspace_doc.md")
 }
 
 fn write_workspace_doc(workspace_root: &Path) -> Result<(), Whatever> {
@@ -905,7 +843,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
-    fn workspace_doc_text_documents_layout_commands_and_only_settings() {
+    fn workspace_doc_text_documents_workspace_commands_and_modes() {
         let text = workspace_doc_text();
 
         for expected in [
@@ -914,8 +852,19 @@ base_url = "https://staging.example.test/{sibling_id}/"
             "theme",
             ".build-eips.toml",
             ".local-build",
+            "Workspace Layout",
+            "Requirements And Troubleshooting",
+            "Serve And Preview",
+            "Local Server And Base URL",
+            "Target Specific Proposals",
+            "Remote Environment Commands",
+            "Source And Output Overrides",
+            "Editorial Validation",
             "build-eips serve",
+            "build-eips preview",
             "--only",
+            "--remote-sibling-repo",
+            "--batch",
             "[render]",
             "only = [",
             "1111",
@@ -926,6 +875,8 @@ base_url = "https://staging.example.test/{sibling_id}/"
                 "workspace document text should contain `{expected}`"
             );
         }
+
+        assert!(text.ends_with('\n'));
     }
 
     #[test]
@@ -933,8 +884,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
         let (_temp, workspace_root) = run_workspace_init_for_docs(None, None);
 
         let doc = std::fs::read_to_string(workspace_root.join(WORKSPACE_DOC_FILE)).unwrap();
-        assert!(doc.contains("build-eips Workspace"));
-        assert!(doc.contains("build-eips serve"));
+        assert_eq!(doc, workspace_doc_text());
     }
 
     #[test]
@@ -944,8 +894,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
 
         let doc = std::fs::read_to_string(workspace_root.join(WORKSPACE_DOC_FILE)).unwrap();
         assert_ne!(doc, existing_doc);
-        assert!(doc.contains("build-eips Workspace"));
-        assert!(doc.contains("--only"));
+        assert_eq!(doc, workspace_doc_text());
     }
 
     #[test]
