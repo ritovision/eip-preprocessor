@@ -29,9 +29,9 @@ pub(crate) struct Args {
     #[clap(long)]
     pub(crate) production: bool,
 
-    /// Use the configured remote sibling content repository
+    /// Use the configured remote sibling content repositories
     #[clap(long)]
-    pub(crate) remote_sibling_repo: bool,
+    pub(crate) remote_siblings: bool,
 
     /// Write build artifacts under BUILD_ROOT instead of the default location
     #[clap(long)]
@@ -138,11 +138,22 @@ pub(crate) enum Operation {
         command: EditorialCommand,
     },
 
-    /// Manage local multi-repo workspace state
-    Workspace {
-        #[command(subcommand)]
-        command: WorkspaceCommand,
+    /// Create the local workspace config and clone any missing sibling repositories
+    Init {
+        /// Workspace root directory
+        path: PathBuf,
+
+        /// Also clone template for proposal-family scaffold work
+        #[arg(long)]
+        template: bool,
+
+        /// Also clone preprocessor and eipw for platform development
+        #[arg(long)]
+        platform_dev: bool,
     },
+
+    /// Check whether the local workspace bootstrap is ready for direct build-eips commands
+    Doctor,
 
     /// Run a normal command with the built-in parity mode
     Parity {
@@ -173,26 +184,6 @@ pub(crate) enum ProfiledOperation {
 }
 
 #[derive(Debug, Subcommand, Clone)]
-pub(crate) enum WorkspaceCommand {
-    /// Create the local workspace config and clone any missing sibling repositories
-    Init {
-        /// Workspace root directory
-        path: PathBuf,
-
-        /// Also clone template for proposal-family scaffold work
-        #[arg(long)]
-        template: bool,
-
-        /// Also clone preprocessor and eipw for platform development
-        #[arg(long)]
-        platform_dev: bool,
-    },
-
-    /// Check whether the local workspace bootstrap is ready for direct build-eips commands
-    Doctor,
-}
-
-#[derive(Debug, Subcommand, Clone)]
 pub(crate) enum EditorialCommand {
     /// Run eipw on explicitly selected proposal targets
     Lint {
@@ -204,7 +195,7 @@ pub(crate) enum EditorialCommand {
     },
 
     /// Run targeted editorial validation, then the runtime check path
-    Build {
+    Check {
         #[command(flatten)]
         selectors: EditorialSelectorArgs,
 
@@ -262,7 +253,8 @@ impl Operation {
             | Self::Check { .. }
             | Self::Changed { .. }
             | Self::Editorial { .. }
-            | Self::Workspace { .. } => ServerCliArgs::default(),
+            | Self::Init { .. }
+            | Self::Doctor => ServerCliArgs::default(),
         }
     }
 
@@ -276,7 +268,8 @@ impl Operation {
             | Self::Check { .. }
             | Self::Changed { .. }
             | Self::Editorial { .. }
-            | Self::Workspace { .. } => BaseUrlCliArgs::default(),
+            | Self::Init { .. }
+            | Self::Doctor => BaseUrlCliArgs::default(),
         }
     }
 
@@ -290,7 +283,8 @@ impl Operation {
             | Self::Clean
             | Self::Changed { .. }
             | Self::Editorial { .. }
-            | Self::Workspace { .. }
+            | Self::Init { .. }
+            | Self::Doctor
             | Self::Parity { .. } => CleanCliArgs::default(),
         }
     }
@@ -304,7 +298,8 @@ impl Operation {
             | Self::Check { .. }
             | Self::Changed { .. }
             | Self::Editorial { .. }
-            | Self::Workspace { .. }
+            | Self::Init { .. }
+            | Self::Doctor
             | Self::Parity { .. } => None,
         }
     }
@@ -316,18 +311,18 @@ impl Operation {
         )
     }
 
-    pub(crate) fn is_editorial_build_command(&self) -> bool {
+    pub(crate) fn is_editorial_check_command(&self) -> bool {
         matches!(
             self,
             Self::Editorial {
-                command: EditorialCommand::Build { .. }
+                command: EditorialCommand::Check { .. }
             }
         )
     }
 
     pub(crate) fn runtime_operation(&self) -> Option<RuntimeOperation> {
         match self {
-            Self::Print { .. } | Self::Workspace { .. } => None,
+            Self::Print { .. } | Self::Init { .. } | Self::Doctor => None,
             Self::Build { .. } => Some(RuntimeOperation::Build),
             Self::Serve { .. } => Some(RuntimeOperation::Serve),
             Self::Preview { .. } => Some(RuntimeOperation::Preview),
@@ -344,8 +339,8 @@ impl Operation {
         }
     }
 
-    pub(crate) fn is_workspace_command(&self) -> bool {
-        matches!(self, Self::Workspace { .. })
+    pub(crate) fn is_workspace_lifecycle_command(&self) -> bool {
+        matches!(self, Self::Init { .. } | Self::Doctor)
     }
 
     pub(crate) fn is_print_command(&self) -> bool {
@@ -426,7 +421,7 @@ mod tests {
 
     use crate::proposal::ProposalNumber;
 
-    use super::{Args, Operation, ProfiledOperation, RuntimeOperation, WorkspaceCommand};
+    use super::{Args, EditorialCommand, Operation, ProfiledOperation, RuntimeOperation};
 
     fn parse_args(arguments: &[&str]) -> Args {
         Args::try_parse_from(arguments).unwrap()
@@ -652,12 +647,16 @@ mod tests {
     }
 
     #[test]
-    fn removed_dirty_command_surface_is_rejected() {
+    fn removed_command_surface_is_rejected() {
         for arguments in [
             &["build-eips", "dirty", "build"][..],
             &["build-eips", "--allow-dirty", "build"][..],
             &["build-eips", "--no-allow-dirty", "build"][..],
             &["build-eips", "--no-staging", "build"][..],
+            &["build-eips", "--remote-sibling-repo", "build"][..],
+            &["build-eips", "workspace", "init", "/tmp/workspace"][..],
+            &["build-eips", "workspace", "doctor"][..],
+            &["build-eips", "editorial", "build", "1"][..],
             &["build-eips", "parity", "preview"][..],
             &["build-eips", "parity", "clean"][..],
             &["build-eips", "parity", "changed"][..],
@@ -691,14 +690,12 @@ mod tests {
             ],
             &[
                 "build-eips",
-                "workspace",
                 "doctor",
                 "--base-url",
                 "http://localhost:4000",
             ],
             &[
                 "build-eips",
-                "workspace",
                 "init",
                 "/tmp/workspace",
                 "--base-url",
@@ -721,43 +718,62 @@ mod tests {
     }
 
     #[test]
-    fn workspace_init_optional_flags_parse() {
-        let template = parse_args(&[
-            "build-eips",
-            "workspace",
-            "init",
-            "/tmp/workspace",
-            "--template",
-        ]);
+    fn workspace_lifecycle_commands_parse() {
+        let plain = parse_args(&["build-eips", "init", "/tmp/workspace"]);
+        let template = parse_args(&["build-eips", "init", "/tmp/workspace", "--template"]);
         let combined = parse_args(&[
             "build-eips",
-            "workspace",
             "init",
             "/tmp/workspace",
             "--template",
             "--platform-dev",
         ]);
+        let doctor = parse_args(&["build-eips", "doctor"]);
 
         assert!(matches!(
+            plain.operation,
+            Operation::Init {
+                template: false,
+                platform_dev: false,
+                ..
+            }
+        ));
+        assert!(matches!(
             template.operation,
-            Operation::Workspace {
-                command: WorkspaceCommand::Init {
-                    template: true,
-                    platform_dev: false,
-                    ..
-                }
+            Operation::Init {
+                template: true,
+                platform_dev: false,
+                ..
             }
         ));
         assert!(matches!(
             combined.operation,
-            Operation::Workspace {
-                command: WorkspaceCommand::Init {
-                    template: true,
-                    platform_dev: true,
-                    ..
-                }
+            Operation::Init {
+                template: true,
+                platform_dev: true,
+                ..
             }
         ));
+        assert!(matches!(doctor.operation, Operation::Doctor));
+    }
+
+    #[test]
+    fn editorial_check_parses_as_runtime_editorial_command() {
+        let args = parse_args(&["build-eips", "editorial", "check", "--working-tree"]);
+
+        assert!(matches!(
+            args.operation.runtime_operation(),
+            Some(RuntimeOperation::Editorial {
+                command: EditorialCommand::Check { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn remote_siblings_flag_parses() {
+        let args = parse_args(&["build-eips", "--remote-siblings", "build"]);
+
+        assert!(args.remote_siblings);
     }
 
     #[test]

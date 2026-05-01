@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn editorial_working_tree_build_still_forces_dirty_runtime_materialization() {
+    fn editorial_working_tree_check_still_forces_dirty_runtime_materialization() {
         let resolved = ResolvedExecution {
             root_path: PathBuf::from("/workspace/Core"),
             build_path: PathBuf::from("/workspace/build/Core"),

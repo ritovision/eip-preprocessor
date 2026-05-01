@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! Local workspace initialization and diagnostics.
+//! Local workspace setup and diagnostics.
 
 use std::{
     fmt,
@@ -477,10 +477,7 @@ pub(crate) fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
     let report = collect_doctor_report(args, true)?;
 
     if report.failures > 0 {
-        snafu::whatever!(
-            "workspace doctor found {} failing check(s)",
-            report.failures
-        );
+        snafu::whatever!("doctor found {} failing check(s)", report.failures);
     }
 
     Ok(())
@@ -532,7 +529,7 @@ fn init_workspace_with_repositories(
     let expected_root = workspace_root.join(&repository_use.title);
     if root_path != expected_root {
         snafu::whatever!(
-            "workspace init expects the active repository at `{}`, found `{}`",
+            "init expects the active repository at `{}`, found `{}`",
             expected_root.to_string_lossy(),
             root_path.to_string_lossy(),
         );
@@ -614,7 +611,7 @@ mod tests {
     use url::Url;
 
     use crate::{
-        cli::{Args, Operation, WorkspaceCommand},
+        cli::{Args, Operation},
         config::{self, LoadedWorkspaceConfig},
     };
 
@@ -738,7 +735,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
 
     fn init_workspace_source_repo(remotes_root: &Path, name: &str) -> Url {
         let path = remotes_root.join(name);
-        init_repo(&path, &[("README.md", "workspace init test repo\n")]);
+        init_repo(&path, &[("README.md", "init test repo\n")]);
         file_url(&path)
     }
 
@@ -781,7 +778,6 @@ base_url = "https://staging.example.test/{sibling_id}/"
             "build-eips",
             "-C",
             active_path.to_str().unwrap(),
-            "workspace",
             "init",
             workspace_root.to_str().unwrap(),
         ]);
@@ -863,7 +859,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
             "build-eips serve",
             "build-eips preview",
             "--only",
-            "--remote-sibling-repo",
+            "--remote-siblings",
             "--batch",
             "[render]",
             "only = [",
@@ -962,7 +958,6 @@ base_url = "https://staging.example.test/{sibling_id}/"
             "build-eips",
             "-C",
             active_path.to_str().unwrap(),
-            "workspace",
             "init",
             workspace_root.to_str().unwrap(),
         ]);
@@ -982,13 +977,8 @@ base_url = "https://staging.example.test/{sibling_id}/"
             assert!(Repository::open(workspace_root.join(sibling_id)).is_ok());
         }
 
-        let doctor_args = parse_args(&[
-            "build-eips",
-            "-C",
-            active_path.to_str().unwrap(),
-            "workspace",
-            "doctor",
-        ]);
+        let doctor_args =
+            parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
         let report = collect_doctor_report(&doctor_args, false).unwrap();
 
         assert_eq!(report.failures, 0);
@@ -1019,22 +1009,18 @@ base_url = "https://staging.example.test/{sibling_id}/"
             "build-eips",
             "-C",
             active_path.as_ref(),
-            "workspace",
             "init",
             workspace_root_arg.as_ref(),
         ];
         arguments.extend_from_slice(flags);
         let init_args = parse_args(&arguments);
-        let Operation::Workspace {
-            command:
-                WorkspaceCommand::Init {
-                    path,
-                    template,
-                    platform_dev,
-                },
+        let Operation::Init {
+            path,
+            template,
+            platform_dev,
         } = init_args.operation.clone()
         else {
-            panic!("expected workspace init command");
+            panic!("expected init command");
         };
 
         assert_eq!(template, expect_template);
@@ -1083,13 +1069,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
         let active_path = workspace.path().join("Core");
         let active_url = file_url(&active_path);
         write_manifest_repo(&active_path, "Core", &active_url, &[]);
-        let args = parse_args(&[
-            "build-eips",
-            "-C",
-            active_path.to_str().unwrap(),
-            "workspace",
-            "doctor",
-        ]);
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
 
         let report = collect_doctor_report(&args, false).unwrap();
 
@@ -1104,13 +1084,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
         let active_url = file_url(&active_path);
         write_manifest_repo(&active_path, "Core", &active_url, &[]);
         std::fs::write(workspace.path().join(config::LOCAL_CONFIG_FILE), "[").unwrap();
-        let args = parse_args(&[
-            "build-eips",
-            "-C",
-            active_path.to_str().unwrap(),
-            "workspace",
-            "doctor",
-        ]);
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
 
         let report = collect_doctor_report(&args, false).unwrap();
 
@@ -1138,13 +1112,7 @@ staging = true
         .unwrap();
         let error = LoadedWorkspaceConfig::from_path(&config_path).unwrap_err();
         assert!(matches!(error, config::WorkspaceError::Parse { .. }));
-        let args = parse_args(&[
-            "build-eips",
-            "-C",
-            active_path.to_str().unwrap(),
-            "workspace",
-            "doctor",
-        ]);
+        let args = parse_args(&["build-eips", "-C", active_path.to_str().unwrap(), "doctor"]);
 
         let report = collect_doctor_report(&args, false).unwrap();
 

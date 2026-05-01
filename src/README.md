@@ -24,7 +24,7 @@ This file documents how the preprocessor crate is organized: which module owns e
 - `progress.rs` owns progress/log rendering helpers.
 - `proposal.rs` owns proposal path classification, proposal-number parsing, and targeted-rendering selection policy.
 - `serve.rs` owns dirty active-repo and local-theme serve synchronization.
-- `workspace.rs` owns local workspace initialization and diagnostics.
+- `workspace.rs` owns local workspace setup and diagnostics.
 - `zola.rs` owns Zola discovery, theme mounting, and Zola command invocation.
 
 ## Test Ownership
@@ -41,7 +41,7 @@ Use `src/tests.rs` for cross-domain behavior tests, especially tests covering:
 - source materialization behavior spanning git, execution, pipeline, or serve
 - tests that would require exposing more internals just to move them
 
-Move tests to module-local `#[cfg(test)]` modules only when the behavior is owned by one module and the test remains clearer there. Examples include pure clap parsing in `cli.rs`, execution policy helpers in `execution.rs`, serve event filtering in `serve.rs`, workspace-local theme materialization in `pipeline.rs`, editorial helper behavior in `editorial.rs`, workspace init/doctor behavior in `workspace.rs`, active repo identity behavior in `identity.rs` when it does not require the full execution path, and proposal path or proposal-number behavior in `proposal.rs`.
+Move tests to module-local `#[cfg(test)]` modules only when the behavior is owned by one module and the test remains clearer there. Examples include pure clap parsing in `cli.rs`, execution policy helpers in `execution.rs`, serve event filtering in `serve.rs`, workspace-local theme materialization in `pipeline.rs`, editorial helper behavior in `editorial.rs`, workspace setup and diagnostics behavior in `workspace.rs`, active repo identity behavior in `identity.rs` when it does not require the full execution path, and proposal path or proposal-number behavior in `proposal.rs`.
 
 ## Dependency Direction
 

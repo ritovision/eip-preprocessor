@@ -45,7 +45,7 @@ When working on `build-eips` itself, use the local contributor setup script inst
 
 The script runs `cargo build` and uses `preprocessor/target/debug/build-eips` for workspace setup, so local branch changes are what get exercised. It expects a sibling active proposal repo checkout, defaulting to `../EIPs`; override `WORKSPACE_ROOT` or `ACTIVE_REPO_ROOT` when your checkout layout differs. Run it from the preprocessor checkout; relative overrides are resolved from the invocation directory.
 
-This setup mutates the local workspace root through `workspace init`, including creating `.build-eips.toml`, `.local-build/`, and cloning missing repositories. By default it passes `--platform-dev`, which adds `preprocessor` and `eipw`. Pass `--template` to the setup script when you also want `template`:
+This setup mutates the local workspace root through `build-eips init`, including creating `.build-eips.toml`, `.local-build/`, and cloning missing repositories. By default it passes `--platform-dev`, which adds `preprocessor` and `eipw`. Pass `--template` to the setup script when you also want `template`:
 
 ```bash
 ./scripts/dev-setup --template
@@ -72,7 +72,7 @@ Public proposal-repo setup scripts are different: they use an installed or relea
 If `build-eips` is already installed, you can bootstrap a local multi-repo workspace from inside `EIPs/` or `ERCs/`:
 
 ```bash
-build-eips workspace init /work/EIPs-project
+build-eips init /work/EIPs-project
 ```
 
 By default this:
@@ -85,13 +85,13 @@ By default this:
 To work on a bare, unpopulated proposal repo, you can additionally clone `template`:
 
 ```bash
-build-eips workspace init /work/EIPs-project --template
+build-eips init /work/EIPs-project --template
 ```
 
 For platform development, you can additionally clone `preprocessor` and `eipw`:
 
 ```bash
-build-eips workspace init /work/EIPs-project --platform-dev
+build-eips init /work/EIPs-project --platform-dev
 ```
 
 The optional `--template` and `--platform-dev` flags can be combined when both sets of optional repositories are needed.
@@ -99,7 +99,7 @@ The optional `--template` and `--platform-dev` flags can be combined when both s
 Validate the workspace bootstrap at any point with:
 
 ```bash
-build-eips workspace doctor
+build-eips doctor
 ```
 
 After bootstrap, direct `build-eips` commands can run from inside `EIPs/` or `ERCs/` without repeating local path flags:
@@ -132,7 +132,7 @@ By default, these commands use:
 
 By default, `build-eips` prepares a disposable build repo under `.local-build/<repo_id>/repo`, then runs the requested check, build, or serve command from that prepared repo.
 
-Sibling repos come from the workspace layout unless you pass `--remote-sibling-repo`.
+Sibling repos come from the workspace layout unless you pass `--remote-siblings`.
 
 Before running Zola, `build-eips` copies the tracked `workspace/theme` state into `.local-build/<repo_id>/repo/themes/eips-theme`.
 
@@ -237,7 +237,7 @@ Remote environment commands and `parity` ignore `[site].base_url` in `.build-eip
 
 Workspace-local sources come from the standard workspace layout. The local theme is `workspace/theme`, and local sibling repos are `workspace/<sibling_repo_id>` from the active repo manifest.
 
-Use `--remote-sibling-repo` when you need to force remote sibling proposal sources for a single command.
+Use `--remote-siblings` when you need to force remote sibling proposal sources for a single command.
 
 Use global `--build-root <path>` when you want a separate prepared repo and output directory, for example to compare two builds side by side. The path replaces the default `.local-build/<repo_id>` location for each command where you pass it, so use the same `--build-root` value when serving or previewing builds.
 
@@ -264,7 +264,7 @@ Use the explicit editorial command group when you want targeted `eipw` validatio
 build-eips editorial lint content/07949.md
 build-eips editorial lint --working-tree
 build-eips editorial lint --against-upstream --format github
-build-eips editorial build --batch /work/EIPs-project/editor-batch.txt
+build-eips editorial check --batch /work/EIPs-project/editor-batch.txt
 ```
 
 Selector modes are mutually exclusive:
@@ -274,4 +274,4 @@ Selector modes are mutually exclusive:
 - `--working-tree` for tracked dirty proposal files
 - `--against-upstream` for PR-style merge-base selection
 
-`editorial build` runs targeted editorial validation first, then reuses the runtime `check` path.
+`editorial check` runs targeted editorial validation first, then reuses the runtime `check` path.

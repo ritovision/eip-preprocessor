@@ -36,7 +36,7 @@ use log::{debug, info};
 use snafu::{Report, ResultExt, Whatever};
 
 use crate::{
-    cli::{Args, EditorialCommand, Operation, RuntimeOperation, WorkspaceCommand},
+    cli::{Args, EditorialCommand, Operation, RuntimeOperation},
     editorial::{editorial_runtime_execution, run_editorial_lint},
     execution::{resolve_execution, validate_non_execution_command_flags},
     layout::{output_path, REPO_DIR},
@@ -80,15 +80,18 @@ fn run() -> Result<(), Whatever> {
         return Ok(());
     }
 
-    if let Operation::Workspace { command } = &args.operation {
-        match command.clone() {
-            WorkspaceCommand::Init {
-                path,
-                template,
-                platform_dev,
-            } => init_workspace(&args, path, template, platform_dev)?,
-            WorkspaceCommand::Doctor => doctor_workspace(&args)?,
-        }
+    if let Operation::Init {
+        path,
+        template,
+        platform_dev,
+    } = &args.operation
+    {
+        init_workspace(&args, path.clone(), *template, *platform_dev)?;
+        return Ok(());
+    }
+
+    if let Operation::Doctor = &args.operation {
+        doctor_workspace(&args)?;
         return Ok(());
     }
 
@@ -157,7 +160,7 @@ fn run() -> Result<(), Whatever> {
             EditorialCommand::Lint { selectors, eipw } => {
                 run_editorial_lint(&resolved, &selectors, eipw)?;
             }
-            EditorialCommand::Build { selectors, eipw } => {
+            EditorialCommand::Check { selectors, eipw } => {
                 run_editorial_lint(&resolved, &selectors, eipw)?;
                 Prepared::prepare(editorial_runtime_execution(resolved, &selectors))?.check()?;
             }

@@ -36,22 +36,22 @@ EIPs-project/
 - `preprocessor/`: optional local `build-eips` development checkout.
 - `eipw/`: optional local `eipw` development checkout.
 
-If the optional repos are missing, rerun workspace init with the needed flags.
+If the optional repos are missing, rerun build-eips init with the needed flags.
 
 From an active proposal repo:
 
 ```sh
-build-eips workspace init .. --template
-build-eips workspace init .. --platform-dev
-build-eips workspace init .. --template --platform-dev
+build-eips init .. --template
+build-eips init .. --platform-dev
+build-eips init .. --template --platform-dev
 ```
 
 From the workspace root:
 
 ```sh
-build-eips -C EIPs workspace init . --template
-build-eips -C EIPs workspace init . --platform-dev
-build-eips -C EIPs workspace init . --template --platform-dev
+build-eips -C EIPs init . --template
+build-eips -C EIPs init . --platform-dev
+build-eips -C EIPs init . --template --platform-dev
 ```
 
 ## Requirements And Troubleshooting
@@ -64,20 +64,20 @@ Local workspace commands require these tools on `PATH`:
 
 Git must be installed separately. The setup scripts locate or install `build-eips` and Zola, add locally installed tool directories to `PATH` for the current shell session, and print guidance for making those `PATH` changes permanent.
 
-Run `workspace doctor` after setup and whenever a command cannot find a repo, config file, theme, or required tool:
+Run `build-eips doctor` after setup and whenever a command cannot find a repo, config file, theme, or required tool:
 
 ```sh
-build-eips workspace doctor
+build-eips doctor
 ```
 
 From the workspace root, anchor the command through an active proposal repo:
 
 ```sh
-build-eips -C EIPs workspace doctor
-build-eips -C ERCs workspace doctor
+build-eips -C EIPs doctor
+build-eips -C ERCs doctor
 ```
 
-`workspace doctor` checks:
+`build-eips doctor` checks:
 
 - required tools: Git, `build-eips`, and Zola 0.22.1
 - the active proposal repo manifest
@@ -88,9 +88,9 @@ build-eips -C ERCs workspace doctor
 
 If a fresh shell cannot find `build-eips` or Zola, rerun the setup script or apply the permanent `PATH` guidance printed by the setup script.
 
-If a sibling repo, `theme/`, or optional platform repo is missing, rerun `workspace init` with the needed flags.
+If a sibling repo, `theme/`, or optional platform repo is missing, rerun `build-eips init` with the needed flags.
 
-If `workspace doctor` reports that Zola is missing or too old, rerun the setup script to install the supported Zola version.
+If `build-eips doctor` reports that Zola is missing or too old, rerun the setup script to install the supported Zola version.
 
 ## Commands
 
@@ -109,7 +109,7 @@ Common commands:
 build-eips build
 build-eips serve
 build-eips check
-build-eips workspace doctor
+build-eips doctor
 ```
 
 `build-eips serve` listens at `http://127.0.0.1:1111` by default. Use
@@ -193,7 +193,7 @@ These commands still require the workspace-local `theme/`. CI and production run
 
 Workspace-local sources come from the standard workspace layout. The local theme is `theme/`, and local sibling proposal repos use their repo IDs, such as `EIPs/` and `ERCs/`.
 
-Use `--remote-sibling-repo` when you need to force remote sibling proposal sources for a single command.
+Use `--remote-siblings` when you need to force remote sibling proposal sources for a single command.
 
 Use global `--build-root <path>` when you want a separate prepared repo and output directory, for example to compare two builds side by side. The path replaces the default `.local-build/<repo_id>` location for each command where you pass it, so use the same `--build-root` value when serving or previewing builds.
 
@@ -215,7 +215,7 @@ build-eips -C /work/EIPs-project/EIPs --build-root /tmp/eips-staging --staging s
 
 Use editorial commands when you want targeted `eipw` validation before opening or updating a pull request.
 
-Both `editorial lint` and `editorial build` take the same selector modes:
+Both `editorial lint` and `editorial check` take the same selector modes:
 
 * proposal numbers or repo-relative proposal paths for explicit targets
 * `--working-tree` for tracked dirty proposal files
@@ -232,12 +232,12 @@ build-eips editorial lint --working-tree
 build-eips editorial lint --against-upstream --format github
 ```
 
-`editorial build` runs targeted editorial validation first, then reuses the local `check` path:
+`editorial check` runs targeted editorial validation first, then reuses the local `check` path:
 
 ```bash
-build-eips editorial build 1
-build-eips editorial build --working-tree
-build-eips editorial build --against-upstream --format github
+build-eips editorial check 1
+build-eips editorial check --working-tree
+build-eips editorial check --against-upstream --format github
 ```
 
 Use a batch file when you want to lint or build-check the same proposal set repeatedly. A batch file is a plain text file with one proposal number or repo-relative proposal path per line:
@@ -250,5 +250,5 @@ content/07950.md
 
 ```bash
 build-eips editorial lint --batch ../editor-batch.txt
-build-eips editorial build --batch ../editor-batch.txt
+build-eips editorial check --batch ../editor-batch.txt
 ```

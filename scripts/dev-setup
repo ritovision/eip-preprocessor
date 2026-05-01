@@ -76,14 +76,14 @@ say "Building local build-eips"
 
 say "Bootstrapping local contributor workspace"
 if [ "$INCLUDE_TEMPLATE" = true ]; then
-    "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace init "$WORKSPACE_ROOT" --platform-dev --template
+    "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" init "$WORKSPACE_ROOT" --platform-dev --template
 else
-    "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace init "$WORKSPACE_ROOT" --platform-dev
+    "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" init "$WORKSPACE_ROOT" --platform-dev
 fi
 
-say "Running workspace doctor"
-if ! "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" workspace doctor; then
-    say "Workspace doctor reported issues above. Fix them before relying on local build-eips commands."
+say "Running build-eips doctor"
+if ! "$BUILD_EIPS" -C "$ACTIVE_REPO_ROOT" doctor; then
+    say "build-eips doctor reported issues above. Fix them before relying on local build-eips commands."
 fi
 
 say ""

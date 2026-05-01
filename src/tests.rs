@@ -14,10 +14,7 @@ use tempfile::TempDir;
 use url::Url;
 
 use crate::{
-    cli::{
-        Args, EditorialCommand, EditorialSelectorArgs, Operation, RuntimeOperation,
-        WorkspaceCommand,
-    },
+    cli::{Args, EditorialCommand, EditorialSelectorArgs, Operation, RuntimeOperation},
     config::{self, LoadedWorkspaceConfig},
     editorial::editorial_targets,
     execution::{
@@ -205,23 +202,13 @@ fn write_manifest_repo(
 
 #[test]
 fn command_groups_route_separately_from_parity() {
-    let workspace = parse_args(&["build-eips", "workspace", "init", "/tmp/workspace"]);
-    let doctor = parse_args(&["build-eips", "workspace", "doctor"]);
+    let init = parse_args(&["build-eips", "init", "/tmp/workspace"]);
+    let doctor = parse_args(&["build-eips", "doctor"]);
     let editorial_lint = parse_args(&["build-eips", "editorial", "lint", "--working-tree"]);
-    let editorial_build = parse_args(&["build-eips", "editorial", "build", "--working-tree"]);
+    let editorial_check = parse_args(&["build-eips", "editorial", "check", "--working-tree"]);
 
-    assert!(matches!(
-        workspace.operation,
-        Operation::Workspace {
-            command: WorkspaceCommand::Init { .. }
-        }
-    ));
-    assert!(matches!(
-        doctor.operation,
-        Operation::Workspace {
-            command: WorkspaceCommand::Doctor
-        }
-    ));
+    assert!(matches!(init.operation, Operation::Init { .. }));
+    assert!(matches!(doctor.operation, Operation::Doctor));
     assert!(matches!(
         editorial_lint.operation.runtime_operation(),
         Some(RuntimeOperation::Editorial {
@@ -229,9 +216,9 @@ fn command_groups_route_separately_from_parity() {
         })
     ));
     assert!(matches!(
-        editorial_build.operation.runtime_operation(),
+        editorial_check.operation.runtime_operation(),
         Some(RuntimeOperation::Editorial {
-            command: EditorialCommand::Build { .. }
+            command: EditorialCommand::Check { .. }
         })
     ));
     assert!(validate_non_execution_command_flags(&editorial_lint).is_ok());
@@ -272,7 +259,7 @@ fn downstream_ci_zola_forms_require_workspace_local_theme_config() {
             "build-eips",
             "--staging",
             "editorial",
-            "build",
+            "check",
             "--against-upstream",
         ][..],
         &["build-eips", "parity", "check"][..],

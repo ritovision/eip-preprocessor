@@ -61,12 +61,12 @@ pub(crate) struct ExecutionSettings {
 }
 
 fn has_execution_override_flags(args: &Args) -> bool {
-    args.staging || args.production || args.remote_sibling_repo || args.build_root.is_some()
+    args.staging || args.production || args.remote_siblings || args.build_root.is_some()
 }
 
 pub(crate) fn validate_non_execution_command_flags(args: &Args) -> Result<(), Whatever> {
-    if args.operation.is_workspace_command() && has_execution_override_flags(args) {
-        snafu::whatever!("execution override flags cannot be used with `workspace` commands");
+    if args.operation.is_workspace_lifecycle_command() && has_execution_override_flags(args) {
+        snafu::whatever!("execution override flags cannot be used with `init` or `doctor`");
     }
 
     if args.operation.is_print_command() && has_execution_override_flags(args) {
@@ -129,7 +129,7 @@ fn only_cli_is_applicable(args: &Args, explicit_environment: Option<bool>) -> bo
         Operation::Build { .. } | Operation::Serve { .. }
     ) && explicit_environment.is_none()
         && !args.operation.clean_cli_args().clean
-        && !args.remote_sibling_repo
+        && !args.remote_siblings
 }
 
 pub(crate) fn resolve_execution_settings(
@@ -143,7 +143,7 @@ pub(crate) fn resolve_execution_settings(
         .map(resolve_input_path)
         .transpose()?;
     let explicit_environment = explicit_environment_or_parity(args)?;
-    let sibling_override = remote_source_override(args.remote_sibling_repo);
+    let sibling_override = remote_source_override(args.remote_siblings);
     let clean = args.operation.clean_cli_args().clean;
 
     if cli_only_requested(args) && !only_cli_is_applicable(args, explicit_environment) {
@@ -152,7 +152,7 @@ pub(crate) fn resolve_execution_settings(
 
     let (staging, allow_dirty, default_sibling) = if let Some(staging) = explicit_environment {
         (staging, false, SelectedSource::Remote)
-    } else if args.operation.is_plain_site_command() || args.operation.is_editorial_build_command()
+    } else if args.operation.is_plain_site_command() || args.operation.is_editorial_check_command()
     {
         (true, !clean, SelectedSource::WorkspaceLocal)
     } else {
@@ -168,13 +168,13 @@ pub(crate) fn resolve_execution_settings(
     match (missing_theme, missing_sibling) {
         (true, true) => {
             snafu::whatever!(
-                "the selected command requires workspace-local theme and sibling sources, but no `{}` was found.\n\nRun:\n  build-eips workspace init <workspace-root>\n\nThen retry from that workspace. Remote theme support has been removed; local theme is required for Zola commands. Use `--remote-sibling-repo` only if you intentionally want remote sibling proposal sources.",
+                "the selected command requires workspace-local theme and sibling sources, but no `{}` was found.\n\nRun:\n  build-eips init <workspace-root>\n\nThen retry from that workspace. Remote theme support has been removed; local theme is required for Zola commands. Use `--remote-siblings` only if you intentionally want remote sibling proposal sources.",
                 config::LOCAL_CONFIG_FILE
             );
         }
         (false, true) => {
             snafu::whatever!(
-                "the selected command requires workspace-local sibling sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips workspace init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-sibling-repo` for remote sibling source overrides\n3. use `parity <command>`, `--staging <command>`, or `--production <command>` for remote clean environment behavior",
+                "the selected command requires workspace-local sibling sources, but no `{}` was found to provide them.\nResolve this by doing one of the following:\n1. run `build-eips init <workspace-root>` so the workspace config supplies the local sources\n2. pass `--remote-siblings` for remote sibling source overrides\n3. use `parity <command>`, `--staging <command>`, or `--production <command>` for remote clean environment behavior",
                 config::LOCAL_CONFIG_FILE
             );
         }
@@ -314,7 +314,7 @@ fn resolve_theme_path(
     }
 
     let workspace_config = workspace_config.whatever_context(format!(
-        "the selected command requires a workspace-local theme, but no `{}` was found.\n\nRun:\n  build-eips workspace init <workspace-root>\n\nThen retry from that workspace. Remote theme support has been removed; staging,\nproduction, and parity commands still use remote proposal sources but require a\nlocal workspace theme.",
+        "the selected command requires a workspace-local theme, but no `{}` was found.\n\nRun:\n  build-eips init <workspace-root>\n\nThen retry from that workspace. Remote theme support has been removed; staging,\nproduction, and parity commands still use remote proposal sources but require a\nlocal workspace theme.",
         config::LOCAL_CONFIG_FILE
     ))?;
     let theme_path = workspace_config.local_theme_path();
@@ -323,7 +323,7 @@ fn resolve_theme_path(
         Ok(_) => Ok(Some(theme_path)),
         Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
             snafu::whatever!(
-                "workspace-local theme path `{}` does not exist.\n\nRun `build-eips workspace init <workspace-root>` to bootstrap the workspace, or\nclone/update the theme repository at the configured path.",
+                "workspace-local theme path `{}` does not exist.\n\nRun `build-eips init <workspace-root>` to bootstrap the workspace, or\nclone/update the theme repository at the configured path.",
                 theme_path.to_string_lossy()
             );
         }
@@ -439,8 +439,8 @@ mod tests {
 
     use super::{
         explicit_environment_or_parity, resolve_base_url_override, resolve_execution_settings,
-        resolve_only_selection, resolve_server_binding, resolve_theme_path, ExecutionSettings,
-        SelectedSource,
+        resolve_only_selection, resolve_server_binding, resolve_theme_path,
+        validate_non_execution_command_flags, ExecutionSettings, SelectedSource,
     };
 
     fn parse_args(arguments: &[&str]) -> Args {
@@ -489,7 +489,7 @@ mod tests {
             "the selected command requires a workspace-local theme, but no `.build-eips.toml` was found"
         ));
         assert!(message.contains("Remote theme support has been removed"));
-        assert!(message.contains("build-eips workspace init <workspace-root>"));
+        assert!(message.contains("build-eips init <workspace-root>"));
         assert!(!message.contains("theme and sibling"));
         assert!(!message.contains(concat!("--remote", "-theme")));
     }
@@ -503,11 +503,11 @@ mod tests {
         assert!(message
             .contains("the selected command requires workspace-local theme and sibling sources"));
         assert!(message.contains("no `.build-eips.toml` was found"));
-        assert!(message.contains("build-eips workspace init <workspace-root>"));
+        assert!(message.contains("build-eips init <workspace-root>"));
         assert!(message.contains("Remote theme support has been removed"));
         assert!(message.contains("local theme is required for Zola commands"));
         assert!(message.contains(
-            "Use `--remote-sibling-repo` only if you intentionally want remote sibling proposal sources"
+            "Use `--remote-siblings` only if you intentionally want remote sibling proposal sources"
         ));
         assert!(!message.contains(concat!("--remote", "-theme")));
         assert!(!message.contains("--profile"));
@@ -749,7 +749,7 @@ base_url = "http://localhost:4000"
             &["build-eips", "--staging", "build"][..],
             &["build-eips", "--production", "check"][..],
             &["build-eips", "parity", "build"][..],
-            &["build-eips", "editorial", "build", "--against-upstream"][..],
+            &["build-eips", "editorial", "check", "--against-upstream"][..],
         ] {
             let args = parse_args(arguments);
             let theme_path = resolve_theme_path(Some(&workspace_config), &args.operation)
@@ -766,7 +766,7 @@ base_url = "http://localhost:4000"
             &["build-eips", "changed"][..],
             &["build-eips", "clean"][..],
             &["build-eips", "preview"][..],
-            &["build-eips", "workspace", "doctor"][..],
+            &["build-eips", "doctor"][..],
             &["build-eips", "print", "schema-version"][..],
         ] {
             let args = parse_args(arguments);
@@ -861,12 +861,12 @@ base_url = "http://localhost:4000"
         let workspace_config = load_workspace_config("");
         let cases = [
             (
-                &["build-eips", "--remote-sibling-repo", "build"][..],
+                &["build-eips", "--remote-siblings", "build"][..],
                 true,
                 SelectedSource::Remote,
             ),
             (
-                &["build-eips", "--remote-sibling-repo", "build", "--clean"][..],
+                &["build-eips", "--remote-siblings", "build", "--clean"][..],
                 false,
                 SelectedSource::Remote,
             ),
@@ -928,23 +928,11 @@ only = [678, 555, 678]
             &["build-eips", "--staging", "build", "--only", "555"][..],
             &["build-eips", "--production", "build", "--only", "555"][..],
             &["build-eips", "build", "--clean", "--only", "555"][..],
-            &[
-                "build-eips",
-                "--remote-sibling-repo",
-                "build",
-                "--only",
-                "555",
-            ][..],
+            &["build-eips", "--remote-siblings", "build", "--only", "555"][..],
             &["build-eips", "--staging", "serve", "--only", "555"][..],
             &["build-eips", "--production", "serve", "--only", "555"][..],
             &["build-eips", "serve", "--clean", "--only", "555"][..],
-            &[
-                "build-eips",
-                "--remote-sibling-repo",
-                "serve",
-                "--only",
-                "555",
-            ][..],
+            &["build-eips", "--remote-siblings", "serve", "--only", "555"][..],
         ] {
             let args = parse_args(arguments);
             let error = resolve_execution_settings(&args, &[], None).unwrap_err();
@@ -1039,7 +1027,7 @@ only = []
     }
 
     #[test]
-    fn editorial_dispatch_uses_local_first_only_for_runtime_build_path() {
+    fn editorial_dispatch_uses_local_first_only_for_runtime_check_path() {
         let workspace_config = load_workspace_config("");
 
         assert_settings(
@@ -1054,7 +1042,7 @@ only = []
             },
         );
         assert_settings(
-            &["build-eips", "editorial", "build", "content/0001.md"],
+            &["build-eips", "editorial", "check", "content/0001.md"],
             &["ERCs"],
             Some(&workspace_config),
             ExecutionSettings {
@@ -1069,7 +1057,7 @@ only = []
                 "build-eips",
                 "--staging",
                 "editorial",
-                "build",
+                "check",
                 "--against-upstream",
             ],
             &["ERCs"],
@@ -1086,7 +1074,7 @@ only = []
                 "build-eips",
                 "--production",
                 "editorial",
-                "build",
+                "check",
                 "--against-upstream",
             ],
             &["ERCs"],
@@ -1132,12 +1120,42 @@ only = []
     }
 
     #[test]
+    fn non_execution_commands_reject_execution_override_flags() {
+        for arguments in [
+            &["build-eips", "--staging", "init", "/tmp/workspace"][..],
+            &["build-eips", "--production", "init", "/tmp/workspace"][..],
+            &["build-eips", "--remote-siblings", "init", "/tmp/workspace"][..],
+            &[
+                "build-eips",
+                "--build-root",
+                "/tmp/build",
+                "init",
+                "/tmp/workspace",
+            ][..],
+            &["build-eips", "--staging", "doctor"][..],
+            &["build-eips", "--production", "doctor"][..],
+            &["build-eips", "--remote-siblings", "doctor"][..],
+            &["build-eips", "--build-root", "/tmp/build", "doctor"][..],
+            &["build-eips", "--remote-siblings", "print", "schema-version"][..],
+        ] {
+            let args = parse_args(arguments);
+            let error = validate_non_execution_command_flags(&args).unwrap_err();
+            let message = error.to_string();
+
+            assert!(
+                message.contains("execution override flags cannot be used"),
+                "unexpected error for {arguments:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn local_first_theme_commands_without_workspace_config_report_combined_setup_error() {
         for arguments in [
             &["build-eips", "build"][..],
             &["build-eips", "serve"][..],
             &["build-eips", "check"][..],
-            &["build-eips", "editorial", "build", "content/0001.md"][..],
+            &["build-eips", "editorial", "check", "content/0001.md"][..],
         ] {
             assert_combined_missing_workspace_error(arguments);
         }
@@ -1145,7 +1163,7 @@ only = []
 
     #[test]
     fn local_first_with_remote_sibling_override_is_not_parity() {
-        let local_args = parse_args(&["build-eips", "--remote-sibling-repo", "build"]);
+        let local_args = parse_args(&["build-eips", "--remote-siblings", "build"]);
         let sibling_ids = vec!["ERCs".to_owned()];
         let local_settings = resolve_execution_settings(&local_args, &sibling_ids, None).unwrap();
 
@@ -1174,7 +1192,7 @@ only = []
 
     #[test]
     fn zero_sibling_remote_override_is_noop() {
-        let remote_args = parse_args(&["build-eips", "--remote-sibling-repo", "parity", "build"]);
+        let remote_args = parse_args(&["build-eips", "--remote-siblings", "parity", "build"]);
         let remote_settings = resolve_execution_settings(&remote_args, &[], None).unwrap();
 
         assert_eq!(remote_settings.sibling, SelectedSource::Remote);
@@ -1191,16 +1209,12 @@ only = []
 
     #[test]
     fn remote_sibling_override_without_workspace_config_only_requires_theme_resolution() {
-        let args = parse_args(&["build-eips", "--remote-sibling-repo", "build"]);
+        let args = parse_args(&["build-eips", "--remote-siblings", "build"]);
         let sibling_ids = vec!["ERCs".to_owned()];
         let settings = resolve_execution_settings(&args, &sibling_ids, None).unwrap();
 
         assert_eq!(settings.sibling, SelectedSource::Remote);
-        assert_theme_only_missing_workspace_error(&[
-            "build-eips",
-            "--remote-sibling-repo",
-            "build",
-        ]);
+        assert_theme_only_missing_workspace_error(&["build-eips", "--remote-siblings", "build"]);
     }
 
     #[test]
@@ -1237,6 +1251,6 @@ only = []
                 .join(config::DEFAULT_THEME_DIR)
                 .to_string_lossy()
         )));
-        assert!(message.contains("build-eips workspace init <workspace-root>"));
+        assert!(message.contains("build-eips init <workspace-root>"));
     }
 }
