@@ -215,11 +215,11 @@ pub(crate) enum EditorialCommand {
 
 #[derive(Debug, clap::Args, Clone)]
 pub(crate) struct EditorialSelectorArgs {
-    /// Repo-relative proposal path(s), such as `content/07949.md`
-    #[arg(value_name = "PATH")]
+    /// Proposal number(s) or repo-relative proposal path(s), such as `4` or `content/07949.md`
+    #[arg(value_name = "TARGET")]
     pub(crate) paths: Vec<PathBuf>,
 
-    /// Read repo-relative proposal paths from BATCH, one per line
+    /// Read proposal numbers or repo-relative proposal paths from BATCH, one per line
     #[arg(long)]
     pub(crate) batch: Option<PathBuf>,
 

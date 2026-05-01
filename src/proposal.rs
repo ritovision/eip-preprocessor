@@ -26,21 +26,40 @@ use crate::layout::CONTENT_DIR;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProposalNumber(NonZeroU32);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProposalNumberParseFailure {
+    Empty,
+    NonDigit,
+    Zero,
+    Overflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditorialNumberSelector {
+    Number(ProposalNumber),
+    InvalidNumberLike(ProposalNumberParseFailure),
+    PathLike,
+}
+
 impl ProposalNumber {
-    pub(crate) fn parse_cli_selector(selector: &str) -> Result<Self, String> {
-        if selector.is_empty() || !selector.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(format!(
-                "`{selector}` is not a valid --only selector; expected a positive proposal number"
-            ));
+    fn parse_selector(selector: &str) -> Result<Self, ProposalNumberParseFailure> {
+        if selector.is_empty() {
+            return Err(ProposalNumberParseFailure::Empty);
         }
 
-        let number = selector.parse::<u32>().map_err(|_| {
-            format!(
-                "`{selector}` is not a valid --only selector; expected a positive proposal number"
-            )
-        })?;
+        if !selector.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ProposalNumberParseFailure::NonDigit);
+        }
 
-        Self::from_u32(number).map_err(|_| {
+        let number = selector
+            .parse::<u32>()
+            .map_err(|_| ProposalNumberParseFailure::Overflow)?;
+
+        Self::from_u32(number).map_err(|_| ProposalNumberParseFailure::Zero)
+    }
+
+    pub(crate) fn parse_cli_selector(selector: &str) -> Result<Self, String> {
+        Self::parse_selector(selector).map_err(|_| {
             format!(
                 "`{selector}` is not a valid --only selector; expected a positive proposal number"
             )
@@ -54,6 +73,23 @@ impl ProposalNumber {
     pub(crate) fn get(self) -> u32 {
         self.0.get()
     }
+}
+
+pub(crate) fn classify_editorial_number_selector(selector: &str) -> EditorialNumberSelector {
+    match ProposalNumber::parse_selector(selector) {
+        Ok(number) => EditorialNumberSelector::Number(number),
+        Err(failure) if is_number_like_selector(selector) => {
+            EditorialNumberSelector::InvalidNumberLike(failure)
+        }
+        Err(_) => EditorialNumberSelector::PathLike,
+    }
+}
+
+fn is_number_like_selector(selector: &str) -> bool {
+    !selector.is_empty()
+        && selector
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b','))
 }
 
 impl fmt::Display for ProposalNumber {
@@ -557,6 +593,85 @@ pub(crate) fn is_proposal_path(path: &Path) -> bool {
     proposal_number_from_content_markdown_path(content_relative_path).is_some()
 }
 
+pub(crate) fn resolve_proposal_number_markdown_path(
+    active_repo_root: &Path,
+    proposal_number: ProposalNumber,
+) -> Result<PathBuf, Whatever> {
+    let content_root = active_repo_root.join(CONTENT_DIR);
+    let mut matches = BTreeSet::new();
+    let entries = std::fs::read_dir(&content_root).with_whatever_context(|_| {
+        format!(
+            "unable to read active repository content directory `{}`",
+            content_root.to_string_lossy()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.with_whatever_context(|_| {
+            format!(
+                "unable to read active repository content directory entry in `{}`",
+                content_root.to_string_lossy()
+            )
+        })?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type().with_whatever_context(|_| {
+            format!(
+                "unable to inspect active repository content path `{}`",
+                entry_path.to_string_lossy()
+            )
+        })?;
+
+        if file_type.is_file() {
+            if flat_proposal_number(&entry_path) == Some(proposal_number) {
+                matches.insert(PathBuf::from(CONTENT_DIR).join(entry.file_name()));
+            }
+        } else if file_type.is_dir()
+            && path_component_proposal_number(Some(entry.file_name().as_os_str()))
+                == Some(proposal_number)
+        {
+            let index_path = entry_path.join("index.md");
+            match std::fs::metadata(&index_path) {
+                Ok(metadata) if metadata.is_file() => {
+                    matches.insert(
+                        PathBuf::from(CONTENT_DIR)
+                            .join(entry.file_name())
+                            .join("index.md"),
+                    );
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => {
+                    snafu::whatever!(
+                        "unable to inspect proposal markdown `{}`: {error}",
+                        index_path.to_string_lossy()
+                    );
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => snafu::whatever!(
+            "proposal `{proposal_number}` was not found in active repository content"
+        ),
+        1 => Ok(matches.into_iter().next().expect("one proposal path")),
+        _ => {
+            let paths = matches
+                .iter()
+                .map(|path| format!("`{}`", path.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            snafu::whatever!(
+                "proposal `{proposal_number}` has more than one markdown path in active repository content: {paths}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -564,8 +679,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        is_proposal_path, proposal_number_from_content_markdown_path, OnlyRenderPlan,
-        ProposalNumber,
+        classify_editorial_number_selector, is_proposal_path,
+        proposal_number_from_content_markdown_path, resolve_proposal_number_markdown_path,
+        EditorialNumberSelector, OnlyRenderPlan, ProposalNumber, ProposalNumberParseFailure,
     };
 
     fn number(value: u32) -> ProposalNumber {
@@ -599,13 +715,48 @@ mod tests {
         );
 
         for selector in ["+555", "0", "-555", "abc", "555,678", "content/00555.md"] {
-            assert!(
-                ProposalNumber::parse_cli_selector(selector).is_err(),
-                "expected `{selector}` to be rejected"
+            let error = ProposalNumber::parse_cli_selector(selector).unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "`{selector}` is not a valid --only selector; expected a positive proposal number"
+                )
             );
         }
 
-        assert!(ProposalNumber::parse_cli_selector("4294967296").is_err());
+        let error = ProposalNumber::parse_cli_selector("4294967296").unwrap_err();
+        assert_eq!(
+            error,
+            "`4294967296` is not a valid --only selector; expected a positive proposal number"
+        );
+    }
+
+    #[test]
+    fn editorial_number_selector_classifier_splits_numbers_invalid_numbers_and_paths() {
+        assert_eq!(
+            classify_editorial_number_selector("000555"),
+            EditorialNumberSelector::Number(number(555))
+        );
+
+        for (selector, expected_failure) in [
+            ("0", ProposalNumberParseFailure::Zero),
+            ("+555", ProposalNumberParseFailure::NonDigit),
+            ("-555", ProposalNumberParseFailure::NonDigit),
+            ("555,678", ProposalNumberParseFailure::NonDigit),
+            ("4294967296", ProposalNumberParseFailure::Overflow),
+        ] {
+            assert_eq!(
+                classify_editorial_number_selector(selector),
+                EditorialNumberSelector::InvalidNumberLike(expected_failure)
+            );
+        }
+
+        for selector in ["foo", "draft.md", "4a", "draft-4.md", "content/00555.md"] {
+            assert_eq!(
+                classify_editorial_number_selector(selector),
+                EditorialNumberSelector::PathLike
+            );
+        }
     }
 
     #[test]
@@ -626,6 +777,102 @@ mod tests {
         assert!(!is_proposal_path(Path::new(
             "content/000555/assets/readme.md"
         )));
+    }
+
+    #[test]
+    fn proposal_number_resolver_returns_exact_flat_markdown_path() {
+        for (selector, existing_path) in [
+            ("4", "content/4.md"),
+            ("004", "content/0004.md"),
+            ("0004", "content/004.md"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            write_file(temp.path(), existing_path, "");
+
+            assert_eq!(
+                resolve_proposal_number_markdown_path(
+                    temp.path(),
+                    ProposalNumber::parse_cli_selector(selector).unwrap(),
+                )
+                .unwrap(),
+                Path::new(existing_path)
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_number_resolver_returns_exact_directory_index_path() {
+        for (selector, existing_path) in [
+            ("4", "content/4/index.md"),
+            ("004", "content/0004/index.md"),
+            ("0004", "content/004/index.md"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            write_file(temp.path(), existing_path, "");
+
+            assert_eq!(
+                resolve_proposal_number_markdown_path(
+                    temp.path(),
+                    ProposalNumber::parse_cli_selector(selector).unwrap(),
+                )
+                .unwrap(),
+                Path::new(existing_path)
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_number_resolver_reports_missing_and_ignores_assets_only_dirs() {
+        let missing = TempDir::new().unwrap();
+        write_file(missing.path(), "content/0005.md", "");
+        let error = resolve_proposal_number_markdown_path(missing.path(), number(4))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("proposal `4` was not found in active repository content"));
+
+        let assets_only = TempDir::new().unwrap();
+        write_file(assets_only.path(), "content/0004/assets/foo.png", "");
+        let error = resolve_proposal_number_markdown_path(assets_only.path(), number(4))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("proposal `4` was not found in active repository content"));
+    }
+
+    #[test]
+    fn proposal_number_resolver_reports_ambiguous_markdown_paths() {
+        for paths in [
+            &["content/4.md", "content/0004/index.md"][..],
+            &["content/4.md", "content/0004.md"][..],
+            &["content/4/index.md", "content/0004/index.md"][..],
+        ] {
+            let temp = TempDir::new().unwrap();
+            for path in paths {
+                write_file(temp.path(), path, "");
+            }
+
+            let error = resolve_proposal_number_markdown_path(temp.path(), number(4))
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(
+                "proposal `4` has more than one markdown path in active repository content"
+            ));
+        }
+    }
+
+    #[test]
+    fn proposal_number_resolver_searches_only_active_repo_content() {
+        let temp = TempDir::new().unwrap();
+        let active_repo = temp.path().join("active");
+        let sibling_repo = temp.path().join("sibling");
+        write_file(&active_repo, "content/0005.md", "");
+        write_file(&sibling_repo, "content/0004.md", "");
+
+        let error = resolve_proposal_number_markdown_path(&active_repo, number(4))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("proposal `4` was not found in active repository content"));
     }
 
     #[test]
