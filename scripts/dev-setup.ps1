@@ -388,7 +388,7 @@ function Resolve-ActiveRepoRoot {
         Say "No active proposal repo found at $activeRepoCandidate."
         Say "Cloning default proposal repo from $DefaultActiveRepoUrl"
         Say "This may take a few minutes..."
-        & git clone https://github.com/ethereum/EIPs.git $activeRepoCandidate
+        & git clone $DefaultActiveRepoUrl $activeRepoCandidate
         $GitCloneExitCode = $LASTEXITCODE
         if ($GitCloneExitCode -ne 0) {
             Die "failed to clone default proposal repo from $DefaultActiveRepoUrl to $activeRepoCandidate"

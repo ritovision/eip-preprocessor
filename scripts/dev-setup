@@ -43,13 +43,16 @@ ensure_active_repo_root() {
             say "No active proposal repo found at $ACTIVE_REPO_ROOT."
             say "Cloning default proposal repo from $DEFAULT_ACTIVE_REPO_URL"
             say "This may take a few minutes..."
-            if ! git clone https://github.com/ethereum/EIPs.git "$ACTIVE_REPO_ROOT"; then
+            if ! git clone "$DEFAULT_ACTIVE_REPO_URL" "$ACTIVE_REPO_ROOT"; then
                 die "failed to clone default proposal repo from $DEFAULT_ACTIVE_REPO_URL to $ACTIVE_REPO_ROOT"
             fi
             say "Cloned default proposal repo to $ACTIVE_REPO_ROOT"
-        elif [ ! -d "$ACTIVE_REPO_ROOT" ]; then
+        fi
+
+        if [ ! -d "$ACTIVE_REPO_ROOT" ]; then
             die "default active proposal repo path exists but is not a directory: $ACTIVE_REPO_ROOT. Remove it or set ACTIVE_REPO_ROOT."
-        elif [ ! -e "$ACTIVE_REPO_ROOT/.git" ]; then
+        fi
+        if [ ! -e "$ACTIVE_REPO_ROOT/.git" ]; then
             die "default active proposal repo path exists but is not a git checkout: $ACTIVE_REPO_ROOT. Remove it or set ACTIVE_REPO_ROOT."
         fi
     fi
