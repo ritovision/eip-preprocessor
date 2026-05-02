@@ -4,6 +4,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$DefaultActiveRepoUrl = "https://github.com/ethereum/EIPs.git"
 
 function Say {
     param([string]$Message)
@@ -346,7 +347,9 @@ function Resolve-ActiveRepoRoot {
         [string]$WorkspaceRoot
     )
 
+    $activeRepoExplicit = $false
     if (-not [string]::IsNullOrWhiteSpace($env:ACTIVE_REPO_ROOT)) {
+        $activeRepoExplicit = $true
         if ([System.IO.Path]::IsPathRooted($env:ACTIVE_REPO_ROOT)) {
             $activeRepoCandidate = $env:ACTIVE_REPO_ROOT
         } else {
@@ -356,25 +359,63 @@ function Resolve-ActiveRepoRoot {
         $activeRepoCandidate = Join-Path -Path $WorkspaceRoot -ChildPath "EIPs"
     }
 
+    if ($activeRepoExplicit) {
+        try {
+            $resolved = (Resolve-Path -LiteralPath $activeRepoCandidate).ProviderPath
+        } catch {
+            Die "configured ACTIVE_REPO_ROOT does not exist: $activeRepoCandidate. Fix ACTIVE_REPO_ROOT or unset it to let this script clone EIPs."
+        }
+
+        if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
+            Die "configured ACTIVE_REPO_ROOT is not a directory: $resolved. Fix ACTIVE_REPO_ROOT or unset it to let this script clone EIPs."
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path -Path $resolved -ChildPath ".git"))) {
+            Die "configured ACTIVE_REPO_ROOT is not a git checkout: $resolved. Fix ACTIVE_REPO_ROOT or unset it to let this script clone EIPs."
+        }
+
+        return @{
+            Path = $resolved
+            Explicit = $true
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $activeRepoCandidate)) {
+        $gitCommand = Get-Command git -CommandType Application -ErrorAction SilentlyContinue
+        if ($null -eq $gitCommand) {
+            Die "need git to clone default proposal repo from $DefaultActiveRepoUrl"
+        }
+
+        Say "No active proposal repo found at $activeRepoCandidate."
+        Say "Cloning default proposal repo from $DefaultActiveRepoUrl"
+        Say "This may take a few minutes..."
+        & git clone https://github.com/ethereum/EIPs.git $activeRepoCandidate
+        $GitCloneExitCode = $LASTEXITCODE
+        if ($GitCloneExitCode -ne 0) {
+            Die "failed to clone default proposal repo from $DefaultActiveRepoUrl to $activeRepoCandidate"
+        }
+        Say "Cloned default proposal repo to $activeRepoCandidate"
+    }
+
     try {
         $resolved = (Resolve-Path -LiteralPath $activeRepoCandidate).ProviderPath
     } catch {
-        Die "preprocessor local setup needs an active proposal repo checkout such as EIPs at $activeRepoCandidate"
+        Die "default active proposal repo path does not exist after clone: $activeRepoCandidate"
     }
 
     if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
-        Die "preprocessor local setup needs an active proposal repo checkout such as EIPs at $activeRepoCandidate"
+        Die "default active proposal repo path exists but is not a directory: $resolved. Remove it or set ACTIVE_REPO_ROOT."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path -Path $resolved -ChildPath ".git"))) {
+        Die "default active proposal repo path exists but is not a git checkout: $resolved. Remove it or set ACTIVE_REPO_ROOT."
     }
 
-    return $resolved
+    return @{
+        Path = $resolved
+        Explicit = $false
+    }
 }
 
 $PathNotes = @()
-
-$cargoCommand = Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue
-if ($null -eq $cargoCommand) {
-    Die "need cargo to build local build-eips. Install Rust from https://rustup.rs/ and re-run this script."
-}
 
 $InvocationDir = (Get-Location).ProviderPath
 $ScriptDir = (Resolve-Path -LiteralPath $PSScriptRoot).ProviderPath
@@ -386,7 +427,9 @@ if (-not [string]::IsNullOrWhiteSpace($env:WORKSPACE_ROOT)) {
     $WorkspaceRoot = (Resolve-Path -LiteralPath (Split-Path -Path $PreprocessorRoot -Parent)).ProviderPath
 }
 
-$ActiveRepoRoot = Resolve-ActiveRepoRoot -InvocationDir $InvocationDir -WorkspaceRoot $WorkspaceRoot
+$ActiveRepoInfo = Resolve-ActiveRepoRoot -InvocationDir $InvocationDir -WorkspaceRoot $WorkspaceRoot
+$ActiveRepoRoot = $ActiveRepoInfo["Path"]
+$ActiveRepoExplicit = $ActiveRepoInfo["Explicit"]
 $BuildEipsPath = Join-Path -Path $PreprocessorRoot -ChildPath "target\debug\build-eips.exe"
 
 Say "Workspace root: $WorkspaceRoot"
@@ -394,6 +437,11 @@ Say "Active proposal repo: $ActiveRepoRoot"
 Say "Local build-eips: $BuildEipsPath"
 Say "If PowerShell blocks this script, run:"
 Say "  powershell -ExecutionPolicy Bypass -File .\scripts\dev-setup.ps1"
+
+$cargoCommand = Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue
+if ($null -eq $cargoCommand) {
+    Die "need cargo to build local build-eips. Install Rust from https://rustup.rs/ and re-run this script."
+}
 
 Say "Building local build-eips"
 $CargoExitCode = 0

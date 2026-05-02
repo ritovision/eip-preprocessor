@@ -2,6 +2,8 @@
 
 set -eu
 
+DEFAULT_ACTIVE_REPO_URL=https://github.com/ethereum/EIPs.git
+
 say() {
     printf '%s\n' "$*"
 }
@@ -24,6 +26,35 @@ absolute_path() {
             printf '%s/%s\n' "$INVOCATION_DIR" "$1"
             ;;
     esac
+}
+
+ensure_active_repo_root() {
+    if [ "$ACTIVE_REPO_EXPLICIT" = true ]; then
+        if [ ! -d "$ACTIVE_REPO_ROOT" ]; then
+            die "configured ACTIVE_REPO_ROOT does not exist: $ACTIVE_REPO_ROOT. Fix ACTIVE_REPO_ROOT or unset it to let this script clone EIPs."
+        fi
+        if [ ! -e "$ACTIVE_REPO_ROOT/.git" ]; then
+            die "configured ACTIVE_REPO_ROOT is not a git checkout: $ACTIVE_REPO_ROOT. Fix ACTIVE_REPO_ROOT or unset it to let this script clone EIPs."
+        fi
+    else
+        if [ ! -e "$ACTIVE_REPO_ROOT" ]; then
+            command -v git >/dev/null 2>&1 || die "need git to clone default proposal repo from $DEFAULT_ACTIVE_REPO_URL"
+
+            say "No active proposal repo found at $ACTIVE_REPO_ROOT."
+            say "Cloning default proposal repo from $DEFAULT_ACTIVE_REPO_URL"
+            say "This may take a few minutes..."
+            if ! git clone https://github.com/ethereum/EIPs.git "$ACTIVE_REPO_ROOT"; then
+                die "failed to clone default proposal repo from $DEFAULT_ACTIVE_REPO_URL to $ACTIVE_REPO_ROOT"
+            fi
+            say "Cloned default proposal repo to $ACTIVE_REPO_ROOT"
+        elif [ ! -d "$ACTIVE_REPO_ROOT" ]; then
+            die "default active proposal repo path exists but is not a directory: $ACTIVE_REPO_ROOT. Remove it or set ACTIVE_REPO_ROOT."
+        elif [ ! -e "$ACTIVE_REPO_ROOT/.git" ]; then
+            die "default active proposal repo path exists but is not a git checkout: $ACTIVE_REPO_ROOT. Remove it or set ACTIVE_REPO_ROOT."
+        fi
+    fi
+
+    ACTIVE_REPO_ROOT=$(CDPATH= cd -- "$ACTIVE_REPO_ROOT" && pwd)
 }
 
 normalize_dir_for_path_compare() {
@@ -422,8 +453,6 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-command -v cargo >/dev/null 2>&1 || die "need cargo to build local build-eips. Install Rust from https://rustup.rs/ and re-run this script."
-
 INVOCATION_DIR=$(pwd)
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PREPROCESSOR_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
@@ -442,21 +471,21 @@ if [ -d "$WORKSPACE_ROOT" ]; then
 fi
 
 if [ -n "${ACTIVE_REPO_ROOT:-}" ]; then
+    ACTIVE_REPO_EXPLICIT=true
     ACTIVE_REPO_ROOT=$(absolute_path "$ACTIVE_REPO_ROOT")
 else
+    ACTIVE_REPO_EXPLICIT=false
     ACTIVE_REPO_ROOT=$WORKSPACE_ROOT/EIPs
 fi
 
-if [ ! -d "$ACTIVE_REPO_ROOT" ]; then
-    die "preprocessor local setup needs an active proposal repo checkout such as EIPs at $ACTIVE_REPO_ROOT"
-fi
-
-ACTIVE_REPO_ROOT=$(CDPATH= cd -- "$ACTIVE_REPO_ROOT" && pwd)
+ensure_active_repo_root
 BUILD_EIPS=$PREPROCESSOR_ROOT/target/debug/build-eips
 
 say "Workspace root: $WORKSPACE_ROOT"
 say "Active proposal repo: $ACTIVE_REPO_ROOT"
 say "Local build-eips: $BUILD_EIPS"
+
+command -v cargo >/dev/null 2>&1 || die "need cargo to build local build-eips. Install Rust from https://rustup.rs/ and re-run this script."
 
 say "Building local build-eips"
 if ! (CDPATH= cd -- "$PREPROCESSOR_ROOT" && cargo build); then
