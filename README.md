@@ -83,6 +83,8 @@ Windows PowerShell:
 
 The setup script builds the local debug binary, ensures the pinned Zola version is available, bootstraps the workspace with that binary, and runs `doctor`. It does not install or reuse a released `build-eips`.
 
+The script anchors setup through `../EIPs` by default and clones `https://github.com/ethereum/EIPs.git` there when that checkout is missing. Set `ACTIVE_REPO_ROOT` to use another proposal repo checkout.
+
 After setup, the workspace has this layout:
 
 ```text
