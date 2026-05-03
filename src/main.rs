@@ -4,6 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+mod changed;
 mod cli;
 mod config;
 mod context;
@@ -39,9 +40,8 @@ use crate::{
     cli::{Args, EditorialCommand, Operation, RuntimeOperation},
     editorial::{editorial_runtime_execution, run_editorial_lint},
     execution::{resolve_execution, validate_non_execution_command_flags},
-    layout::{output_path, REPO_DIR},
+    layout::output_path,
     pipeline::Prepared,
-    proposal::is_proposal_path,
     workspace::{doctor_workspace, init_workspace},
 };
 
@@ -132,29 +132,7 @@ fn run() -> Result<(), Whatever> {
         }
         RuntimeOperation::Preview => unreachable!(),
         RuntimeOperation::Changed { all, format } => {
-            let repo_path = build_path.join(REPO_DIR);
-
-            let both = git::Fresh::new(
-                &resolved.root_path,
-                &repo_path,
-                resolved.repository_use.clone(),
-                resolved.source_materialization,
-            )
-            .whatever_context("initializing build repo")?
-            .clone_src()
-            .whatever_context("cloning source repo")?
-            .fetch_upstream()
-            .whatever_context("fetching upstream repo")?;
-
-            let changed_files: Vec<_> = both
-                .changed_files()
-                .whatever_context("unable to list changed files")?
-                .into_iter()
-                .filter(|p| all || is_proposal_path(p))
-                .map(|p| repo_path.join(p))
-                .collect();
-
-            format.print(&changed_files, &repo_path);
+            changed::run(&resolved, &build_path, all, &format)?;
         }
         RuntimeOperation::Editorial { command } => match command {
             EditorialCommand::Lint { selectors, eipw } => {
