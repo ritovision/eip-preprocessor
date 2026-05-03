@@ -75,7 +75,7 @@ pub(crate) struct OnlyCliArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum Operation {
-    /// Print various useful things, like available lints
+    /// Print linter schema metadata and lint configuration
     Print {
         #[command(flatten)]
         print: print::CmdArgs,
@@ -93,7 +93,13 @@ pub(crate) enum Operation {
         only: OnlyCliArgs,
     },
 
-    /// Build the project and launch a web server to preview it
+    /// Serve the existing built output without rebuilding it
+    Preview {
+        #[command(flatten)]
+        server: ServerCliArgs,
+    },
+
+    /// Build a fresh temporary site, serve it locally, and watch tracked edits
     Serve {
         #[command(flatten)]
         server: ServerCliArgs,
@@ -108,16 +114,10 @@ pub(crate) enum Operation {
         only: OnlyCliArgs,
     },
 
-    /// Serve the existing built output without rebuilding it
-    Preview {
-        #[command(flatten)]
-        server: ServerCliArgs,
-    },
-
-    /// Remove temporary and output files
+    /// Remove the selected build directory and generated output
     Clean,
 
-    /// Analyze the repository and report errors, but don't build HTML files
+    /// Validate that the site builds cleanly without writing HTML output
     Check {
         #[command(flatten)]
         clean: CleanCliArgs,
@@ -132,13 +132,13 @@ pub(crate) enum Operation {
         format: ChangedFormat,
     },
 
-    /// Run targeted editorial validation with eipw
+    /// Run targeted editorial lint or check workflows
     Editorial {
         #[command(subcommand)]
         command: EditorialCommand,
     },
 
-    /// Create the local workspace config and clone any missing sibling repositories
+    /// Create workspace config, docs, build root, and missing local repos
     Init {
         /// Workspace root directory
         path: PathBuf,
@@ -152,10 +152,10 @@ pub(crate) enum Operation {
         platform_dev: bool,
     },
 
-    /// Check whether the local workspace bootstrap is ready for direct build-eips commands
+    /// Check workspace layout, local repos, and required tools
     Doctor,
 
-    /// Run a normal command with the built-in parity mode
+    /// Run build, serve, or check with staging remote proposal sources
     Parity {
         #[command(subcommand)]
         command: ProfiledOperation,
@@ -170,7 +170,7 @@ pub(crate) enum ProfiledOperation {
         base_url: BaseUrlCliArgs,
     },
 
-    /// Build the project and launch a web server to preview it
+    /// Build a fresh temporary site, serve it locally, and watch tracked edits
     Serve {
         #[command(flatten)]
         server: ServerCliArgs,
@@ -179,13 +179,13 @@ pub(crate) enum ProfiledOperation {
         base_url: BaseUrlCliArgs,
     },
 
-    /// Analyze the repository and report errors, but don't build HTML files
+    /// Validate that the site builds cleanly without writing HTML output
     Check,
 }
 
 #[derive(Debug, Subcommand, Clone)]
 pub(crate) enum EditorialCommand {
-    /// Run eipw on explicitly selected proposal targets
+    /// Run eipw lint checks on selected proposal files
     Lint {
         #[command(flatten)]
         selectors: EditorialSelectorArgs,
@@ -194,7 +194,7 @@ pub(crate) enum EditorialCommand {
         eipw: lint::CmdArgs,
     },
 
-    /// Run targeted editorial validation, then the runtime check path
+    /// Run eipw lint checks, then validate the site build
     Check {
         #[command(flatten)]
         selectors: EditorialSelectorArgs,
