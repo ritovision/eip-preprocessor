@@ -313,10 +313,12 @@ fn resolve_theme_path(
         return Ok(None);
     }
 
-    let workspace_config = workspace_config.whatever_context(format!(
-        "the selected command requires a workspace-local theme, but no `{}` was found.\n\nRun:\n  build-eips init <workspace-root>\n\nThen retry from that workspace. Remote theme support has been removed; staging,\nproduction, and parity commands still use remote proposal sources but require a\nlocal workspace theme.",
-        config::LOCAL_CONFIG_FILE
-    ))?;
+    let workspace_config = workspace_config.with_whatever_context(|| {
+        format!(
+            "the selected command requires a workspace-local theme, but no `{}` was found.\n\nRun:\n  build-eips init <workspace-root>\n\nThen retry from that workspace. Remote theme support has been removed; staging,\nproduction, and parity commands still use remote proposal sources but require a\nlocal workspace theme.",
+            config::LOCAL_CONFIG_FILE
+        )
+    })?;
     let theme_path = workspace_config.local_theme_path();
 
     match std::fs::metadata(&theme_path) {
