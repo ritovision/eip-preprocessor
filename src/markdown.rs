@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs::read_to_string;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use snafu::{whatever, OptionExt, ResultExt, Whatever};
@@ -42,6 +42,26 @@ use crate::{
     progress::ProgressIteratorExt,
     proposal::{OnlyRenderPlan, ProposalNumber, ProposalReference},
 };
+
+#[derive(Clone, Copy)]
+enum MissingPathMode {
+    Error,
+    Ignore,
+}
+
+impl MissingPathMode {
+    fn should_ignore_io_error(self, error: &std::io::Error) -> bool {
+        matches!(self, Self::Ignore)
+            && matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+    }
+
+    fn should_ignore_walkdir_error(self, error: &walkdir::Error) -> bool {
+        error
+            .io_error()
+            .map(|error| self.should_ignore_io_error(error))
+            .unwrap_or(false)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Author {
@@ -310,12 +330,12 @@ pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Resul
                 if let Some(plan) = only_plan {
                     let index_relative_path = relative_path.join("index.md");
                     if plan.should_preprocess_markdown(&index_relative_path) {
-                        process_eip(root_path, &index_path, only_plan)?;
+                        process_eip(root_path, &index_path, only_plan, MissingPathMode::Error)?;
                     }
                 } else {
-                    process_eip(root_path, &index_path, only_plan)?;
+                    process_eip(root_path, &index_path, only_plan, MissingPathMode::Error)?;
                 }
-                process_assets(root_path, &entry_path, only_plan)?;
+                process_assets(root_path, &entry_path, only_plan, MissingPathMode::Error)?;
             }
         } else if entry_path.extension().and_then(OsStr::to_str) == Some("md") {
             let relative_path = entry_path
@@ -331,7 +351,7 @@ pub fn preprocess(root_path: &Path, only_plan: Option<&OnlyRenderPlan>) -> Resul
                 .map(|plan| plan.should_preprocess_markdown(relative_path))
                 .unwrap_or(true)
             {
-                process_eip(root_path, &entry_path, only_plan)?;
+                process_eip(root_path, &entry_path, only_plan, MissingPathMode::Error)?;
             }
         }
     }
@@ -377,24 +397,20 @@ pub fn preprocess_paths(
             Some(component) if component.as_os_str() == OsStr::new("assets")
         ) {
             let proposal_dir = root_path.join(first_component.as_os_str());
-            if proposal_dir.join("assets").exists() {
-                asset_dirs.insert(proposal_dir);
-            }
+            asset_dirs.insert(proposal_dir);
             continue;
         }
 
         let path = root_path.join(content_relative_path);
-        if path.exists() {
-            eips.insert(path);
-        }
+        eips.insert(path);
     }
 
     for path in eips {
-        process_eip(root_path, &path, only_plan)?;
+        process_eip(root_path, &path, only_plan, MissingPathMode::Ignore)?;
     }
 
     for path in asset_dirs {
-        process_assets(root_path, &path, only_plan)?;
+        process_assets(root_path, &path, only_plan, MissingPathMode::Ignore)?;
     }
 
     Ok(())
@@ -647,8 +663,63 @@ fn process_assets(
     root: &Path,
     path: &Path,
     only_plan: Option<&OnlyRenderPlan>,
+    missing_path_mode: MissingPathMode,
 ) -> Result<(), Whatever> {
     let canon_root = std::fs::canonicalize(root).whatever_context("could not canonicalize root")?;
+    let assets_dir = path.join("assets");
+
+    let mut entries = Vec::new();
+    let mut ignored_missing_path = false;
+
+    for entry in WalkDir::new(&assets_dir).follow_links(true).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if missing_path_mode.should_ignore_walkdir_error(&error) => {
+                ignored_missing_path = true;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_whatever_context(|_| {
+                    format!("couldn't read entry in `{}`", assets_dir.to_string_lossy())
+                });
+            }
+        };
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        if entry.path().extension().and_then(OsStr::to_str) != Some("md") {
+            continue;
+        }
+
+        let candidate = match std::fs::canonicalize(entry.path()) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "unable to canonicalize `{}`: {e}",
+                    entry.path().to_string_lossy()
+                );
+                continue;
+            }
+        };
+
+        let in_root = candidate.starts_with(&canon_root);
+        if !in_root {
+            warn!(
+                "asset `{}` not in root, skipping",
+                entry.path().to_string_lossy()
+            );
+            continue;
+        }
+
+        entries.push(entry);
+    }
+
+    if entries.is_empty() && ignored_missing_path {
+        return Ok(());
+    }
+
     let number_txt = path
         .file_name()
         .with_whatever_context(|| format!("no file name for `{}`", path.to_string_lossy()))?
@@ -659,53 +730,17 @@ fn process_assets(
         format!("can't parse number for `{}`", path.to_string_lossy())
     })?;
 
-    let assets_dir = path.join("assets");
-
-    let dir = WalkDir::new(&assets_dir)
-        .follow_links(true)
-        .into_iter()
-        .filter(|e| match e {
-            Ok(f) if !f.file_type().is_file() => false,
-            Ok(f) => f.path().extension().and_then(OsStr::to_str) == Some("md"),
-            Err(_) => true,
-        })
-        .filter(|e| {
-            let f = match e {
-                Ok(f) => f,
-                _ => return true,
-            };
-
-            let candidate = match std::fs::canonicalize(f.path()) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "unable to canonicalize `{}`: {e}",
-                        f.path().to_string_lossy()
-                    );
-                    return false;
-                }
-            };
-
-            let in_root = candidate.starts_with(&canon_root);
-            if !in_root {
-                warn!(
-                    "asset `{}` not in root, skipping",
-                    f.path().to_string_lossy()
-                );
-            }
-            in_root
-        });
-    let dirs: Vec<_> = dir.collect();
-
-    for entry in dirs.into_iter().progress_ext("Assets") {
-        let entry = entry.with_whatever_context(|_| {
-            format!("couldn't read entry in `{}`", assets_dir.to_string_lossy())
-        })?;
-
+    for entry in entries.into_iter().progress_ext("Assets") {
         let path = entry.path();
-        let contents = read_to_string(path).with_whatever_context(|_| {
-            format!("could not read file `{}`", path.to_string_lossy())
-        })?;
+        let contents = match read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if missing_path_mode.should_ignore_io_error(&error) => continue,
+            Err(error) => {
+                return Err(error).with_whatever_context(|_| {
+                    format!("could not read file `{}`", path.to_string_lossy())
+                });
+            }
+        };
 
         let contents =
             transform_markdown(root, path, &contents, only_plan).with_whatever_context(|_| {
@@ -742,7 +777,11 @@ fn process_assets(
             ..Default::default()
         };
 
-        write_file(path, front_matter, &contents).whatever_context("couldn't write file")?;
+        match write_file(path, front_matter, &contents) {
+            Ok(()) => {}
+            Err(error) if missing_path_mode.should_ignore_io_error(&error) => continue,
+            Err(error) => return Err(error).whatever_context("couldn't write file"),
+        }
     }
 
     Ok(())
@@ -752,10 +791,17 @@ fn process_eip(
     root: &Path,
     path: &Path,
     only_plan: Option<&OnlyRenderPlan>,
+    missing_path_mode: MissingPathMode,
 ) -> Result<(), Whatever> {
     let path_lossy = path.to_string_lossy();
-    let contents = read_to_string(path)
-        .with_whatever_context(|_| format!("could not read file `{}`", path_lossy))?;
+    let contents = match read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if missing_path_mode.should_ignore_io_error(&error) => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_whatever_context(|_| format!("could not read file `{}`", path_lossy));
+        }
+    };
 
     let (preamble, body) = Preamble::split(&contents)
         .with_whatever_context(|_| format!("couldn't split preamble for `{}`", path_lossy))?;
@@ -881,7 +927,11 @@ fn process_eip(
         }
     }
 
-    write_file(Path::new(&path), front_matter, &body).whatever_context("couldn't write file")?;
+    match write_file(path, front_matter, &body) {
+        Ok(()) => {}
+        Err(error) if missing_path_mode.should_ignore_io_error(&error) => return Ok(()),
+        Err(error) => return Err(error).whatever_context("couldn't write file"),
+    }
 
     Ok(())
 }
@@ -1034,6 +1084,18 @@ mod tests {
     }
 
     #[test]
+    fn targeted_preprocess_paths_ignores_deleted_dirty_markdown() {
+        let (_temp, content) =
+            content_repo(&[("00555.md", proposal_markdown(555, None, "", "Selected."))]);
+        let plan = only_plan(&content, &[555]);
+        std::fs::remove_file(content.join("00555.md")).unwrap();
+
+        preprocess_paths(&content, &repo_paths(&["content/00555.md"]), Some(&plan)).unwrap();
+
+        assert!(!content.join("00555.md").exists());
+    }
+
+    #[test]
     fn targeted_preprocess_rewrites_retained_non_proposal_links_to_public_urls() {
         let (_temp, content) = content_repo(&[
             (
@@ -1100,6 +1162,29 @@ mod tests {
             std::fs::read_to_string(content.join("00555/assets/diagram.png")).unwrap(),
             "image\n"
         );
+    }
+
+    #[test]
+    fn targeted_preprocess_paths_ignores_deleted_dirty_asset_dir() {
+        let (_temp, content) = content_repo(&[
+            ("00555.md", proposal_markdown(555, None, "", "Selected.")),
+            (
+                "00555/assets/guide.md",
+                "See [EIP-678](/00678.md).\n".to_owned(),
+            ),
+            ("00678.md", proposal_markdown(678, None, "", "Unselected.")),
+        ]);
+        let plan = only_plan(&content, &[555]);
+        std::fs::remove_dir_all(content.join("00555/assets")).unwrap();
+
+        preprocess_paths(
+            &content,
+            &repo_paths(&["content/00555/assets/guide.md"]),
+            Some(&plan),
+        )
+        .unwrap();
+
+        assert!(!content.join("00555/assets").exists());
     }
 
     #[test]
