@@ -8,6 +8,8 @@
 
 use std::{
     fmt,
+    fs::OpenOptions,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
 
@@ -570,14 +572,25 @@ fn init_workspace_with_repositories(
         .whatever_context("unable to create local build root")?;
 
     let config_path = workspace_root.join(config::LOCAL_CONFIG_FILE);
-    if config_path.exists() {
-        info!(
-            "leaving existing workspace config `{}` in place",
-            config_path.to_string_lossy()
-        );
-    } else {
-        std::fs::write(&config_path, config::default_workspace_config_text())
-            .whatever_context("unable to write workspace config")?;
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config_path)
+    {
+        Ok(mut config_file) => {
+            config_file
+                .write_all(config::default_workspace_config_text().as_bytes())
+                .whatever_context("unable to write workspace config")?;
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            info!(
+                "leaving existing workspace config `{}` in place",
+                config_path.to_string_lossy()
+            );
+        }
+        Err(error) => {
+            return Err(error).whatever_context("unable to write workspace config");
+        }
     }
 
     write_workspace_doc(&workspace_root)?;

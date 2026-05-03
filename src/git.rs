@@ -142,15 +142,21 @@ impl LegacyLocations {
 }
 
 pub fn clone_missing_repo(url: &str, destination: &Path) -> Result<(), Error> {
-    if destination.exists() {
-        git2::Repository::open(destination).context(GitSnafu {
-            what: "open existing workspace repository",
-        })?;
-        info!(
-            "using existing workspace repo `{}`",
-            destination.to_string_lossy()
-        );
-        return Ok(());
+    match git2::Repository::open(destination) {
+        Ok(_) => {
+            info!(
+                "using existing workspace repo `{}`",
+                destination.to_string_lossy()
+            );
+            return Ok(());
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+        Err(error) => {
+            return Err(GitSnafu {
+                what: "open existing workspace repository",
+            }
+            .into_error(error));
+        }
     }
 
     info!("cloning `{url}` into `{}`", destination.to_string_lossy());

@@ -8,6 +8,7 @@
 
 use std::{
     collections::BTreeSet,
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -27,7 +28,11 @@ use crate::{
     },
 };
 
-fn repo_relative_path(root_path: &Path, path: &Path) -> Result<PathBuf, Whatever> {
+fn repo_relative_canonical_path(
+    root_path: &Path,
+    path: &Path,
+    canonical_path: &Path,
+) -> Result<PathBuf, Whatever> {
     if path.is_absolute() {
         snafu::whatever!(
             "editorial selectors require repo-relative proposal paths, got `{}`",
@@ -35,15 +40,7 @@ fn repo_relative_path(root_path: &Path, path: &Path) -> Result<PathBuf, Whatever
         );
     }
 
-    let full_path = root_path.join(path);
-    let canonical = full_path.canonicalize().with_whatever_context(|_| {
-        format!(
-            "unable to resolve editorial target `{}`",
-            full_path.to_string_lossy()
-        )
-    })?;
-
-    let relative = canonical
+    let relative = canonical_path
         .strip_prefix(root_path)
         .with_whatever_context(|_| {
             format!(
@@ -72,11 +69,26 @@ fn validate_editorial_targets(
             );
         }
 
-        if !strict && !root_path.join(&path).exists() {
-            continue;
-        }
+        let full_path = root_path.join(&path);
+        let canonical_path = match full_path.canonicalize() {
+            Ok(canonical_path) => canonical_path,
+            Err(error)
+                if !strict
+                    && matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_whatever_context(|_| {
+                    format!(
+                        "unable to resolve editorial target `{}`",
+                        full_path.to_string_lossy()
+                    )
+                });
+            }
+        };
 
-        let relative = repo_relative_path(root_path, &path)?;
+        let relative = repo_relative_canonical_path(root_path, &path, &canonical_path)?;
 
         if !is_proposal_path(&relative) {
             if strict {

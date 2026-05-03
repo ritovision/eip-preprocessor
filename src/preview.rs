@@ -6,6 +6,7 @@
 
 use std::{
     fs::File,
+    io::ErrorKind,
     path::{Component, Path, PathBuf},
 };
 
@@ -62,19 +63,37 @@ fn handle_request(output_path: &Path, request: Request) -> Result<(), Whatever> 
         return Ok(());
     };
 
-    if !path.is_file() {
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            request
+                .respond(Response::empty(StatusCode(404)))
+                .whatever_context("unable to send preview not found response")?;
+            return Ok(());
+        }
+        Err(error) => {
+            snafu::whatever!(
+                "unable to open preview asset `{}`: {error}",
+                path.to_string_lossy()
+            );
+        }
+    };
+
+    if !file
+        .metadata()
+        .with_whatever_context(|e| {
+            format!(
+                "unable to inspect preview asset `{}`: {e}",
+                path.to_string_lossy()
+            )
+        })?
+        .is_file()
+    {
         request
             .respond(Response::empty(StatusCode(404)))
             .whatever_context("unable to send preview not found response")?;
         return Ok(());
     }
-
-    let file = File::open(&path).with_whatever_context(|e| {
-        format!(
-            "unable to open preview asset `{}`: {e}",
-            path.to_string_lossy()
-        )
-    })?;
 
     let response = if let Some(value) = content_type(&path) {
         Response::from_file(file).with_header(content_type_header(value))
