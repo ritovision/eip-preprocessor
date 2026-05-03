@@ -23,6 +23,7 @@ use snafu::{OptionExt, ResultExt, Whatever};
 
 use crate::layout::CONTENT_DIR;
 
+/// Positive proposal number used by CLI selectors and `[render].only` config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProposalNumber(NonZeroU32);
 
