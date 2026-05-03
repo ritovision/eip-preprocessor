@@ -487,7 +487,7 @@ pub(crate) fn doctor_workspace(args: &Args) -> Result<(), Whatever> {
 
 pub(crate) fn init_workspace(
     args: &Args,
-    path: PathBuf,
+    workspace_root: PathBuf,
     include_template: bool,
     platform_dev: bool,
 ) -> Result<(), Whatever> {
@@ -506,19 +506,25 @@ pub(crate) fn init_workspace(
         eipw: &eipw_repository,
     };
 
-    init_workspace_with_repositories(args, path, include_template, platform_dev, &repositories)
+    init_workspace_with_repositories(
+        args,
+        workspace_root,
+        include_template,
+        platform_dev,
+        &repositories,
+    )
 }
 
 fn init_workspace_with_repositories(
     args: &Args,
-    path: PathBuf,
+    workspace_root: PathBuf,
     include_template: bool,
     platform_dev: bool,
     repositories: &WorkspaceInitRepositories<'_>,
 ) -> Result<(), Whatever> {
     let root_path = root(args)?;
     let active_repo = ActiveRepoIdentity::load(&root_path)?;
-    let workspace_root = resolve_input_path(&path)?;
+    let workspace_root = resolve_input_path(&workspace_root)?;
     std::fs::create_dir_all(&workspace_root)
         .whatever_context("unable to create workspace root directory")?;
     let workspace_root = workspace_root
@@ -1028,7 +1034,7 @@ base_url = "https://staging.example.test/{sibling_id}/"
         arguments.extend_from_slice(flags);
         let init_args = parse_args(&arguments);
         let Operation::Init {
-            path,
+            path: workspace_root_path,
             template,
             platform_dev,
         } = init_args.operation.clone()
@@ -1039,8 +1045,14 @@ base_url = "https://staging.example.test/{sibling_id}/"
         assert_eq!(template, expect_template);
         assert_eq!(platform_dev, expect_platform_dev);
 
-        init_workspace_with_repositories(&init_args, path, template, platform_dev, &repositories)
-            .unwrap();
+        init_workspace_with_repositories(
+            &init_args,
+            workspace_root_path,
+            template,
+            platform_dev,
+            &repositories,
+        )
+        .unwrap();
 
         assert_workspace_init_optional_repos(&workspace_root, expect_template, expect_platform_dev);
     }
