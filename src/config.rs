@@ -367,6 +367,15 @@ pub struct LegacyLocation {
     pub identifying_commit: String,
 }
 
+impl LegacyLocation {
+    pub fn endpoint(&self) -> RepositoryEndpoint {
+        RepositoryEndpoint {
+            repository: self.repository.clone(),
+            base_url: self.base_url.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LegacyLocations(pub HashMap<String, LegacyLocation>);
@@ -426,15 +435,6 @@ impl Config {
 
         Self {
             locations: LegacyLocations(locations),
-        }
-    }
-}
-
-impl LegacyLocation {
-    pub fn endpoint(&self) -> RepositoryEndpoint {
-        RepositoryEndpoint {
-            repository: self.repository.clone(),
-            base_url: self.base_url.clone(),
         }
     }
 }
