@@ -858,31 +858,22 @@ base_url = "https://staging.example.test/{sibling_id}/"
     }
 
     #[test]
-    fn workspace_doc_text_documents_workspace_commands_and_modes() {
+    fn workspace_doc_text_mentions_required_workspace_reference_content() {
         let text = workspace_doc_text();
 
         for expected in [
-            "EIPs",
-            "ERCs",
-            "theme",
             ".build-eips.toml",
             ".local-build",
-            "Workspace Layout",
-            "Requirements And Troubleshooting",
-            "Serve And Preview",
-            "Local Server And Base URL",
-            "Target Specific Proposals",
-            "Remote Environment Commands",
-            "Source And Output Overrides",
-            "Editorial Validation",
+            "build-eips init",
+            "build-eips doctor",
+            "build-eips build",
             "build-eips serve",
             "build-eips preview",
-            "--only",
-            "--remote-siblings",
-            "--batch",
+            "build-eips editorial check",
             "[render]",
             "only = [",
-            "1111",
+            "--only",
+            "--remote-siblings",
             "--base-url",
         ] {
             assert!(
