@@ -317,10 +317,10 @@ pub fn tracked_working_tree_paths(root_path: &Path) -> Result<Vec<PathBuf>, Erro
 }
 
 pub fn materialize_working_tree(source_root: &Path, destination_root: &Path) -> Result<(), Error> {
-    remove_existing_path(destination_root).context(IoSnafu {
+    remove_existing_path(destination_root).with_context(|_| IoSnafu {
         path: destination_root.to_path_buf(),
     })?;
-    std::fs::create_dir_all(destination_root).context(IoSnafu {
+    std::fs::create_dir_all(destination_root).with_context(|_| IoSnafu {
         path: destination_root.to_path_buf(),
     })?;
 
@@ -351,7 +351,7 @@ pub fn index_path(root_path: &Path) -> Result<PathBuf, Error> {
     index
         .path()
         .map(Path::to_path_buf)
-        .context(UpdateTreeSnafu::<String> {
+        .with_context(|| UpdateTreeSnafu::<String> {
             msg: "repository index is in-memory".into(),
         })
 }
@@ -368,9 +368,11 @@ pub fn sync_materialized_paths(
     let working_repo = git2::Repository::open(build_repo_path).context(GitSnafu {
         what: "open build repository",
     })?;
-    let working_root = working_repo.workdir().context(UpdateTreeSnafu::<String> {
-        msg: "build repository workdir is unavailable".into(),
-    })?;
+    let working_root = working_repo
+        .workdir()
+        .with_context(|| UpdateTreeSnafu::<String> {
+            msg: "build repository workdir is unavailable".into(),
+        })?;
     let mut index = working_repo.index().context(GitSnafu {
         what: "open build repository index",
     })?;
@@ -518,7 +520,7 @@ fn sync_dirty_path(
 
     match std::fs::symlink_metadata(&source_path) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            remove_existing_path(&working_path).context(IoSnafu {
+            remove_existing_path(&working_path).with_context(|_| IoSnafu {
                 path: working_path.clone(),
             })?;
             remove_index_path(index, relative_path)?;
@@ -526,21 +528,21 @@ fn sync_dirty_path(
         }
         Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
             if let Some(parent) = working_path.parent() {
-                std::fs::create_dir_all(parent).context(IoSnafu {
+                std::fs::create_dir_all(parent).with_context(|_| IoSnafu {
                     path: parent.to_path_buf(),
                 })?;
             }
 
-            remove_existing_path(&working_path).context(IoSnafu {
+            remove_existing_path(&working_path).with_context(|_| IoSnafu {
                 path: working_path.clone(),
             })?;
 
             if metadata.file_type().is_symlink() {
-                copy_symlink(&source_path, &working_path).context(IoSnafu {
+                copy_symlink(&source_path, &working_path).with_context(|_| IoSnafu {
                     path: working_path.clone(),
                 })?;
             } else {
-                std::fs::copy(&source_path, &working_path).context(IoSnafu {
+                std::fs::copy(&source_path, &working_path).with_context(|_| IoSnafu {
                     path: source_path.clone(),
                 })?;
             }
@@ -555,7 +557,7 @@ fn sync_dirty_path(
         }
         .fail(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            remove_existing_path(&working_path).context(IoSnafu {
+            remove_existing_path(&working_path).with_context(|_| IoSnafu {
                 path: working_path.clone(),
             })?;
             remove_index_path(index, relative_path)?;
@@ -575,27 +577,27 @@ fn sync_working_tree_path(
 
     match std::fs::symlink_metadata(&source_path) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            remove_existing_path(&destination_path).context(IoSnafu {
+            remove_existing_path(&destination_path).with_context(|_| IoSnafu {
                 path: destination_path.clone(),
             })
         }
         Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
             if let Some(parent) = destination_path.parent() {
-                std::fs::create_dir_all(parent).context(IoSnafu {
+                std::fs::create_dir_all(parent).with_context(|_| IoSnafu {
                     path: parent.to_path_buf(),
                 })?;
             }
 
-            remove_existing_path(&destination_path).context(IoSnafu {
+            remove_existing_path(&destination_path).with_context(|_| IoSnafu {
                 path: destination_path.clone(),
             })?;
 
             if metadata.file_type().is_symlink() {
-                copy_symlink(&source_path, &destination_path).context(IoSnafu {
+                copy_symlink(&source_path, &destination_path).with_context(|_| IoSnafu {
                     path: destination_path.clone(),
                 })?;
             } else {
-                std::fs::copy(&source_path, &destination_path).context(IoSnafu {
+                std::fs::copy(&source_path, &destination_path).with_context(|_| IoSnafu {
                     path: source_path.clone(),
                 })?;
             }
@@ -607,7 +609,7 @@ fn sync_working_tree_path(
         }
         .fail(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            remove_existing_path(&destination_path).context(IoSnafu {
+            remove_existing_path(&destination_path).with_context(|_| IoSnafu {
                 path: destination_path,
             })
         }
@@ -630,9 +632,11 @@ fn materialize_dirty_tree(
         return Ok(local_head);
     }
 
-    let working_root = working_repo.workdir().context(UpdateTreeSnafu::<String> {
-        msg: "build repository workdir is unavailable".into(),
-    })?;
+    let working_root = working_repo
+        .workdir()
+        .with_context(|| UpdateTreeSnafu::<String> {
+            msg: "build repository workdir is unavailable".into(),
+        })?;
     let mut index = working_repo.index().context(GitSnafu {
         what: "open build repository index",
     })?;
@@ -724,15 +728,16 @@ impl Fresh {
         src_repo_use: RepositoryUse,
         source_materialization: SourceMaterialization,
     ) -> Result<Self, Error> {
-        let root_path = absolute(root_path).context(IoSnafu { path: root_path })?;
+        let root_path = absolute(root_path).with_context(|_| IoSnafu { path: root_path })?;
         if source_materialization == SourceMaterialization::Clean {
             check_dirty(&root_path)?;
         }
-        let src_repo_url = Url::from_directory_path(&root_path)
-            .ok()
-            .context(PathUrlSnafu {
-                path: root_path.clone(),
-            })?;
+        let src_repo_url =
+            Url::from_directory_path(&root_path)
+                .ok()
+                .with_context(|| PathUrlSnafu {
+                    path: root_path.clone(),
+                })?;
 
         debug!("source repository at `{src_repo_url}`");
 
