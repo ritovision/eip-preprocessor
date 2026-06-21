@@ -6,7 +6,7 @@
 
 //! Command context and path resolution helpers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use snafu::{ResultExt, Whatever};
 
@@ -16,6 +16,15 @@ use crate::{cli::Args, config, find_root};
 pub(crate) struct WorkspaceCommandContext {
     pub(crate) search_from: PathBuf,
     pub(crate) config_path: Option<PathBuf>,
+}
+
+pub(crate) fn resolve_input_path(path: &Path) -> Result<PathBuf, Whatever> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        let cwd = std::env::current_dir().whatever_context("unable to get current directory")?;
+        Ok(cwd.join(path))
+    }
 }
 
 pub(crate) fn root(args: &Args) -> Result<PathBuf, Whatever> {
